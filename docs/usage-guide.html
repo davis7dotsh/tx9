@@ -1,0 +1,173 @@
+<header>
+  <h1>Hermes Box Lite</h1>
+  <p class="dek">A practical guide to creating, using, backing up, restoring, and repairing isolated agent boxes.</p>
+</header>
+
+<div class="callout note">
+  <span class="ico" aria-hidden="true">i</span>
+  <div class="body">
+    <div class="title">The operating model</div>
+    <p>Tools are replaceable; state is precious. Claude Code, Codex, Hermes, Executor, and Neovim live in an isolated smolvm VM. User state lives under <code>/data</code> and travels through encrypted backups.</p>
+  </div>
+</div>
+
+<div class="page-layout">
+  <aside class="section-nav" aria-label="On this page">
+    <p class="label">On this page</p>
+    <nav>
+      <ul>
+        <li><a href="#quick-start">Quick start</a></li>
+        <li><a href="#daily-use">Daily use</a></li>
+        <li><a href="#backup-restore">Backup and restore</a></li>
+        <li><a href="#health-repair">Health and repair</a></li>
+        <li><a href="#configuration">Configuration</a></li>
+        <li><a href="#security">Security model</a></li>
+        <li><a href="#troubleshooting">Troubleshooting</a></li>
+      </ul>
+    </nav>
+  </aside>
+
+  <div class="page-content">
+    <section id="quick-start">
+      <h2>Quick start</h2>
+      <p>Run these commands from the <code>hermes-box-lite</code> repository on a Mac with <code>smolvm</code>, GPG, and standard command-line tools installed.</p>
+
+      <h3>1. Create and verify a box</h3>
+      <pre><code>./box new alpha
+./box doctor alpha</code></pre>
+      <p>Creation boots Ubuntu, installs the toolchain, starts Executor, registers its authenticated HTTP MCP endpoint with Claude and Codex, and runs health checks. A failed creation is removed automatically.</p>
+
+      <h3>2. Enter and authenticate</h3>
+      <pre><code>./box enter alpha</code></pre>
+      <p>You enter as <code>agent</code> in a persistent tmux session under <code>~/workspace</code>. Authenticate the tools you intend to use:</p>
+      <pre><code>hermes setup --portal
+claude
+codex</code></pre>
+
+      <h3>3. Open Executor and save the state</h3>
+      <pre><code>./box open alpha
+./box save alpha</code></pre>
+      <p><code>box open</code> launches the authenticated Executor UI without printing its bearer token. <code>box save</code> pauses Executor, validates the archive, encrypts it, verifies it, and writes it under <code>backups/</code>.</p>
+    </section>
+
+    <section id="daily-use">
+      <h2>Daily use</h2>
+      <div class="table-wrap" role="region" aria-label="Common Hermes Box Lite commands" tabindex="0">
+        <table>
+          <caption>Common commands</caption>
+          <thead>
+            <tr><th scope="col">Command</th><th scope="col">Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row"><code>./box ls</code></th><td>List managed boxes, their state, and Executor URLs.</td></tr>
+            <tr><th scope="row"><code>./box enter alpha</code></th><td>Start the box and attach its persistent tmux session.</td></tr>
+            <tr><th scope="row"><code>./box open alpha</code></th><td>Open the authenticated Executor UI.</td></tr>
+            <tr><th scope="row"><code>./box stop alpha</code></th><td>Stop the VM without deleting its state.</td></tr>
+            <tr><th scope="row"><code>./box start alpha</code></th><td>Start a stopped VM.</td></tr>
+            <tr><th scope="row"><code>./box doctor alpha</code></th><td>Check tools, Executor, MCP wiring, durable state, and host forwarding.</td></tr>
+          </tbody>
+        </table>
+      </div>
+
+      <h3>Inside the box</h3>
+      <pre><code>hb status
+hb versions
+hb doctor
+hb logs executor</code></pre>
+      <p>Executor normally runs continuously. Use <code>hb down</code> for a deliberate pause and <code>hb up</code> to resume it. The workload respects the pause instead of immediately restarting the daemon.</p>
+    </section>
+
+    <section id="backup-restore">
+      <h2>Backup and restore</h2>
+      <h3>Create a backup</h3>
+      <pre><code>./box save alpha</code></pre>
+      <p>By default, this creates <code>backups/alpha-&lt;timestamp&gt;.tar.gz.gpg</code>. The command refuses to overwrite an existing destination. Set a passphrase in the environment for unattended use:</p>
+      <pre><code>BOX_PASSPHRASE='your-local-secret' ./box save alpha</code></pre>
+      <p>Do not actively edit workspace files during the save. Executor is quiesced, but arbitrary editor and agent processes are not frozen.</p>
+
+      <h3>Restore into a new box</h3>
+      <pre><code>./box load backups/alpha-20260625-120000.tar.gz.gpg beta</code></pre>
+      <p>The archive is decrypted and validated before a VM is created. The destination is provisioned, restored while Executor is paused, refreshed with current managed assets, rewired, and health-checked. An incomplete destination is removed after failure.</p>
+
+      <h3>Inspect a backup without a VM</h3>
+      <pre><code>./box extract backups/alpha-20260625-120000.tar.gz.gpg</code></pre>
+      <p>Extraction validates the archive and writes to a new directory under <code>backups/</code>. Treat extracted contents as sensitive: they can contain credentials, sessions, private work, and Executor data.</p>
+
+      <div class="callout warn">
+        <span class="ico" aria-hidden="true">!</span>
+        <div class="body">
+          <div class="title">Backups preserve state, not an exact machine</div>
+          <p>A later restore installs then-current upstream tool releases before applying saved state. The archive includes a runtime-version manifest for diagnosis, but it is not an offline, reproducible machine image.</p>
+        </div>
+      </div>
+    </section>
+
+    <section id="health-repair">
+      <h2>Health and repair</h2>
+      <p>Start with the doctor whenever a box feels partly broken:</p>
+      <pre><code>./box doctor alpha</code></pre>
+      <p>If managed tools, profiles, or MCP wiring need repair, re-run provisioning:</p>
+      <pre><code>./box repair alpha</code></pre>
+      <p>Repair pauses Executor, refreshes packages and repository-owned guest assets, resumes the daemon, repairs MCP wiring, and runs the doctor. It can contact upstream installers and may install newer releases.</p>
+
+      <h3>Remove a box safely</h3>
+      <pre><code>./box rm alpha</code></pre>
+      <p>The command reports whether it can find a recent backup and requires the exact box name as confirmation. For intentional non-interactive deletion:</p>
+      <pre><code>./box rm alpha --force</code></pre>
+    </section>
+
+    <section id="configuration">
+      <h2>Configuration</h2>
+      <p>Edit <code>box.env</code> before creating or repairing a box.</p>
+      <div class="table-wrap" role="region" aria-label="Hermes Box Lite configuration" tabindex="0">
+        <table>
+          <caption>Important settings</caption>
+          <thead>
+            <tr><th scope="col">Setting</th><th scope="col">Effect</th></tr>
+          </thead>
+          <tbody>
+            <tr><th scope="row"><code>BASE_IMAGE</code></th><td>OCI image used for new boxes.</td></tr>
+            <tr><th scope="row"><code>NODE_MAJOR</code></th><td>NodeSource major line installed during provisioning.</td></tr>
+            <tr><th scope="row"><code>INSTALL_HERMES</code></th><td>Enable or disable Hermes installation.</td></tr>
+            <tr><th scope="row"><code>INSTALL_EXECUTOR</code></th><td>Enable or disable Executor installation.</td></tr>
+            <tr><th scope="row"><code>EXPOSE_EXECUTOR_WEB</code></th><td>Forward Executor to a unique loopback-only host port.</td></tr>
+            <tr><th scope="row"><code>EXECUTOR_PORT_LO</code> / <code>HI</code></th><td>Range used for unique host ports.</td></tr>
+            <tr><th scope="row"><code>WIRE_EXECUTOR_MCP</code></th><td>Register Executor's authenticated HTTP MCP endpoint with Claude and Codex.</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <p>Provisioning installs a root-owned copy at <code>/etc/hermes-box.env</code>, so guest helpers use the same settings as the host workflow.</p>
+    </section>
+
+    <section id="security">
+      <h2>Security model</h2>
+      <ul>
+        <li>The VM has no host filesystem mounts.</li>
+        <li>Executor's forwarded web port is host-loopback-only.</li>
+        <li>Networking is always enabled for provisioning and agent tools.</li>
+        <li>Claude, Codex, Hermes, Executor, and plugins share one guest account and credential set.</li>
+        <li>The <code>agent</code> user has passwordless sudo inside the guest.</li>
+        <li>Encrypted backups and extracted state should be handled as secret material.</li>
+      </ul>
+      <p>The VM is the host-protection boundary. Tools inside a box are not isolated from one another. A compromised tool, plugin, MCP source, or prompt-injected agent may access the other tools' credentials and workspace.</p>
+    </section>
+
+    <section id="troubleshooting">
+      <h2>Troubleshooting</h2>
+      <h3>Executor or MCP is unhealthy</h3>
+      <pre><code>./box doctor alpha
+./box repair alpha</code></pre>
+      <p>Inside the box, inspect <code>hb status</code> and <code>hb logs executor</code>. Run <code>hb wire-mcp</code> to replace stale legacy stdio wiring with the authenticated HTTP configuration.</p>
+
+      <h3>An operation says the box is locked</h3>
+      <p>Another mutation may be running. Locks contain an owning PID and stale locks are recovered automatically after that process exits. Do not manually remove a lock while a save, load, repair, or delete is active.</p>
+
+      <h3>A restore fails before VM creation</h3>
+      <p>The passphrase may be incorrect, or the decrypted archive may be corrupt or unsafe. This failure intentionally occurs before provisioning so it does not leave an orphan VM.</p>
+
+      <h3>Validate the repository</h3>
+      <pre><code>make check</code></pre>
+      <p>This runs Bash syntax checks, ShellCheck, static contracts, encrypted archive round-trip tests, validation-before-VM tests, temporary-file cleanup checks, and mock failure rollback.</p>
+    </section>
+  </div>
+</div>

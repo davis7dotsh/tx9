@@ -4,6 +4,8 @@ Small, isolated agent VMs with **Claude Code, Codex, Hermes, and Executor**.
 Each box runs on [smolvm](https://smolmachines.com), has no host filesystem
 mounts, and keeps portable user state under `/data`.
 
+**[Usage guide and quick start](https://columbia-pages.davis7.sh/p/5UcuYS0y4E79)**
+
 This is deliberately simpler than full Hermes Box: there are no release locks,
 offline artifact closures, or transactional component updates. The reliability
 boundary is narrower: safe lifecycle operations and verified state backups.
