@@ -1,0 +1,509 @@
+#!/usr/bin/env bash
+# hermes-box-lite — isolated, portable agent boxes whose durable state lives in
+# /data. Runtime: smolvm. Backups are encrypted state archives, not VM images.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT"
+# shellcheck source=box.env
+source "$ROOT/box.env"
+
+REG="$ROOT/.boxes"
+LOCK_ROOT="$ROOT/.box-locks"
+_BOX_PASS=""
+_TEMP_PATHS=()
+_LOCK_DIRS=()
+_PAUSED_BOXES=()
+
+die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+say() { printf '\033[36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+have() { command -v "$1" >/dev/null 2>&1; }
+
+_cleanup() {
+  local status=$? n path
+  trap - EXIT HUP INT TERM
+  for n in "${_PAUSED_BOXES[@]:-}"; do
+    [[ -n "$n" ]] || continue
+    _guest_hb "$n" resume >/dev/null 2>&1 || true
+  done
+  for path in "${_TEMP_PATHS[@]:-}"; do
+    [[ -n "$path" ]] && rm -f -- "$path"
+  done
+  for path in "${_LOCK_DIRS[@]:-}"; do
+    [[ -n "$path" ]] || continue
+    if [[ -r "$path/pid" && "$(cat "$path/pid")" == "$$" ]]; then rm -f "$path/pid"; fi
+    rmdir "$path" >/dev/null 2>&1 || true
+  done
+  exit "$status"
+}
+
+_install_cleanup_traps() {
+  trap _cleanup EXIT
+  trap 'exit 129' HUP
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+}
+
+_track_temp() { _TEMP_PATHS+=("$1"); }
+
+_require() { have "$1" || die "$1 not found on PATH"; }
+
+_host_preflight() {
+  local mode="${1:-vm}" cmd
+  for cmd in awk mktemp tar; do _require "$cmd"; done
+  if [[ "$mode" != archive-only ]]; then
+    for cmd in lsof smolvm; do _require "$cmd"; done
+  fi
+  if [[ "$mode" != vm-only ]]; then _require gpg; fi
+}
+
+_validate_name() {
+  local n="$1"
+  [[ "$n" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] ||
+    die "invalid box name '$n' (use 1-63 letters, numbers, dots, underscores, or dashes)"
+}
+
+_acquire_lock() {
+  local key="$1" dir="$LOCK_ROOT/$1.lock"
+  mkdir -p "$LOCK_ROOT"
+  if ! mkdir "$dir" 2>/dev/null; then
+    local owner=""
+    [[ -r "$dir/pid" ]] && owner="$(cat "$dir/pid")"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$dir"
+      mkdir "$dir" 2>/dev/null || die "could not recover stale '$key' lock"
+    else
+      die "another operation already holds the '$key' lock${owner:+ (pid $owner)}"
+    fi
+  fi
+  _LOCK_DIRS+=("$dir")
+  printf '%s\n' "$$" >"$dir/pid"
+}
+
+_release_lock() {
+  local dir="$LOCK_ROOT/$1.lock"
+  rm -f "$dir/pid"
+  rmdir "$dir" >/dev/null 2>&1 || true
+}
+
+# One line per managed box: "<name>\t<host-port>". The registry is local host
+# metadata; the VM remains the source of truth for whether an instance exists.
+_reg_add() {
+  touch "$REG"
+  _reg_del "$1"
+  printf '%s\t%s\n' "$1" "${2:-}" >>"$REG"
+}
+_reg_del() {
+  [[ -f "$REG" ]] || return 0
+  awk -F'\t' -v n="$1" '$1!=n' "$REG" >"$REG.tmp"
+  mv "$REG.tmp" "$REG"
+}
+_reg_port() { [[ -f "$REG" ]] && awk -F'\t' -v n="$1" '$1==n{print $2}' "$REG"; }
+
+_machine_exists() { smolvm machine status --name "$1" >/dev/null 2>&1; }
+
+_port_free() {
+  awk -F'\t' -v p="$1" '$2==p{f=1} END{exit !f}' "$REG" 2>/dev/null && return 1
+  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1 && return 1
+  return 0
+}
+
+_assign_port() {
+  local lo="${EXECUTOR_PORT_LO:-4790}" hi="${EXECUTOR_PORT_HI:-4999}" p attempt
+  [[ "$lo" =~ ^[0-9]+$ && "$hi" =~ ^[0-9]+$ && "$lo" -ge 1024 && "$hi" -le 65535 && "$lo" -le "$hi" ]] ||
+    die "invalid executor host-port range ${lo}-${hi}"
+  for ((attempt = 0; attempt < 300; attempt++)); do
+    p=$((lo + RANDOM % (hi - lo + 1)))
+    _port_free "$p" && { printf '%s' "$p"; return 0; }
+  done
+  die "no free host port in ${lo}-${hi}"
+}
+
+_resolve_passphrase() {
+  local confirm="${1:-}" p1 p2
+  [[ -n "$_BOX_PASS" ]] && return
+  if [[ -n "${BOX_PASSPHRASE:-}" ]]; then
+    _BOX_PASS="$BOX_PASSPHRASE"
+    return
+  fi
+  [[ -r /dev/tty ]] || die "no BOX_PASSPHRASE set and no terminal to prompt on"
+  printf 'Passphrase: ' >/dev/tty
+  read -rs p1 </dev/tty
+  printf '\n' >/dev/tty
+  if [[ "$confirm" == confirm ]]; then
+    printf 'Confirm passphrase: ' >/dev/tty
+    read -rs p2 </dev/tty
+    printf '\n' >/dev/tty
+    [[ "$p1" == "$p2" ]] || die "passphrases do not match"
+  fi
+  [[ -n "$p1" ]] || die "empty passphrase"
+  _BOX_PASS="$p1"
+}
+
+gpg_enc() {
+  _resolve_passphrase confirm
+  gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+    --symmetric --cipher-algo AES256 -o "$1" 3<<<"$_BOX_PASS"
+}
+
+gpg_dec() {
+  _resolve_passphrase
+  gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 -d "$1" 3<<<"$_BOX_PASS"
+}
+
+_validate_archive() {
+  local raw="$1" listing status=0
+  listing="$(mktemp)"
+  tar tzf "$raw" >"$listing" || status=1
+  [[ -s "$listing" ]] || status=1
+  if ! awk '
+    /^\// { exit 1 }
+    /(^|\/)\.\.($|\/)/ { exit 1 }
+    /[[:cntrl:]]/ { exit 1 }
+  ' "$listing"; then status=1; fi
+  grep -Eq '^\.?/?home/agent(/|$)' "$listing" || status=1
+  rm -f "$listing"
+  [[ "$status" == 0 ]]
+}
+
+_guest_hb() {
+  local n="$1"
+  shift
+  smolvm machine exec --name "$n" -- \
+    setpriv --reuid=agent --regid=agent --init-groups \
+    env HOME=/data/home/agent bash --noprofile --norc -c \
+    '. /etc/profile.d/hermes-box.sh; exec hb "$@"' hb "$@"
+}
+
+_pause_box() {
+  local n="$1"
+  if _guest_hb "$n" is-paused >/dev/null 2>&1; then return; fi
+  _guest_hb "$n" pause
+  _PAUSED_BOXES+=("$n")
+}
+
+_resume_box() {
+  local n="$1" index
+  for index in "${!_PAUSED_BOXES[@]}"; do
+    if [[ "${_PAUSED_BOXES[$index]}" == "$n" ]]; then
+      _guest_hb "$n" resume
+      _PAUSED_BOXES[index]=""
+      return
+    fi
+  done
+}
+
+_create_base() {
+  local n="$1" port="" wl_port opts=()
+  _acquire_lock registry
+  [[ -z "$(_reg_port "$n")" ]] || { _release_lock registry; die "box '$n' is already registered"; }
+  if _machine_exists "$n"; then
+    _release_lock registry
+    die "smolvm machine '$n' already exists"
+  fi
+  if [[ "${INSTALL_EXECUTOR:-0}" == 1 && "${EXPOSE_EXECUTOR_WEB:-0}" == 1 ]]; then
+    port="$(_assign_port)" || { _release_lock registry; return 1; }
+    opts+=(-p "${port}:${port}")
+    say "Assigned host port ${port} -> executor (http://localhost:${port})"
+  fi
+  wl_port="${port:-4788}"
+  if ! smolvm machine create --net "${opts[@]}" --name "$n" --image "$BASE_IMAGE" \
+    -- bash -c "while [ ! -x /opt/hermes-box/bin/hb-workload ]; do sleep 2; done; exec runuser -u agent -- env HOME=/data/home/agent /opt/hermes-box/bin/hb-workload ${wl_port}"; then
+    _release_lock registry
+    return 1
+  fi
+  smolvm machine start --name "$n" || { _release_lock registry; return 1; }
+  _reg_add "$n" "$port" || { _release_lock registry; return 1; }
+  _release_lock registry
+}
+
+_provision_into() {
+  local n="$1" mode="${2:-full}"
+  say "Streaming provision context into '$n'"
+  if ! COPYFILE_DISABLE=1 tar czf - -C "$ROOT" provision guest box.env \
+    | smolvm machine exec -i --name "$n" -- bash -lc 'cat >/tmp/ctx.tgz'; then
+    return 1
+  fi
+  if [[ "$mode" == assets ]]; then
+    say "Refreshing managed guest assets"
+  else
+    say "Provisioning node/uv, claude, codex, hermes, executor (a few minutes)…"
+  fi
+  smolvm machine exec --name "$n" -- bash -lc "
+    set -e
+    rm -rf /tmp/ctx && mkdir -p /tmp/ctx
+    tar xzf /tmp/ctx.tgz -C /tmp/ctx
+    bash /tmp/ctx/provision/provision.sh '$mode'"
+}
+
+_prepare_runtime() {
+  local n="$1"
+  _guest_hb "$n" up && _guest_hb "$n" wire-once && _guest_hb "$n" doctor
+}
+
+_rollback_created() {
+  local n="$1"
+  warn "rolling back incomplete box '$n'"
+  smolvm machine delete --name "$n" -f >/dev/null 2>&1 || true
+  if [[ ! -r "$LOCK_ROOT/registry.lock/pid" || "$(cat "$LOCK_ROOT/registry.lock/pid")" != "$$" ]]; then
+    _acquire_lock registry
+  fi
+  _reg_del "$n"
+  _release_lock registry
+}
+
+cmd_new() {
+  local n="${1:?usage: box new <name>}"
+  _validate_name "$n"
+  _host_preflight vm-only
+  _acquire_lock "$n"
+  say "Creating instance '$n' from $BASE_IMAGE"
+  if ! _create_base "$n" || ! _provision_into "$n" full || ! _prepare_runtime "$n"; then
+    _rollback_created "$n"
+    die "box creation failed"
+  fi
+  local port
+  port="$(_reg_port "$n")"
+  say "Ready. Enter with: ./box enter $n"
+  [[ -n "$port" ]] && say "Executor web: http://localhost:${port} (./box open $n)"
+  say "Authenticate inside, then ./box save $n to capture the state."
+}
+
+cmd_enter() {
+  local n="${1:?usage: box enter <name>}"
+  _validate_name "$n"
+  _host_preflight vm-only
+  smolvm machine start --name "$n" >/dev/null
+  exec smolvm machine exec -it --name "$n" -- login -f agent
+}
+
+cmd_save() {
+  local n="${1:?usage: box save <name> [out.tar.gz.gpg]}" ts out raw encrypted guest_tmp
+  _validate_name "$n"
+  _host_preflight
+  _acquire_lock "$n"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  out="${2:-backups/${n}-${ts}.tar.gz.gpg}"
+  [[ ! -e "$out" ]] || die "refusing to overwrite existing backup: $out"
+  mkdir -p "$(dirname "$out")"
+  raw="$(mktemp)"
+  encrypted="$(mktemp "${out}.tmp.XXXXXX")"
+  guest_tmp="/tmp/hb-data-${ts}-$$-${RANDOM}.tgz"
+  _track_temp "$raw"
+  _track_temp "$encrypted"
+
+  say "Quiescing Executor inside '$n'"
+  _pause_box "$n"
+  _guest_hb "$n" write-manifest
+  say "Archiving /data inside '$n'"
+  smolvm machine exec --name "$n" -- bash -lc "sync; tar czf '$guest_tmp' -C /data ."
+  smolvm machine cp "$n:$guest_tmp" "$raw"
+  smolvm machine exec --name "$n" -- rm -f "$guest_tmp"
+  _validate_archive "$raw" || die "generated archive failed validation"
+  _resume_box "$n"
+
+  say "Encrypting and verifying backup"
+  gpg_enc "$encrypted" <"$raw"
+  gpg_dec "$encrypted" | tar tzf - >/dev/null || die "encrypted backup verification failed"
+  ln "$encrypted" "$out" 2>/dev/null || die "backup destination appeared during save: $out"
+  rm -f "$encrypted"
+  say "Saved and verified $(du -h "$out" | cut -f1) -> $out"
+}
+
+cmd_load() {
+  local file="${1:?usage: box load <archive.tar.gz.gpg> [name]}" n="${2:-restored}" raw guest_tmp
+  [[ -f "$file" ]] || die "no such archive: $file"
+  _validate_name "$n"
+  _host_preflight
+  _acquire_lock "$n"
+  raw="$(mktemp)"
+  _track_temp "$raw"
+  say "Decrypting and validating archive before creating a VM"
+  gpg_dec "$file" >"$raw"
+  _validate_archive "$raw" || die "archive is invalid or unsafe"
+
+  say "Creating and provisioning fresh instance '$n'"
+  if ! _create_base "$n" || ! _provision_into "$n" full; then
+    _rollback_created "$n"
+    die "destination provisioning failed"
+  fi
+
+  guest_tmp="/tmp/hb-restore-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}.tgz"
+  if ! _pause_box "$n" || ! smolvm machine cp "$raw" "$n:$guest_tmp" ||
+    ! smolvm machine exec --name "$n" -- bash -lc \
+      "find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; tar xzf '$guest_tmp' --no-same-owner -C /data; rm -f '$guest_tmp'" ||
+    ! _provision_into "$n" assets || ! _resume_box "$n" || ! _prepare_runtime "$n"; then
+    _rollback_created "$n"
+    die "restore failed; incomplete destination was removed"
+  fi
+  say "Restored and verified. Enter with: ./box enter $n"
+}
+
+cmd_extract() {
+  local file="${1:?usage: box extract <archive.tar.gz.gpg> [dest-dir]}" base dest raw
+  [[ -f "$file" ]] || die "no such archive: $file"
+  _host_preflight archive-only
+  base="$(basename "$file")"
+  base="${base%.tar.gz.gpg}"
+  dest="${2:-backups/${base}-extracted}"
+  [[ ! -e "$dest" ]] || die "$dest already exists"
+  raw="$(mktemp)"
+  _track_temp "$raw"
+  gpg_dec "$file" >"$raw"
+  _validate_archive "$raw" || die "archive is invalid or unsafe"
+  mkdir -p "$dest"
+  if ! tar xzf "$raw" --no-same-owner -C "$dest"; then
+    rm -rf "$dest"
+    die "extraction failed"
+  fi
+  say "Extracted $(find "$dest" -type f | wc -l | tr -d ' ') files -> $dest/"
+}
+
+cmd_ls() {
+  _host_preflight vm-only
+  if [[ "${1:-}" == --all ]]; then smolvm machine ls; return; fi
+  [[ -s "$REG" ]] || { echo "No hermes-box-lite boxes yet. Create one: ./box new <name>"; return; }
+  printf '%-16s %-10s %s\n' BOX STATE EXECUTOR
+  local n port st url
+  while IFS=$'\t' read -r n port; do
+    [[ -n "$n" ]] || continue
+    if st="$(smolvm machine status --name "$n" 2>/dev/null)"; then
+      st="${st#*: }"
+      st="${st%% *}"
+    else
+      st=missing
+    fi
+    url='—'
+    [[ -n "$port" ]] && url="http://localhost:${port}"
+    printf '%-16s %-10s %s\n' "$n" "$st" "$url"
+  done <"$REG"
+}
+
+cmd_open() {
+  local n="${1:?usage: box open <name>}" port token url
+  _validate_name "$n"
+  _host_preflight vm-only
+  _acquire_lock "$n"
+  port="$(_reg_port "$n")"
+  [[ -n "$port" ]] || die "'$n' has no exposed Executor host port"
+  smolvm machine start --name "$n" >/dev/null
+  _guest_hb "$n" up >/dev/null
+  token="$(_guest_hb "$n" executor-token)" || die "could not read Executor's local token"
+  [[ -n "$token" ]] || die "Executor token is unavailable"
+  url="http://localhost:${port}/?_token=${token}"
+  say "Opening authenticated Executor UI at http://localhost:${port}"
+  if command -v open >/dev/null 2>&1; then
+    open "$url"
+  else
+    die "no browser opener found; enter the box and run 'hb web'"
+  fi
+}
+
+cmd_doctor() {
+  local n="${1:?usage: box doctor <name>}" port
+  _validate_name "$n"
+  _host_preflight vm-only
+  _acquire_lock "$n"
+  port="$(_reg_port "$n")"
+  _machine_exists "$n" || die "smolvm machine '$n' is missing"
+  smolvm machine start --name "$n" >/dev/null
+  _guest_hb "$n" doctor
+  if [[ -n "$port" ]]; then
+    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || die "host port $port is not listening"
+    say "host Executor listener: http://localhost:${port}"
+  fi
+  say "doctor passed for '$n'"
+}
+
+cmd_repair() {
+  local n="${1:?usage: box repair <name>}"
+  _validate_name "$n"
+  _host_preflight vm-only
+  _acquire_lock "$n"
+  _machine_exists "$n" || die "smolvm machine '$n' is missing"
+  smolvm machine start --name "$n" >/dev/null
+  _pause_box "$n"
+  _provision_into "$n" full
+  _resume_box "$n"
+  _prepare_runtime "$n"
+  say "repair completed for '$n'"
+}
+
+cmd_stop() {
+  local n="${1:?usage: box stop <name>}"
+  _validate_name "$n"
+  _host_preflight vm-only
+  _acquire_lock "$n"
+  smolvm machine stop --name "$n"
+}
+
+cmd_start() {
+  local n="${1:?usage: box start <name>}"
+  _validate_name "$n"
+  _host_preflight vm-only
+  _acquire_lock "$n"
+  smolvm machine start --name "$n"
+}
+
+cmd_rm() {
+  local n="${1:?usage: box rm <name> [--force]}" force="${2:-}" answer latest
+  _validate_name "$n"
+  _host_preflight vm-only
+  latest="$(find backups -maxdepth 1 -type f -name "${n}-*.tar.gz.gpg" -print 2>/dev/null | sort | tail -1)"
+  if [[ -n "$latest" ]]; then say "latest backup: $latest"; else warn "no backup found for '$n'"; fi
+  if [[ "$force" != --force ]]; then
+    [[ -r /dev/tty ]] || die "refusing non-interactive deletion without --force"
+    printf "Type the box name '%s' to delete it permanently: " "$n" >/dev/tty
+    read -r answer </dev/tty
+    [[ "$answer" == "$n" ]] || die "deletion cancelled"
+  fi
+  _acquire_lock "$n"
+  smolvm machine delete --name "$n" -f
+  _acquire_lock registry
+  _reg_del "$n"
+  _release_lock registry
+  say "deleted '$n'"
+}
+
+usage() {
+  cat <<'EOF'
+hermes-box-lite — isolated, portable agent boxes (claude / codex / hermes / executor)
+
+  ./box new <name>             Create, provision, and health-check a fresh box
+  ./box enter <name>           Log in as agent and attach tmux 'main'
+  ./box ls [--all]             List managed boxes (or every smolvm VM)
+  ./box open <name>            Open the authenticated Executor web UI
+  ./box doctor <name>          Check guest tools, Executor, MCP wiring, and host port
+  ./box repair <name>          Re-run provisioning and repair managed guest assets
+  ./box stop|start <name>      Stop or start an instance
+  ./box save <name> [out]      Quiesce, validate, encrypt, and verify /data
+  ./box load <file> [name]     Validate first, then build and restore a fresh box
+  ./box extract <file> [dir]   Validate and extract a backup without a VM
+  ./box rm <name> [--force]    Delete after confirmation (or explicit --force)
+
+  Set BOX_PASSPHRASE to skip the GPG prompt. Configuration: box.env
+EOF
+}
+
+main() {
+  _install_cleanup_traps
+  case "${1:-help}" in
+    new) shift; cmd_new "$@" ;;
+    enter | shell) shift; cmd_enter "$@" ;;
+    ls) shift; cmd_ls "$@" ;;
+    open) shift; cmd_open "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    repair | provision) shift; cmd_repair "$@" ;;
+    stop) shift; cmd_stop "$@" ;;
+    start) shift; cmd_start "$@" ;;
+    save) shift; cmd_save "$@" ;;
+    load) shift; cmd_load "$@" ;;
+    extract) shift; cmd_extract "$@" ;;
+    rm) shift; cmd_rm "$@" ;;
+    help | -h | --help) usage ;;
+    *) usage; return 1 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

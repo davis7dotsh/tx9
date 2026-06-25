@@ -1,0 +1,10 @@
+# Encrypted state archives are large / secret — never commit.
+/backups/*
+!/backups/.gitkeep
+*.tar.gz
+*.tar.gz.gpg
+
+# Local registry of boxes created on this machine.
+/.boxes
+/.boxes.tmp
+/.box-locks/

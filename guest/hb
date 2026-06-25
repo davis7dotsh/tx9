@@ -1,0 +1,234 @@
+#!/usr/bin/env bash
+# hb — in-box control for durable layout, Executor, diagnostics, and MCP wiring.
+set -uo pipefail
+# shellcheck disable=SC1091
+[ -f /etc/profile.d/hermes-box.sh ] && . /etc/profile.d/hermes-box.sh
+
+DATA=/data
+AGENT_HOME="$DATA/home/agent"
+LOGS="$DATA/logs"
+PAUSE_FILE=/tmp/hermes-box-executor-paused
+WIRE_VERSION=http-v1
+WIRED="$AGENT_HOME/.hermes-box-wired"
+TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
+TOKEN_ENV="$AGENT_HOME/.config/hermes-box/executor-mcp.env"
+
+init() {
+  mkdir -p "$AGENT_HOME"/{.claude,.codex,.hermes,workspace,.config,.local/share,.local/state} "$LOGS"
+  id agent >/dev/null 2>&1 && chown -R agent:agent "$AGENT_HOME" "$LOGS" 2>/dev/null || true
+}
+
+_port_open() {
+  (exec 3<>"/dev/tcp/127.0.0.1/${EXECUTOR_PORT:-4788}") 2>/dev/null && { exec 3>&-; return 0; }
+  return 1
+}
+
+_wait_port() {
+  local expected="$1" attempt
+  for ((attempt = 0; attempt < 30; attempt++)); do
+    if [[ "$expected" == open ]] && _port_open; then return 0; fi
+    if [[ "$expected" == closed ]] && ! _port_open; then return 0; fi
+    sleep 1
+  done
+  return 1
+}
+
+up() {
+  init
+  rm -f "$PAUSE_FILE"
+  command -v executor >/dev/null 2>&1 || {
+    [[ "${INSTALL_EXECUTOR:-0}" == 1 ]] && { echo "executor not installed" >&2; return 1; }
+    echo "executor disabled"
+    return 0
+  }
+  if _port_open; then echo "executor daemon: running"; return 0; fi
+  echo "starting executor daemon"
+  rm -f "$AGENT_HOME/.executor"/daemon-active-* 2>/dev/null || true
+  executor daemon run >>"$LOGS/executor.log" 2>&1 || true
+  _wait_port open || { echo "executor failed to become ready; see: hb logs executor" >&2; return 1; }
+  echo "executor daemon: ready"
+}
+
+_stop_executor() {
+  command -v executor >/dev/null 2>&1 && executor daemon stop >/dev/null 2>&1 || true
+  pkill -f "executor daemon run" 2>/dev/null || true
+  rm -f "$AGENT_HOME/.executor"/daemon-active-* 2>/dev/null || true
+  _wait_port closed || { echo "executor failed to stop" >&2; return 1; }
+}
+
+pause() {
+  touch "$PAUSE_FILE"
+  _stop_executor
+  echo "executor daemon: paused"
+}
+
+resume() {
+  rm -f "$PAUSE_FILE"
+  up
+}
+
+down() { pause; }
+is_paused() { [[ -e "$PAUSE_FILE" ]]; }
+
+web() {
+  command -v executor >/dev/null 2>&1 || { echo "executor not installed" >&2; return 1; }
+  executor web "$@"
+}
+
+executor_token() {
+  [[ -r "$TOKEN_FILE" ]] || return 1
+  sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TOKEN_FILE" | head -1
+}
+
+_write_token_env() {
+  local token="$1" tmp
+  mkdir -p "$(dirname "$TOKEN_ENV")"
+  tmp="${TOKEN_ENV}.tmp.$$"
+  umask 077
+  printf "export EXECUTOR_MCP_TOKEN='%s'\n" "$token" >"$tmp"
+  mv "$tmp" "$TOKEN_ENV"
+  chmod 0600 "$TOKEN_ENV"
+}
+
+_unwire_legacy() {
+  if command -v claude >/dev/null 2>&1; then
+    (cd "$AGENT_HOME/workspace" && claude mcp remove executor -s local >/dev/null 2>&1) || true
+    claude mcp remove executor -s user >/dev/null 2>&1 || true
+  fi
+  command -v codex >/dev/null 2>&1 && codex mcp remove executor >/dev/null 2>&1 || true
+}
+
+wire_mcp() {
+  if [[ "${WIRE_EXECUTOR_MCP:-0}" != 1 ]]; then
+    echo "executor MCP wiring disabled"
+    _unwire_legacy
+    rm -f "$WIRED" "$TOKEN_ENV"
+    return 0
+  fi
+  command -v executor >/dev/null 2>&1 || { echo "executor not installed" >&2; return 1; }
+  up >/dev/null
+  local token url="http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp" failed=0
+  token="$(executor_token)"
+  [[ -n "$token" ]] || { echo "executor token unavailable" >&2; return 1; }
+  _write_token_env "$token"
+  export EXECUTOR_MCP_TOKEN="$token"
+  _unwire_legacy
+
+  if command -v claude >/dev/null 2>&1; then
+    claude mcp add executor "$url" -s user -t http -H "Authorization: Bearer $token" >/dev/null 2>&1 || {
+      echo "claude: failed to register Executor HTTP MCP" >&2
+      failed=1
+    }
+  fi
+  if command -v codex >/dev/null 2>&1; then
+    codex mcp add executor --url "$url" --bearer-token-env-var EXECUTOR_MCP_TOKEN >/dev/null 2>&1 || {
+      echo "codex: failed to register Executor HTTP MCP" >&2
+      failed=1
+    }
+  fi
+  [[ "$failed" == 0 ]] || return 1
+  printf '%s\n' "$WIRE_VERSION" >"$WIRED"
+  echo "executor HTTP MCP registered for claude and codex"
+}
+
+wire_once() {
+  local token
+  if [[ "${WIRE_EXECUTOR_MCP:-0}" != 1 ]]; then wire_mcp; return; fi
+  token="$(executor_token 2>/dev/null || true)"
+  if [[ -f "$WIRED" && "$(cat "$WIRED")" == "$WIRE_VERSION" && -r "$TOKEN_ENV" && -n "$token" ]] &&
+    grep -Fq "$token" "$TOKEN_ENV"; then return 0; fi
+  wire_mcp
+}
+
+write_manifest() {
+  local tmp="$DATA/.hermes-box-runtime.tmp.$$" manifest="$DATA/.hermes-box-runtime"
+  {
+    printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    printf 'base_image=%s\n' "${BASE_IMAGE:-unknown}"
+    printf 'node=%s\n' "$(node --version 2>/dev/null || echo missing)"
+    printf 'claude=%s\n' "$(claude --version 2>/dev/null || echo missing)"
+    printf 'codex=%s\n' "$(codex --version 2>/dev/null || echo missing)"
+    printf 'hermes=%s\n' "$(hermes --version 2>/dev/null | head -1 || echo missing)"
+    printf 'executor=%s\n' "$(executor --version 2>/dev/null || echo missing)"
+  } >"$tmp"
+  mv "$tmp" "$manifest"
+}
+
+status() {
+  printf 'executor: %s\n' "$(_port_open && echo running || echo stopped)"
+  printf 'paused:   %s\n' "$([[ -e "$PAUSE_FILE" ]] && echo yes || echo no)"
+  printf 'hermes:   %s\n' "$(command -v hermes >/dev/null 2>&1 && echo installed || echo 'not installed')"
+  printf 'mcp:      %s\n' "$([[ -f "$WIRED" ]] && cat "$WIRED" || echo unwired)"
+  printf 'data:     %s\n' "$(du -sh "$DATA" 2>/dev/null | cut -f1)"
+}
+
+versions() {
+  echo "node:     $(node --version 2>/dev/null || echo -)"
+  echo "uv:       $(uv --version 2>/dev/null || echo -)"
+  echo "nvim:     $(nvim --version 2>/dev/null | head -1 || echo -)"
+  echo "claude:   $(claude --version 2>/dev/null || echo -)"
+  echo "codex:    $(codex --version 2>/dev/null || echo -)"
+  echo "hermes:   $(hermes --version 2>/dev/null | head -1 || { command -v hermes >/dev/null 2>&1 && echo installed || echo -; })"
+  echo "executor: $(executor --version 2>/dev/null || { command -v executor >/dev/null 2>&1 && echo installed || echo -; })"
+}
+
+_check() {
+  local label="$1"
+  shift
+  if "$@"; then printf 'ok   %s\n' "$label"; else printf 'FAIL %s\n' "$label" >&2; return 1; fi
+}
+
+_command_exists() { command -v "$1" >/dev/null 2>&1; }
+
+_claude_http_config() {
+  (cd "$AGENT_HOME/workspace" && claude mcp get executor 2>/dev/null) | grep -q "http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp"
+}
+
+_mcp_auth_works() {
+  local token code
+  token="$(executor_token)" || return 1
+  code="$(curl -sS -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $token" "http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp")" || return 1
+  [[ "$code" != 000 && "$code" != 401 ]]
+}
+
+doctor() {
+  local failed=0 cmd
+  for cmd in node uv nvim claude codex; do
+    _check "$cmd installed" _command_exists "$cmd" || failed=1
+  done
+  if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then _check "hermes installed" _command_exists hermes || failed=1; fi
+  if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then
+    _check "executor installed" _command_exists executor || failed=1
+    _check "executor listening" _port_open || failed=1
+    _check "executor MCP bearer accepted" _mcp_auth_works || failed=1
+  fi
+  _check "durable home writable" test -w "$AGENT_HOME" || failed=1
+  _check "managed profile present" test -r /etc/profile.d/hermes-box.sh || failed=1
+  if [[ "${WIRE_EXECUTOR_MCP:-0}" == 1 ]]; then
+    _check "MCP wiring version" test "$(cat "$WIRED" 2>/dev/null)" = "$WIRE_VERSION" || failed=1
+    _check "MCP token environment" test -r "$TOKEN_ENV" || failed=1
+    _check "Claude HTTP MCP config" _claude_http_config || failed=1
+    _check "Codex HTTP MCP config" grep -q 'url = "http://127.0.0.1:4788/mcp"' "$CODEX_HOME/config.toml" || failed=1
+  fi
+  [[ "$failed" == 0 ]]
+}
+
+logs() { tail -n 200 -F "$LOGS/${1:-executor}.log"; }
+
+case "${1:-status}" in
+  init) init ;;
+  up) up ;;
+  down | pause) pause ;;
+  resume) resume ;;
+  is-paused) is_paused ;;
+  web) shift; web "$@" ;;
+  executor-token) executor_token ;;
+  wire-mcp) wire_mcp ;;
+  wire-once) wire_once ;;
+  write-manifest) write_manifest ;;
+  doctor) doctor ;;
+  status) status ;;
+  versions) versions ;;
+  logs) shift; logs "${1:-executor}" ;;
+  *) echo "usage: hb {init|up|down|pause|resume|web|wire-mcp|doctor|status|versions|logs}"; exit 1 ;;
+esac

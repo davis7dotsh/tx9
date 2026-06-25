@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# Persistent box service — smolvm runs this as the box's workload on every start
+# (as the agent user), and it stays alive for the box's lifetime. It keeps the
+# executor daemon up on localhost:4788 and, when a distinct PORT is given, a socat
+# bridge 0.0.0.0:PORT -> 127.0.0.1:4788 so a host port-forward can reach it.
+# (executor's own 0.0.0.0 mode is ephemeral, and exec-started daemons don't
+# survive — so this boot-context loop is what makes host access durable.)
+set -u
+PORT="${1:-4788}"
+# shellcheck disable=SC1091
+[ -f /etc/profile.d/hermes-box.sh ] && . /etc/profile.d/hermes-box.sh
+mkdir -p /data/logs
+PAUSE_FILE=/tmp/hermes-box-executor-paused
+
+_exec_up() { (exec 3<>/dev/tcp/127.0.0.1/4788) 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
+
+while true; do
+  if [ -e "$PAUSE_FILE" ]; then
+    sleep 2
+    continue
+  fi
+  # executor on its persistent localhost daemon
+  if command -v executor >/dev/null 2>&1 && ! _exec_up; then
+    rm -f "$HOME/.executor"/daemon-active-* 2>/dev/null || true   # drop stale records
+    executor daemon run >>/data/logs/executor.log 2>&1 || true
+  fi
+  # socat bridge for host access (only when a distinct port was assigned)
+  if [ "$PORT" != "4788" ] && command -v socat >/dev/null 2>&1 && _exec_up \
+     && ! pgrep -f "TCP-LISTEN:$PORT," >/dev/null 2>&1; then
+    socat "TCP-LISTEN:$PORT,bind=0.0.0.0,fork,reuseaddr" TCP:127.0.0.1:4788 \
+      >>/data/logs/socat.log 2>&1 &
+  fi
+  sleep 20
+done

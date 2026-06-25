@@ -1,0 +1,42 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+state="${SMOLVM_STATE_DIR:?SMOLVM_STATE_DIR must be set}"
+sentinel="${SMOLVM_CALLED:?SMOLVM_CALLED must point to a sentinel}"
+mkdir -p "$state"
+printf '%q ' "$@" >>"$sentinel"
+printf '\n' >>"$sentinel"
+
+name_from_args() {
+  local previous="" value
+  for value in "$@"; do
+    if [[ "$previous" == --name ]]; then printf '%s' "$value"; return; fi
+    previous="$value"
+  done
+  return 1
+}
+
+[[ "${1:-}" == machine ]] || exit 2
+case "${2:-}" in
+  status)
+    name="$(name_from_args "$@")"
+    [[ -d "$state/$name" ]]
+    ;;
+  create)
+    name="$(name_from_args "$@")"
+    mkdir -p "$state/$name"
+    ;;
+  start | stop)
+    name="$(name_from_args "$@")"
+    [[ -d "$state/$name" ]]
+    ;;
+  delete)
+    name="$(name_from_args "$@")"
+    rm -rf "${state:?}/${name:?}"
+    ;;
+  exec)
+    if [[ " $* " == *" -i "* ]]; then cat >/dev/null; fi
+    exit 42
+    ;;
+  *) exit 2 ;;
+esac

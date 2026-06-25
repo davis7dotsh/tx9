@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# /etc/profile.d/hermes-box.sh — environment for every shell in the box.
+# shellcheck disable=SC1091
+[ -r /etc/hermes-box.env ] && . /etc/hermes-box.env
+
+HB=/opt/hermes-box
+export PATH="$HB/bin:$HB/tooling/node-global/bin:$HB/tooling/uv:$PATH"
+
+# neovim is the default editor; its config/state (~/.config/nvim, ~/.local/share/nvim)
+# lands on /data via the XDG vars below.
+export EDITOR=nvim
+export VISUAL=nvim
+
+# All durable state lives under /data so it travels with the box.
+export HOME="${HOME:-/data/home/agent}"
+export HERMES_BOX_DATA=/data
+export CLAUDE_CONFIG_DIR=/data/home/agent/.claude
+export CODEX_HOME=/data/home/agent/.codex
+export HERMES_HOME=/data/home/agent/.hermes   # hermes auth/sessions/skills/memory
+# executor stores under $HOME (XDG) — already on /data via HOME above.
+export XDG_CONFIG_HOME=/data/home/agent/.config
+export XDG_DATA_HOME=/data/home/agent/.local/share
+export XDG_STATE_HOME=/data/home/agent/.local/state
+
+# Codex reads Executor's local bearer token from this environment variable.
+# The root-owned service mints the token; hb refreshes this mode-0600 file when
+# it wires MCP clients.
+EXECUTOR_MCP_ENV="$XDG_CONFIG_HOME/hermes-box/executor-mcp.env"
+# shellcheck disable=SC1090
+[ -r "$EXECUTOR_MCP_ENV" ] && . "$EXECUTOR_MCP_ENV"
