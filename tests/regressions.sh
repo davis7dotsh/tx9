@@ -71,7 +71,7 @@ start_mcp_server() {
   have() { [[ "$1" == awk || "$1" == smolvm ]]; }
   _host_preflight basic
 )
-for missing_health_tool in curl jq; do
+for missing_health_tool in curl jq mktemp; do
   if (
     # shellcheck disable=SC1090
     source "$PROJECT_ROOT/box"
@@ -117,7 +117,7 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
 
   (
     doctor_calls="$tmp/doctor.calls"
-    _host_preflight() { :; }
+    have() { [[ "$1" == awk || "$1" == smolvm ]]; }
     _acquire_lock() { :; }
     _machine_exists() { :; }
     smolvm() { :; }
@@ -138,8 +138,16 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
     [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor' ]]
 
     printf 'doctor-host\t4899\n' >"$REG"
+    if (cmd_doctor doctor-host >/dev/null 2>&1); then
+      echo "exposed-port doctor passed without host health dependencies" >&2
+      exit 1
+    fi
+    [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor\nup\nwire-once\ndoctor' ]]
+
+    : >"$doctor_calls"
+    have() { :; }
     cmd_doctor doctor-host >/dev/null
-    [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor\nup\nwire-once\ndoctor\nexecutor-token\nhost-mcp\nhost-mcp\nhost-mcp' ]]
+    [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor\nexecutor-token\nhost-mcp\nhost-mcp\nhost-mcp' ]]
 
     : >"$doctor_calls"
     : >"$REG"

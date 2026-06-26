@@ -634,13 +634,14 @@ _open_url() {
 cmd_doctor() {
   local n="${1:?usage: box doctor <name>}" port token
   _validate_name "$n"
-  _host_preflight health
+  _host_preflight basic
   _acquire_lock "$n"
   port="$(_reg_port "$n")"
   _machine_exists "$n" || die "smolvm machine '$n' is missing"
   smolvm machine start --name "$n" >/dev/null
   _prepare_runtime "$n" || die "guest readiness or health check failed for '$n'"
   if [[ -n "$port" ]]; then
+    _host_preflight health
     token="$(_guest_hb "$n" executor-token)" || die "could not read Executor's local token"
     [[ -n "$token" ]] || die "Executor token is unavailable"
     _wait_mcp_ready "http://127.0.0.1:${port}/mcp" "$token" ||
