@@ -1,0 +1,19 @@
+[Unit]
+Description=tx9 agent box %i
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=tx9
+Group=tx9
+SupplementaryGroups=kvm
+UMask=0077
+RemainAfterExit=yes
+ExecStart=/opt/tx9/ops/tx9-host start %i
+ExecStop=/opt/tx9/ops/tx9-host stop %i
+TimeoutStartSec=10min
+TimeoutStopSec=2min
+
+[Install]
+WantedBy=multi-user.target

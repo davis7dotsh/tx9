@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+name="${2:-}"
+[[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] || {
+  echo "usage: tx9-host {start|stop|health|backup} <box>" >&2
+  exit 2
+}
+
+TX9_CONFIG="${TX9_CONFIG:-/etc/tx9/tx9.conf}"
+[[ ! -r "$TX9_CONFIG" ]] || { # shellcheck disable=SC1090
+  source "$TX9_CONFIG"
+}
+box_config="${TX9_BOX_CONFIG_DIR:-/etc/tx9/boxes}/${name}.conf"
+[[ ! -r "$box_config" ]] || { # shellcheck disable=SC1090
+  source "$box_config"
+}
+
+root="${TX9_ROOT:-/opt/tx9}"
+box="$root/box"
+[[ -x "$box" ]] || { echo "tx9 box CLI is not executable: $box" >&2; exit 1; }
+
+case "${1:-}" in
+  start) exec "$box" start "$name" ;;
+  stop) exec "$box" stop "$name" ;;
+  health) exec "$box" doctor "$name" ;;
+  backup)
+    destination="${TX9_BACKUP_DIR:-/var/backups/tx9}"
+    credential="${BOX_PASSPHRASE_FILE:-${CREDENTIALS_DIRECTORY:-}/backup-passphrase}"
+    [[ -n "$credential" && -r "$credential" ]] || {
+      echo "backup passphrase credential is unavailable" >&2; exit 1;
+    }
+    mkdir -p "$destination"
+    stamp="$(date -u +%Y%m%d-%H%M%SZ)"
+    base="${name}-${stamp}.tar.gz.gpg"
+    partial="$destination/${base}.partial"
+    final="$destination/$base"
+    checksum_partial="$destination/${base}.sha256.partial"
+    nas_partial=""
+    nas_checksum_partial=""
+    trap 'rm -f -- "$partial" "$checksum_partial" ${nas_partial:+"$nas_partial"} ${nas_checksum_partial:+"$nas_checksum_partial"}' EXIT HUP INT TERM
+    BOX_PASSPHRASE_FILE="$credential" "$box" save "$name" "$partial"
+    (cd "$destination" && sha256sum "${base}.partial" | sed "s/${base}\.partial$/${base}/") >"$checksum_partial"
+    mv "$partial" "$final"
+    mv "$checksum_partial" "$destination/${base}.sha256"
+    if [[ -n "${TX9_NAS_DIR:-}" ]]; then
+      mountpoint -q "$TX9_NAS_DIR" || {
+        echo "local backup retained, but NAS is not mounted: $TX9_NAS_DIR" >&2; exit 1;
+      }
+      nas_partial="$TX9_NAS_DIR/${base}.partial"
+      nas_checksum_partial="$TX9_NAS_DIR/${base}.sha256.partial"
+      cp "$final" "$nas_partial"
+      cp "$destination/${base}.sha256" "$nas_checksum_partial"
+      mv "$nas_partial" "$TX9_NAS_DIR/$base"
+      mv "$nas_checksum_partial" "$TX9_NAS_DIR/${base}.sha256"
+    fi
+    trap - EXIT HUP INT TERM
+    ;;
+  *) echo "usage: tx9-host {start|stop|health|backup} <box>" >&2; exit 2 ;;
+esac

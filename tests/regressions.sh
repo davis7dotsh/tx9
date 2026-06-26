@@ -94,6 +94,28 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
 [[ "$(stat -c '%u' "$manifest" 2>/dev/null || stat -f '%u' "$manifest")" == "$(id -u)" ]]
 [[ -z "$(find "$(dirname "$manifest")" -name 'runtime-manifest.tmp.*' -print -quit)" ]]
 
+# Gateway startup always requires the explicit single-writer confirmation.
+gateway_data="$tmp/gateway-data"
+HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" init
+if HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" gateway-enable >/dev/null 2>&1; then
+  echo "gateway enabled without single-writer confirmation" >&2
+  exit 1
+fi
+HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" gateway-enable \
+  --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY >/dev/null
+[[ ! -e "$gateway_data/home/agent/.config/hermes-box/gateway-disabled" ]]
+
+# Explicit MCP wiring refuses to clear durable quiesce.
+wire_quiesced="$tmp/wire-quiesced"
+HB_DATA="$wire_quiesced" "$PROJECT_ROOT/guest/hb" init
+mkdir -p "$wire_quiesced/home/agent/.config/hermes-box"
+touch "$wire_quiesced/home/agent/.config/hermes-box/quiesced"
+if HB_DATA="$wire_quiesced" "$PROJECT_ROOT/guest/hb" wire-mcp >/dev/null 2>&1; then
+  echo "MCP wiring unexpectedly ran while quiesced" >&2
+  exit 1
+fi
+[[ -e "$wire_quiesced/home/agent/.config/hermes-box/quiesced" ]]
+
 # wire-once must execute its disabled cleanup path without requiring Executor.
 (
   HB_DATA="$tmp/disabled-wire-data"
@@ -117,12 +139,13 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
 
   (
     doctor_calls="$tmp/doctor.calls"
+    mock_quiesced=0
     have() { [[ "$1" == awk || "$1" == smolvm ]]; }
     _acquire_lock() { :; }
     _machine_exists() { :; }
-    smolvm() { :; }
     _guest_hb() {
       printf '%s\n' "$2" >>"$doctor_calls"
+      if [[ "$2" == is-paused ]]; then [[ "$mock_quiesced" == 1 ]]; return; fi
       [[ "$2" != executor-token ]] || printf 'fixture-token\n'
     }
     mcp_attempts=0
@@ -135,24 +158,30 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
 
     doctor_output="$(cmd_doctor no-host-port)"
     grep -q 'host Executor MCP: skipped (no exposed host port)' <<<"$doctor_output"
-    [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor' ]]
+    [[ "$(cat "$doctor_calls")" == $'is-paused\ndoctor' ]]
 
     printf 'doctor-host\t4899\n' >"$REG"
     if (cmd_doctor doctor-host >/dev/null 2>&1); then
       echo "exposed-port doctor passed without host health dependencies" >&2
       exit 1
     fi
-    [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor\nup\nwire-once\ndoctor' ]]
+    [[ "$(cat "$doctor_calls")" == $'is-paused\ndoctor\nis-paused\ndoctor' ]]
 
     : >"$doctor_calls"
     have() { :; }
     cmd_doctor doctor-host >/dev/null
-    [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor\nexecutor-token\nhost-mcp\nhost-mcp\nhost-mcp' ]]
+    [[ "$(cat "$doctor_calls")" == $'is-paused\ndoctor\nexecutor-token\nhost-mcp\nhost-mcp\nhost-mcp' ]]
+
+    : >"$doctor_calls"
+    mock_quiesced=1
+    cmd_doctor doctor-host >/dev/null
+    [[ "$(cat "$doctor_calls")" == $'is-paused\ndoctor' ]]
+    mock_quiesced=0
 
     : >"$doctor_calls"
     : >"$REG"
     WIRE_EXECUTOR_MCP=0 INSTALL_EXECUTOR=0 cmd_doctor disabled-executor >/dev/null
-    [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor' ]]
+    [[ "$(cat "$doctor_calls")" == $'is-paused\ndoctor' ]]
   )
 
   BOX_BROWSER=true _open_url 'http://localhost:1/?_token=not-printed'
@@ -169,6 +198,7 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
   _open_url 'https://fixture.invalid/secret'
 
   start_mcp_server 200 healthy
+  _hermes_api_healthy "$MCP_PORT"
   _mcp_initialize "http://127.0.0.1:$MCP_PORT/mcp" fixture-token
   wait_for_pattern initialized "$MCP_DELETE_FILE"
   wait_for_pattern deleted "$MCP_DELETE_FILE"
@@ -213,6 +243,23 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
   fi
   if _port_free "$MCP_PORT"; then
     echo "occupied TCP port was reported free" >&2
+    exit 1
+  fi
+  kill "$MCP_PID"
+  wait "$MCP_PID" 2>/dev/null || true
+
+  for unhealthy_status in 401 404 500; do
+    start_mcp_server "$unhealthy_status" "api-$unhealthy_status"
+    if _hermes_api_healthy "$MCP_PORT"; then
+      echo "Hermes API HTTP $unhealthy_status passed health" >&2
+      exit 1
+    fi
+    kill "$MCP_PID"
+    wait "$MCP_PID" 2>/dev/null || true
+  done
+  start_mcp_server 200 api-malformed health-malformed
+  if _hermes_api_healthy "$MCP_PORT"; then
+    echo "malformed Hermes API health JSON passed" >&2
     exit 1
   fi
   kill "$MCP_PID"
@@ -294,6 +341,53 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
   [[ "$ready_attempts" == 3 && "$opener_attempt" == 3 ]]
 )
 
+# Open refuses a quiesced box before hb up can clear its marker.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/box"
+  calls="$tmp/open-quiesced.calls"
+  _host_preflight() { :; }
+  _acquire_lock() { :; }
+  _reg_port() { printf '4899\n'; }
+  smolvm() { printf 'smolvm %s\n' "$*" >>"$calls"; }
+  _guest_hb() {
+    printf 'hb %s\n' "$2" >>"$calls"
+    [[ "$2" == is-paused ]]
+  }
+  if (cmd_open quiesced >/dev/null 2>&1); then
+    echo "box open unexpectedly succeeded while quiesced" >&2
+    exit 1
+  fi
+  grep -q 'hb is-paused' "$calls"
+  if grep -q 'hb up' "$calls"; then
+    echo "box open cleared quiesce through hb up" >&2
+    exit 1
+  fi
+)
+
+# Repair refreshes assets but preserves a pre-existing durable quiesce policy.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/box"
+  calls="$tmp/repair-quiesced.calls"
+  _host_preflight() { :; }
+  _acquire_lock() { :; }
+  _machine_exists() { :; }
+  smolvm() { printf 'smolvm %s\n' "$*" >>"$calls"; }
+  _provision_into() { printf 'provision %s %s\n' "$1" "$2" >>"$calls"; }
+  _guest_hb() {
+    printf 'hb %s\n' "$2" >>"$calls"
+    [[ "$2" == is-paused || "$2" == doctor ]]
+  }
+  cmd_repair quiesced >/dev/null
+  grep -q 'provision quiesced full' "$calls"
+  grep -q 'hb doctor' "$calls"
+  if grep -Eq 'hb (up|resume)' "$calls"; then
+    echo "repair resumed a previously quiesced box" >&2
+    exit 1
+  fi
+)
+
 mkdir -p "$tmp/valid/home/agent/workspace" "$tmp/gnupg" "$tmp/host-tmp"
 chmod 0700 "$tmp/gnupg"
 printf 'portable state\n' >"$tmp/valid/home/agent/workspace/probe.txt"
@@ -309,6 +403,21 @@ make_repo() {
   cp "$PROJECT_ROOT/box" "$PROJECT_ROOT/box.env" "$dest/"
   cp -R "$PROJECT_ROOT/guest" "$PROJECT_ROOT/provision" "$dest/"
 }
+
+# Legacy registry rows remain readable and reserve their Executor port.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/box"
+  REG="$tmp/legacy-registry"
+  printf 'legacy\t4900\n' >"$REG"
+  _reg_exists legacy
+  [[ "$(_reg_port legacy)" == 4900 ]]
+  [[ -z "$(_reg_api_port legacy)" ]]
+  if _port_free 4900; then
+    echo "legacy registry port was reported free" >&2
+    exit 1
+  fi
+)
 
 # A failed precheck must preserve a same-named unmanaged smolvm machine.
 preexisting_repo="$tmp/preexisting-repo"
@@ -363,11 +472,71 @@ fi
 [[ ! -d "$tmp/create-signal-state/create-signal-probe" ]]
 [[ ! -s "$create_signal_repo/.boxes" ]]
 grep -q 'machine create' "$tmp/create-signal.calls"
+grep -q -- '--cpus 4 --mem 8192 --overlay 64' "$tmp/create-signal.calls"
 grep -q 'machine delete' "$tmp/create-signal.calls"
 if grep -q 'machine start' "$tmp/create-signal.calls"; then
   echo "create-time signal was not honored before start" >&2
   exit 1
 fi
+
+# Optional Hermes API exposure constructs a distinct loopback forward and
+# passes its guest bridge port to the persistent workload.
+api_repo="$tmp/api-repo"
+make_repo "$api_repo"
+printf '\nEXPOSE_HERMES_API=1\nHERMES_API_PORT_LO=8650\nHERMES_API_PORT_HI=8650\n' >>"$api_repo/box.env"
+if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/api.calls" \
+  SMOLVM_STATE_DIR="$tmp/api-state" SMOLVM_BEHAVIOR=fail-exec \
+  "$api_repo/box" new api-probe >/dev/null 2>&1; then
+  echo "mock API provisioning failure unexpectedly succeeded" >&2
+  exit 1
+fi
+grep -q -- '-p 8650:8650' "$tmp/api.calls"
+grep -q 'hb-workload.*8650' "$tmp/api.calls"
+
+# Native import fails closed. External provider state requires explicit consent
+# before any VM command, and failures/signals after disable never restart it.
+python3 - "$tmp/hermes-import.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], "w") as archive:
+    archive.writestr("config.yaml", "model: fixture\n")
+    archive.writestr(".env", "DISCORD_BOT_TOKEN=fixture\n")
+    archive.writestr("_external/.honcho/config.json", "{}\n")
+PY
+import_repo="$tmp/import-repo"
+make_repo "$import_repo"
+mkdir -p "$tmp/import-state/import-probe"
+printf 'import-probe\t\n' >"$import_repo/.boxes"
+if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/import-no-consent.calls" \
+  SMOLVM_STATE_DIR="$tmp/import-state" SMOLVM_BEHAVIOR=success \
+  "$import_repo/box" import-hermes import-probe "$tmp/hermes-import.zip" >/dev/null 2>&1; then
+  echo "external import without consent unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ ! -e "$tmp/import-no-consent.calls" ]]
+
+if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/import-fail.calls" \
+  SMOLVM_STATE_DIR="$tmp/import-state" SMOLVM_BEHAVIOR=import-post-fail \
+  "$import_repo/box" import-hermes import-probe "$tmp/hermes-import.zip" \
+    --include-external >/dev/null 2>&1; then
+  echo "post-import verification failure unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ -e "$tmp/import-state/import-probe/gateway-disabled" ]]
+[[ ! -e "$tmp/import-state/import-probe/gateway-restarted" ]]
+grep -q 'hb gateway-disable' "$tmp/import-fail.calls"
+grep -q 'hb resume' "$tmp/import-fail.calls"
+
+rm -f "$tmp/import-state/import-probe/paused"
+if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/import-signal.calls" \
+  SMOLVM_STATE_DIR="$tmp/import-state" SMOLVM_BEHAVIOR=signal-import \
+  "$import_repo/box" import-hermes import-probe "$tmp/hermes-import.zip" \
+    --include-external >/dev/null 2>&1; then
+  echo "signal-interrupted import unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ -e "$tmp/import-state/import-probe/gateway-disabled" ]]
+[[ ! -e "$tmp/import-state/import-probe/gateway-restarted" ]]
+grep -q 'hb resume' "$tmp/import-signal.calls"
 
 # Pause may have taken effect even when the pause command reports failure. The
 # existing box is tracked early and resumed during cleanup.

@@ -68,19 +68,38 @@ install_hermes() {
   if [[ "${INSTALL_HERMES:-0}" != "1" ]]; then
     log "hermes: INSTALL_HERMES != 1 — skipping"; return
   fi
-  log "hermes (official installer, ${HERMES_INSTALL_ARGS:-})"
+  local sha="${HERMES_GIT_SHA:-}" bundle="${HERMES_GIT_BUNDLE:-}" install_dir=/usr/local/lib/hermes-agent
+  [[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]] || { log "invalid HERMES_GIT_SHA: $sha"; return 1; }
+  log "hermes (official installer pinned to $sha)"
   # We run as root, so the installer uses the FHS layout: code -> /usr/local/lib,
   # binary -> /usr/local/bin/hermes (both baked into the golden). HERMES_HOME pins
   # the durable state (auth, sessions, skills, memory) onto /data.
   export HERMES_HOME=/data/home/agent/.hermes
   mkdir -p "$HERMES_HOME"
+  if [[ -n "$bundle" ]]; then
+    [[ "$bundle" != /* && "$bundle" != *..* && "$bundle" == artifacts/* ]] || {
+      log "HERMES_GIT_BUNDLE must be a safe path beneath artifacts/"; return 1;
+    }
+    [[ -f "$CTX/$bundle" ]] || { log "Hermes Git bundle is missing: $CTX/$bundle"; return 1; }
+    git bundle verify "$CTX/$bundle" >/dev/null
+    rm -rf "$install_dir"
+    git clone --no-checkout "$CTX/$bundle" "$install_dir" >/dev/null
+    git -C "$install_dir" cat-file -e "$sha^{commit}"
+    git -C "$install_dir" remote set-url origin "${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
+    git -C "$install_dir" fetch origin main
+    git -C "$install_dir" checkout -B main origin/main
+  fi
   # `bash -s` reads the script from stdin (the curl pipe) — do NOT redirect stdin,
   # or bash gets an empty script. Prompts in the script hit EOF on the pipe, so
   # it stays non-interactive without a redirect.
   local args=()
   read -r -a args <<<"${HERMES_INSTALL_ARGS:-}"
   if curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
-       | bash -s -- "${args[@]}"; then
+       | bash -s -- --dir "$install_dir" --hermes-home "$HERMES_HOME" \
+         --commit "$sha" --skip-setup --non-interactive "${args[@]}"; then
+    [[ "$(git -C "$install_dir" rev-parse HEAD)" == "$sha" ]] || {
+      log "Hermes checkout verification failed"; return 1;
+    }
     log "hermes installed -> $(command -v hermes || echo '/usr/local/bin/hermes')"
   else
     log "hermes install FAILED"
@@ -113,6 +132,7 @@ place_assets() {
   install -m 0644 "$CTX/guest/tmux.conf"    "$OPT/tmux.conf"
   install -m 0755 "$CTX/guest/hb"           "$OPT/bin/hb"
   install -m 0755 "$CTX/guest/hb-workload"  "$OPT/bin/hb-workload"
+  install -m 0755 "$CTX/guest/hermes-state" "$OPT/bin/hermes-state"
   # agent login shell auto-attaches tmux; see guest/agent-bash-profile.sh
   mkdir -p /data/home/agent
   install -m 0644 "$CTX/guest/agent-bash-profile.sh" /data/home/agent/.bash_profile
@@ -142,6 +162,9 @@ verify_required() {
   done
   if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then command -v hermes >/dev/null 2>&1; fi
   if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then command -v executor >/dev/null 2>&1; fi
+  if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then
+    [[ "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" == "${HERMES_GIT_SHA}" ]]
+  fi
 }
 
 assets_only() {

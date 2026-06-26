@@ -65,12 +65,22 @@ case "${2:-}" in
     if [[ "$behavior" == restore-tar-fail && "$*" == *"archive=\$1"* && "$*" == *"tar xzf"* ]]; then
       exit 42
     fi
+    if [[ "$behavior" == signal-import && "$*" == *"hermes-state import-zip"* ]]; then
+      kill -TERM "$PPID"
+      sleep 1
+      exit 143
+    fi
+    if [[ "$behavior" == import-post-fail && "$*" == *" hb verify-state"* ]]; then exit 42; fi
     if [[ "$*" == *" hb is-paused"* ]]; then [[ -e "$state/$name/paused" ]]; exit; fi
     if [[ "$*" == *" hb pause"* ]]; then
       touch "$state/$name/paused"
       [[ "$behavior" != pause-fail ]] || exit 42
     fi
-    if [[ "$*" == *" hb resume"* ]]; then rm -f "$state/$name/paused"; fi
+    if [[ "$*" == *" hb gateway-disable"* ]]; then touch "$state/$name/gateway-disabled"; fi
+    if [[ "$*" == *" hb resume"* ]]; then
+      rm -f "$state/$name/paused"
+      [[ -e "$state/$name/gateway-disabled" ]] || touch "$state/$name/gateway-restarted"
+    fi
     if [[ "$*" == *" hb executor-token"* ]]; then printf 'fixture-token\n'; fi
     ;;
   cp)

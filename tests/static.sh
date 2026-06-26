@@ -11,13 +11,15 @@ files=(
   guest/profile.sh
   guest/agent-bash-profile.sh
   provision/provision.sh
+  ops/tx9-host
   tests/lifecycle-smoke.sh
+  tests/hermes-state.sh
   tests/regressions.sh
   tests/fixtures/smolvm
 )
 
 bash -n "${files[@]}"
-for file in box guest/hb guest/hb-workload provision/provision.sh tests/lifecycle-smoke.sh tests/regressions.sh tests/fixtures/smolvm; do
+for file in box guest/hb guest/hb-workload guest/hermes-state provision/provision.sh ops/tx9-host tests/lifecycle-smoke.sh tests/hermes-state.sh tests/regressions.sh tests/fixtures/smolvm; do
   [[ -x "$file" ]] || { echo "not executable: $file" >&2; exit 1; }
 done
 
@@ -44,6 +46,15 @@ grep -q 'protocolVersion.*2025-03-26' box
 grep -q 'protocolVersion.*2025-03-26' guest/hb
 grep -q 'ca-certificates curl git jq tmux' provision/provision.sh
 grep -q 'runuser -u agent.*hb.*write-manifest' provision/provision.sh
+grep -q -- '--commit.*sha' provision/provision.sh
+grep -q 'BOX_OVERLAY_GIB="64"' box.env
+grep -q 'gateway-disable' box
+grep -Fq -- '--exclude="*/.hermes/*.db-wal"' box
+if grep -Fq -- '--exclude="*.db-wal"' box; then
+  echo "unrelated /data SQLite WAL files are still excluded" >&2
+  exit 1
+fi
+grep -q 'LoadCredential=backup-passphrase' ops/systemd/tx9-backup@.service
 grep -qi 'networking is always enabled' README.md
 grep -q 'intentionally no CI configuration yet' README.md
 

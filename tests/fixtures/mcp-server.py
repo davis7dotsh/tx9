@@ -116,6 +116,18 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         self.respond(400)
 
+    def do_GET(self):
+        if self.path != "/health":
+            self.respond(404)
+            return
+        if status != 200:
+            self.respond(status, b'{"status":"error"}', "application/json")
+            return
+        body = b'{"status":"ok","platform":"hermes-agent"}'
+        if response_mode == "health-malformed":
+            body = b'{"status":'
+        self.respond(200, body, "application/json")
+
     def do_DELETE(self):
         if (
             self.path == "/mcp"
