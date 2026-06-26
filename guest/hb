@@ -18,8 +18,13 @@ TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
 TOKEN_ENV="$AGENT_HOME/.config/hermes-box/executor-mcp.env"
 
 init() {
-  mkdir -p "$AGENT_HOME"/{.claude,.codex,.hermes,workspace,.config/hermes-box,.local/share,.local/state} "$LOGS"
-  id agent >/dev/null 2>&1 && chown -R agent:agent "$AGENT_HOME" "$LOGS" 2>/dev/null || true
+  local managed=(
+    "$AGENT_HOME" "$AGENT_HOME/.claude" "$AGENT_HOME/.codex" "$AGENT_HOME/.hermes"
+    "$AGENT_HOME/workspace" "$AGENT_HOME/.config" "$AGENT_HOME/.config/hermes-box"
+    "$AGENT_HOME/.local" "$AGENT_HOME/.local/share" "$AGENT_HOME/.local/state" "$LOGS"
+  )
+  mkdir -p "${managed[@]}"
+  id agent >/dev/null 2>&1 && chown agent:agent "${managed[@]}" 2>/dev/null || true
   if [[ ! -e "$GATEWAY_POLICY" ]]; then
     touch "$GATEWAY_DISABLED" "$GATEWAY_POLICY"
   fi
@@ -78,14 +83,14 @@ _start_gateway() {
 up() {
   init
   rm -f "$QUIESCE_FILE"
-  _executor_up
+  _executor_up || return 1
   _start_gateway
 }
 
 reconcile() {
   init
   [[ ! -e "$QUIESCE_FILE" ]] || return 0
-  _executor_up
+  _executor_up || return 1
   _start_gateway
 }
 
@@ -139,7 +144,10 @@ gateway_enable() {
   [[ ! -e "$QUIESCE_FILE" ]] || { echo "box is quiesced; resume it before requesting gateway startup" >&2; return 1; }
   if [[ -r "$STATE_DIR/import-manifest.json" ]]; then cutover_ready || return 1; fi
   rm -f "$GATEWAY_DISABLED"
-  _start_gateway || return 1
+  if ! _start_gateway; then
+    touch "$GATEWAY_DISABLED"
+    return 1
+  fi
   echo "Hermes gateway startup requested; run 'hb doctor' and require deep health before declaring cutover complete"
 }
 
@@ -388,7 +396,11 @@ doctor() {
   fi
   _check "durable home writable" test -w "$AGENT_HOME" || failed=1
   _check "managed profile present" test -r /etc/profile.d/hermes-box.sh || failed=1
-  _check "Hermes state integrity" _hermes_state_valid || failed=1
+  if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then
+    _check "Hermes state integrity" _hermes_state_valid || failed=1
+  else
+    printf 'ok   Hermes state check skipped (INSTALL_HERMES != 1)\n'
+  fi
   if [[ "${WIRE_EXECUTOR_MCP:-0}" == 1 ]]; then
     _check "MCP wiring version" test "$(cat "$WIRED" 2>/dev/null)" = "$WIRE_VERSION" || failed=1
     _check "MCP token environment" test -r "$TOKEN_ENV" || failed=1

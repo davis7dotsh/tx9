@@ -22,7 +22,12 @@ case "${2:-}" in
   status)
     name="$(name_from_args "$@")"
     [[ "$behavior" != delete-status-fail ]] || exit 42
-    [[ -d "$state/$name" ]]
+    [[ -d "$state/$name" ]] || exit 1
+    if [[ "$behavior" == inactive ]]; then
+      printf "Machine '%s': stopped\n" "$name"
+    else
+      printf "Machine '%s': running\n" "$name"
+    fi
     ;;
   create)
     name="$(name_from_args "$@")"

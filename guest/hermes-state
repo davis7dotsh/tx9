@@ -29,6 +29,10 @@ SECRET_NAMES = {".env", "auth.json", "state.db"}
 EXTERNAL_SECRET_SUFFIXES = {".json", ".env", ".conf", ".key", ".pem"}
 MARKERS = {"config.yaml", ".env", "state.db"}
 MAX_UNCOMPRESSED = 100 * 1024**3
+RESERVED_EXTERNAL = {
+    ".ssh", ".config", "workspace", ".bashrc", ".bash_profile", ".profile",
+    ".zshrc", ".zprofile", ".zshenv",
+}
 
 
 def _safe_relative(name: str) -> PurePosixPath:
@@ -60,10 +64,13 @@ def _zip_layout(zf: zipfile.ZipFile) -> tuple[str, list[zipfile.ZipInfo]]:
         raise ValueError("archive is empty")
     first = {PurePosixPath(info.filename).parts[0] for info in files}
     prefix = next(iter(first)) + "/" if len(first) == 1 and next(iter(first)) in {".hermes", "hermes"} else ""
-    found = {
-        PurePosixPath(info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename).name
-        for info in files
-    }
+    found = set()
+    for info in files:
+        relative = PurePosixPath(
+            info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
+        )
+        if relative.parts[0] != "_external":
+            found.add(relative.name)
     if not found.intersection(MARKERS):
         raise ValueError("archive is not a native Hermes backup (no config, env, or state database)")
     return prefix, files
@@ -217,7 +224,7 @@ def _extract(
     external_stage: Path,
     prefix: str,
     files: list[zipfile.ZipInfo],
-    include_external: bool,
+    approved_external: set[str],
 ) -> dict[str, int]:
     accounting = {"archive_files": len(files), "hermes_files": 0, "external_files": 0, "skipped_files": 0}
     for info in files:
@@ -227,9 +234,8 @@ def _extract(
             if len(rel.parts) == 1:
                 accounting["skipped_files"] += 1
                 continue
-            if not include_external:
-                accounting["skipped_files"] += 1
-                continue
+            if rel.parts[1] not in approved_external:
+                raise ValueError(f"unapproved external provider entry: {rel.parts[1]}")
             target = external_stage.joinpath(*rel.parts[1:])
             external = True
         elif _skip(rel):
@@ -242,9 +248,12 @@ def _extract(
         with zf.open(info) as source, target.open("wb") as destination:
             shutil.copyfileobj(source, destination, length=1024 * 1024)
         secret = target.name in SECRET_NAMES or target.suffix.lower() in EXTERNAL_SECRET_SUFFIXES
-        target.chmod(0o600 if secret else 0o644)
+        archived_mode = (info.external_attr >> 16) & 0o777
+        executable_path = any(part in {"hooks", "scripts"} for part in rel.parts[:-1])
+        safe_mode = archived_mode if executable_path and archived_mode else 0o644
+        target.chmod(0o600 if secret else safe_mode & 0o777)
         accounting["external_files" if external else "hermes_files"] += 1
-    if include_external:
+    if approved_external:
         for directory in external_stage.rglob("*"):
             if directory.is_dir():
                 directory.chmod(0o700)
@@ -298,9 +307,26 @@ def import_zip(
     home: Path,
     mappings: list[tuple[str, str]],
     manifest: Path,
-    include_external: bool,
+    approved_external: set[str],
 ) -> dict[str, object]:
-    validate_zip(path)
+    archive_report = validate_zip(path)
+    archive_external = set(archive_report["external_top_level_entries"])
+    if archive_external & RESERVED_EXTERNAL:
+        raise ValueError(
+            "archive contains reserved external destinations: "
+            + ", ".join(sorted(archive_external & RESERVED_EXTERNAL))
+        )
+    if approved_external & RESERVED_EXTERNAL:
+        raise ValueError(
+            "reserved external destinations are never importable: "
+            + ", ".join(sorted(approved_external & RESERVED_EXTERNAL))
+        )
+    unapproved = archive_external - approved_external
+    unexpected = approved_external - archive_external
+    if unapproved:
+        raise ValueError("unapproved external provider entries: " + ", ".join(sorted(unapproved)))
+    if unexpected:
+        raise ValueError("approved external entries not present: " + ", ".join(sorted(unexpected)))
     parent = home.parent
     parent.mkdir(parents=True, exist_ok=True)
     stage = Path(tempfile.mkdtemp(prefix=f".{home.name}.import-", dir=parent))
@@ -313,7 +339,7 @@ def import_zip(
     try:
         with zipfile.ZipFile(path) as zf:
             prefix, files = _zip_layout(zf)
-            accounting = _extract(zf, stage, external_stage, prefix, files, include_external)
+            accounting = _extract(zf, stage, external_stage, prefix, files, approved_external)
         source_report = inspect_home(stage)
         source_report["external_files"] = sum(1 for item in external_stage.rglob("*") if item.is_file())
         rewritten = _rewrite_active(stage, mappings)
@@ -327,6 +353,10 @@ def import_zip(
             target = Path.home() / source.name
             if target == home or source.name in {".", ".."}:
                 raise ValueError(f"unsafe external Hermes state target: {target}")
+            if target.is_symlink() or (
+                target.is_dir() and any(item.is_symlink() for item in target.rglob("*"))
+            ):
+                raise ValueError(f"existing external provider tree contains symlinks: {target}")
             candidate = source
             if source.is_dir() and target.is_dir():
                 candidate = external_merge / source.name
@@ -355,6 +385,7 @@ def import_zip(
             "path_maps": [{"from": source, "to": destination} for source, destination in mappings],
             "external_state_imported": bool(external_swaps),
             "external_top_level_entries": [target.name for target, _ in external_swaps],
+            "external_approved": sorted(approved_external),
             "accounting": accounting,
             "active_paths_reviewed": False,
             "gateway_enabled": False,
@@ -453,7 +484,7 @@ def main() -> None:
     importer.add_argument("--home", type=Path, default=Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")))
     importer.add_argument("--manifest", type=Path, default=Path.home() / ".config/hermes-box/import-manifest.json")
     importer.add_argument("--map", action="append", type=_mapping, default=[])
-    importer.add_argument("--include-external", action="store_true")
+    importer.add_argument("--external", action="append", default=[])
     acknowledge = subparsers.add_parser("acknowledge-paths")
     acknowledge.add_argument("--manifest", type=Path, default=Path.home() / ".config/hermes-box/import-manifest.json")
     cutover = subparsers.add_parser("cutover-check")
@@ -465,7 +496,7 @@ def main() -> None:
     elif args.command == "verify":
         result = inspect_home(args.home, args.checkpoint)
     elif args.command == "import-zip":
-        result = import_zip(args.archive, args.home, args.map, args.manifest, args.include_external)
+        result = import_zip(args.archive, args.home, args.map, args.manifest, set(args.external))
     elif args.command == "acknowledge-paths":
         result = acknowledge_paths(args.manifest)
     else:

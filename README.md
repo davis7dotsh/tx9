@@ -180,7 +180,9 @@ Native `hermes backup` imports add ZIP traversal/symlink validation, staging and
 atomic swap, SQLite integrity and inventory baselines, and active-file-only path
 rewrites. Historical sessions, memories, databases, and logs are not rewritten.
 External provider state is previewed and rejected unless the operator explicitly
-adds `--include-external`; ordinary supplemental trees remain separate.
+approves every safe top-level destination with repeatable `--external NAME`
+flags; reserved destinations such as `.ssh`, `.config`, and shell startup files
+are never imported. Ordinary supplemental trees remain separate.
 See [Nexus operations and Eventide migration](docs/nexus-operations.md) for the
 host systemd units, scheduled encrypted backups, NAS rules, and cutover gates.
 

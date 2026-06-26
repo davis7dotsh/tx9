@@ -81,10 +81,19 @@ On Nexus:
 
 ```bash
 sudo -u tx9 /opt/tx9/box new hermes
+sudo -u tx9 python3 /opt/tx9/guest/hermes-state validate-zip \
+  /var/lib/tx9/hermes-backup.zip | jq '.external_top_level_entries'
 sudo -u tx9 /opt/tx9/box import-hermes hermes /var/lib/tx9/hermes-backup.zip \
+  --external .honcho \
   --map /Users/davis=/data/home/agent
 sudo -u tx9 /opt/tx9/box doctor hermes
 ```
+
+The validation command is the no-mutation preview. Replace `.honcho` with the
+exact safe names it reports and repeat `--external NAME` once per intended
+provider. Import rejects any unapproved name and always rejects `.ssh`, broad
+`.config` or `workspace`, and shell startup files. Do not approve a name merely
+to make the command pass; confirm it belongs to the Eventide memory provider.
 
 Import validates all ZIP paths and rejects symlinks before guest mutation. It
 extracts to a sibling staging directory, verifies every SQLite database, applies
@@ -110,6 +119,23 @@ sudo systemctl enable --now tx9-box@hermes.service
 sudo systemctl enable --now tx9-health@hermes.timer tx9-backup@hermes.timer
 ```
 
+Health and backup units are ordered after the box service but do not require or
+start it. Their helper checks that the smolvm machine is already running and
+fails clearly when it is inactive, preserving deliberate stops.
+
+After enabling supervision, manage the Nexus box lifecycle through systemd:
+
+```bash
+sudo systemctl stop tx9-box@hermes.service
+sudo systemctl start tx9-box@hermes.service
+```
+
+Running `box stop hermes` directly while that supervisor is active is only a
+temporary stop: the supervisor treats the loss as unexpected and starts it
+again. A systemd-stopped box stays stopped; scheduled health and backup runs
+then fail clearly and never restart it. Standalone boxes without the systemd
+unit may continue to use the ordinary `box stop` and `box start` commands.
+
 The manifest records source and destination SQLite integrity, `user_version`,
 session/message table counts, session/memory/skill file inventories, cron totals,
 Discord configuration presence, and rewritten files. Import leaves the Hermes
@@ -121,7 +147,10 @@ gateway disabled while Executor remains usable.
 2. Stop and disable its Hermes gateway and watchdog. Confirm no gateway process,
    cron dispatcher, or Discord connection remains.
 3. Create a final native `hermes backup` on Eventide and install it for `tx9`.
-4. Re-run `box import-hermes` with the final ZIP.
+4. Preview the final ZIP's `external_top_level_entries` again, then re-run
+   `box import-hermes` with explicit approvals for every intended provider, for
+   example `--external .honcho`. This final single-writer import must include the
+   intended external memory-provider state; never rely on rehearsal state.
 5. Inspect the newly replaced, current import manifest and active paths. Compare
    its SQLite
    integrity `ok`, identical schema/user version, session/message counts, session

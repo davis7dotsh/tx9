@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2016
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -47,6 +48,16 @@ grep -q 'protocolVersion.*2025-03-26' guest/hb
 grep -q 'ca-certificates curl git jq tmux' provision/provision.sh
 grep -q 'runuser -u agent.*hb.*write-manifest' provision/provision.sh
 grep -q -- '--commit.*sha' provision/provision.sh
+grep -q 'HERMES_INSTALLER_SHA256="[0-9a-f]\{64\}"' box.env
+grep -q 'sha256sum --check --status' provision/provision.sh
+if grep -q 'curl .*install.sh.*|.*bash' provision/provision.sh; then
+  echo "unverified Hermes installer execution remains" >&2
+  exit 1
+fi
+if grep -q 'git -C "$install_dir" fetch origin main' provision/provision.sh; then
+  echo "bundle provisioning still fetches the public origin" >&2
+  exit 1
+fi
 grep -q 'BOX_OVERLAY_GIB="64"' box.env
 grep -q 'gateway-disable' box
 grep -Fq -- '--exclude="*/.hermes/*.db-wal"' box
@@ -55,6 +66,23 @@ if grep -Fq -- '--exclude="*.db-wal"' box; then
   exit 1
 fi
 grep -q 'LoadCredential=backup-passphrase' ops/systemd/tx9-backup@.service
+if grep -q '^Requires=tx9-box@' ops/systemd/tx9-*.service; then
+  echo "timer service still pulls the box service active" >&2
+  exit 1
+fi
+grep -q '^Type=simple$' ops/systemd/tx9-box@.service
+grep -q 'tx9-host supervise %i' ops/systemd/tx9-box@.service
+grep -Fq 'ExecStop=/bin/kill -TERM $MAINPID' ops/systemd/tx9-box@.service
+if grep -q '^RemainAfterExit=' ops/systemd/tx9-box@.service; then
+  echo "box supervisor is still modeled as a oneshot service" >&2
+  exit 1
+fi
+if grep -q 'chown -R' guest/hb; then
+  echo "reconcile still recursively changes durable-tree ownership" >&2
+  exit 1
+fi
+grep -q 'EXECUTOR_TARGET_PORT="${EXECUTOR_PORT:-4788}"' guest/hb-workload
+grep -q 'TCP:127.0.0.1:$EXECUTOR_TARGET_PORT' guest/hb-workload
 grep -qi 'networking is always enabled' README.md
 grep -q 'intentionally no CI configuration yet' README.md
 

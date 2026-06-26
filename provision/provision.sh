@@ -69,7 +69,9 @@ install_hermes() {
     log "hermes: INSTALL_HERMES != 1 — skipping"; return
   fi
   local sha="${HERMES_GIT_SHA:-}" bundle="${HERMES_GIT_BUNDLE:-}" install_dir=/usr/local/lib/hermes-agent
+  local installer_sha="${HERMES_INSTALLER_SHA256:-}" installer
   [[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]] || { log "invalid HERMES_GIT_SHA: $sha"; return 1; }
+  [[ "$installer_sha" =~ ^[0-9a-fA-F]{64}$ ]] || { log "invalid HERMES_INSTALLER_SHA256"; return 1; }
   log "hermes (official installer pinned to $sha)"
   # We run as root, so the installer uses the FHS layout: code -> /usr/local/lib,
   # binary -> /usr/local/bin/hermes (both baked into the golden). HERMES_HOME pins
@@ -85,26 +87,41 @@ install_hermes() {
     rm -rf "$install_dir"
     git clone --no-checkout "$CTX/$bundle" "$install_dir" >/dev/null
     git -C "$install_dir" cat-file -e "$sha^{commit}"
-    git -C "$install_dir" remote set-url origin "${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
-    git -C "$install_dir" fetch origin main
-    git -C "$install_dir" checkout -B main origin/main
+    git -C "$install_dir" checkout --detach "$sha"
   fi
-  # `bash -s` reads the script from stdin (the curl pipe) — do NOT redirect stdin,
-  # or bash gets an empty script. Prompts in the script hit EOF on the pipe, so
-  # it stays non-interactive without a redirect.
   local args=()
   read -r -a args <<<"${HERMES_INSTALL_ARGS:-}"
-  if curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
-       | bash -s -- --dir "$install_dir" --hermes-home "$HERMES_HOME" \
-         --commit "$sha" --skip-setup --non-interactive "${args[@]}"; then
+  installer="$(mktemp)"
+  if ! curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o "$installer"; then
+    rm -f "$installer"
+    log "Hermes installer download failed"
+    return 1
+  fi
+  if ! printf '%s  %s\n' "$installer_sha" "$installer" | sha256sum --check --status; then
+    rm -f "$installer"
+    log "Hermes installer checksum verification failed"
+    return 1
+  fi
+  if bash "$installer" --dir "$install_dir" --hermes-home "$HERMES_HOME" \
+       --commit "$sha" --skip-setup --non-interactive "${args[@]}"; then
+    rm -f "$installer"
     [[ "$(git -C "$install_dir" rev-parse HEAD)" == "$sha" ]] || {
       log "Hermes checkout verification failed"; return 1;
     }
+    own_hermes_home
     log "hermes installed -> $(command -v hermes || echo '/usr/local/bin/hermes')"
   else
+    rm -f "$installer"
     log "hermes install FAILED"
     return 1
   fi
+}
+
+own_hermes_home() {
+  # The verified installer runs as root and may create mutable state several
+  # levels deep. Repair ownership only inside Hermes's durable state root.
+  chown -R agent:agent "$HERMES_HOME"
+  chmod -R u+rwX "$HERMES_HOME"
 }
 
 install_executor() {
@@ -136,6 +153,7 @@ place_assets() {
   # agent login shell auto-attaches tmux; see guest/agent-bash-profile.sh
   mkdir -p /data/home/agent
   install -m 0644 "$CTX/guest/agent-bash-profile.sh" /data/home/agent/.bash_profile
+  chown agent:agent /data/home/agent/.bash_profile
 }
 
 seed_data() {
@@ -193,8 +211,10 @@ main() {
   PATH="$NODE_PREFIX/bin:$UV_DIR:$PATH" "$OPT/bin/hb" versions || true
 }
 
-case "${1:-full}" in
-  full) main ;;
-  assets) assets_only ;;
-  *) log "unknown provisioning mode: $1"; exit 2 ;;
-esac
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  case "${1:-full}" in
+    full) main ;;
+    assets) assets_only ;;
+    *) log "unknown provisioning mode: $1"; exit 2 ;;
+  esac
+fi

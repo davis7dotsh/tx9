@@ -3,7 +3,7 @@ set -euo pipefail
 
 name="${2:-}"
 [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] || {
-  echo "usage: tx9-host {start|stop|health|backup} <box>" >&2
+  echo "usage: tx9-host {start|stop|supervise|health|backup} <box>" >&2
   exit 2
 }
 
@@ -20,13 +20,57 @@ root="${TX9_ROOT:-/opt/tx9}"
 box="$root/box"
 [[ -x "$box" ]] || { echo "tx9 box CLI is not executable: $box" >&2; exit 1; }
 
+require_active() {
+  local status
+  status="$(smolvm machine status --name "$name" 2>/dev/null)" || {
+    echo "tx9 box '$name' is missing; scheduled operation will not start it" >&2
+    return 1
+  }
+  grep -q ': running' <<<"$status" || {
+    echo "tx9 box '$name' is inactive; scheduled operation will not start it" >&2
+    return 1
+  }
+}
+
 case "${1:-}" in
   start) exec "$box" start "$name" ;;
   stop) exec "$box" stop "$name" ;;
-  health) exec "$box" doctor "$name" ;;
+  supervise)
+    interval="${TX9_SUPERVISE_INTERVAL_SECONDS:-20}"
+    [[ "$interval" =~ ^[1-9][0-9]*$ && "$interval" -le 300 ]] || {
+      echo "TX9_SUPERVISE_INTERVAL_SECONDS must be 1-300" >&2; exit 2;
+    }
+    stopping=0
+    sleeper=""
+    stop_supervisor() {
+      stopping=1
+      [[ -z "$sleeper" ]] || kill "$sleeper" 2>/dev/null || true
+    }
+    trap stop_supervisor HUP INT TERM
+    "$box" start "$name"
+    while [[ "$stopping" == 0 ]]; do
+      if [[ "${TX9_SUPERVISE_ONCE:-0}" != 1 ]]; then
+        sleep "$interval" &
+        sleeper=$!
+        wait "$sleeper" || true
+        sleeper=""
+        [[ "$stopping" == 0 ]] || break
+      fi
+      [[ "$stopping" == 0 ]] || break
+      if ! smolvm machine status --name "$name" 2>/dev/null | grep -q ': running'; then
+        [[ "$stopping" == 0 ]] || break
+        echo "tx9 box '$name' stopped unexpectedly; restarting" >&2
+        "$box" start "$name"
+      fi
+      [[ "${TX9_SUPERVISE_ONCE:-0}" != 1 ]] || break
+    done
+    trap - HUP INT TERM
+    ;;
+  health) require_active; exec "$box" doctor "$name" ;;
   backup)
+    require_active
     destination="${TX9_BACKUP_DIR:-/var/backups/tx9}"
-    credential="${BOX_PASSPHRASE_FILE:-${CREDENTIALS_DIRECTORY:-}/backup-passphrase}"
+    credential="${BOX_PASSPHRASE_FILE:-${CREDENTIALS_DIRECTORY:+${CREDENTIALS_DIRECTORY}/backup-passphrase}}"
     [[ -n "$credential" && -r "$credential" ]] || {
       echo "backup passphrase credential is unavailable" >&2; exit 1;
     }
@@ -56,5 +100,5 @@ case "${1:-}" in
     fi
     trap - EXIT HUP INT TERM
     ;;
-  *) echo "usage: tx9-host {start|stop|health|backup} <box>" >&2; exit 2 ;;
+  *) echo "usage: tx9-host {start|stop|supervise|health|backup} <box>" >&2; exit 2 ;;
 esac

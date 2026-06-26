@@ -1,7 +1,6 @@
 [Unit]
 Description=Verify tx9 agent box %i
 After=tx9-box@%i.service
-Requires=tx9-box@%i.service
 
 [Service]
 Type=oneshot

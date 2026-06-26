@@ -4,14 +4,16 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
-Type=oneshot
+Type=simple
 User=tx9
 Group=tx9
 SupplementaryGroups=kvm
 UMask=0077
-RemainAfterExit=yes
-ExecStart=/opt/tx9/ops/tx9-host start %i
+ExecStart=/opt/tx9/ops/tx9-host supervise %i
+ExecStop=/bin/kill -TERM $MAINPID
 ExecStop=/opt/tx9/ops/tx9-host stop %i
+Restart=on-failure
+RestartSec=5s
 TimeoutStartSec=10min
 TimeoutStopSec=2min
 

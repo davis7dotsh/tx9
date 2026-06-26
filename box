@@ -188,6 +188,10 @@ _reg_api_port() { [[ -f "$REG" ]] && awk -F'\t' -v n="$1" '$1==n{print $3}' "$RE
 _reg_api_guest_port() { [[ -f "$REG" ]] && awk -F'\t' -v n="$1" '$1==n{print $4}' "$REG"; }
 
 _machine_exists() { smolvm machine status --name "$1" >/dev/null 2>&1; }
+_machine_running() {
+  local status
+  status="$(smolvm machine status --name "$1" 2>/dev/null)" && grep -q ': running' <<<"$status"
+}
 
 _tcp_port_open() {
   local host="$1" port="$2"
@@ -295,6 +299,10 @@ _assign_port() {
 }
 
 _validate_resources() {
+  BOX_CPUS="${BOX_CPUS:-4}"
+  BOX_MEM_MIB="${BOX_MEM_MIB:-8192}"
+  BOX_OVERLAY_GIB="${BOX_OVERLAY_GIB:-64}"
+  BOX_STORAGE_GIB="${BOX_STORAGE_GIB:-}"
   [[ "${BOX_CPUS:-}" =~ ^[1-9][0-9]*$ && "${BOX_CPUS}" -le 128 ]] || die "BOX_CPUS must be 1-128"
   [[ "${BOX_MEM_MIB:-}" =~ ^[1-9][0-9]*$ && "${BOX_MEM_MIB}" -ge 512 ]] || die "BOX_MEM_MIB must be at least 512"
   [[ "${BOX_OVERLAY_GIB:-}" =~ ^[1-9][0-9]*$ ]] || die "BOX_OVERLAY_GIB must be a positive integer"
@@ -316,7 +324,7 @@ _resolve_passphrase() {
   [[ -n "$_BOX_PASS" ]] && return
   if [[ -n "${BOX_PASSPHRASE_FILE:-}" ]]; then
     [[ -r "$BOX_PASSPHRASE_FILE" ]] || die "BOX_PASSPHRASE_FILE is not readable"
-    IFS= read -r _BOX_PASS <"$BOX_PASSPHRASE_FILE"
+    IFS= read -r _BOX_PASS <"$BOX_PASSPHRASE_FILE" || true
     [[ -n "$_BOX_PASS" ]] || die "BOX_PASSPHRASE_FILE is empty"
     return
   fi
@@ -448,7 +456,10 @@ _create_base() {
 
 _provision_into() {
   local n="$1" mode="${2:-full}" contexts=(provision guest box.env)
-  [[ -z "${HERMES_GIT_BUNDLE:-}" ]] || contexts+=("$HERMES_GIT_BUNDLE")
+  if [[ "$mode" == full ]]; then
+    _validate_bundle
+    [[ -z "${HERMES_GIT_BUNDLE:-}" ]] || contexts+=("$HERMES_GIT_BUNDLE")
+  fi
   say "Streaming provision context into '$n'"
   if ! COPYFILE_DISABLE=1 tar czf - -C "$ROOT" "${contexts[@]}" \
     | smolvm machine exec -i --name "$n" -- bash -lc 'cat >/tmp/ctx.tgz'; then
@@ -636,18 +647,31 @@ cmd_load() {
 }
 
 cmd_import_hermes() {
-  local n="${1:?usage: box import-hermes <name> <hermes-backup.zip> [--include-external] [--map OLD=NEW]...}"
-  local file="${2:?usage: box import-hermes <name> <hermes-backup.zip> [--include-external] [--map OLD=NEW]...}"
-  local guest_tmp map already_paused=0 include_external=0 validation external_count
+  local n="${1:?usage: box import-hermes <name> <hermes-backup.zip> [--external NAME]... [--map OLD=NEW]...}"
+  local file="${2:?usage: box import-hermes <name> <hermes-backup.zip> [--external NAME]... [--map OLD=NEW]...}"
+  local guest_tmp map external already_paused=0 validation external_count archive_external
   shift 2
   _validate_name "$n"
   [[ -f "$file" ]] || die "no such Hermes backup: $file"
   _host_preflight import
-  local maps=()
+  # Keep a blank sentinel because macOS Bash 3.2 treats an expanded empty array
+  # as unbound under `set -u`.
+  local maps=() externals=("")
   [[ -z "${HERMES_IMPORT_PATH_MAP:-}" ]] || maps+=("$HERMES_IMPORT_PATH_MAP")
   while (($#)); do
     case "$1" in
-      --include-external) include_external=1; shift ;;
+      --external)
+        [[ $# -ge 2 ]] || die "expected --external NAME"
+        external="$2"
+        [[ "$external" =~ ^[A-Za-z0-9._-]+$ && "$external" != . && "$external" != .. ]] ||
+          die "invalid external provider name '$external'"
+        case "$external" in
+          .ssh | .config | workspace | .bashrc | .bash_profile | .profile | .zshrc | .zprofile | .zshenv)
+            die "reserved external destination '$external' is never importable" ;;
+        esac
+        externals+=("$external")
+        shift 2
+        ;;
       --map)
         [[ $# -ge 2 ]] || die "expected --map OLD=NEW"
         map="$2"
@@ -655,19 +679,30 @@ cmd_import_hermes() {
         maps+=("$map")
         shift 2
         ;;
-      *) die "expected --include-external or --map OLD=NEW" ;;
+      *) die "expected --external NAME or --map OLD=NEW" ;;
     esac
   done
   validation="$(python3 "$ROOT/guest/hermes-state" validate-zip "$file")" || die "Hermes backup is invalid or unsafe"
   external_count="$(jq '.external_top_level_entries | length' <<<"$validation")"
-  if [[ "$external_count" != 0 && "$include_external" != 1 ]]; then
-    jq -r '.external_top_level_entries[] | "  /data/home/agent/" + .' <<<"$validation" >&2
-    die "backup contains external provider state; review destinations and re-run with --include-external"
-  fi
-  if [[ "$include_external" == 1 && "$external_count" != 0 ]]; then
-    say "External provider destinations explicitly approved:"
+  if [[ "$external_count" != 0 ]]; then
+    say "External provider destinations in archive:"
     jq -r '.external_top_level_entries[] | "  /data/home/agent/" + .' <<<"$validation"
   fi
+  while IFS= read -r archive_external; do
+    [[ -n "$archive_external" ]] || continue
+    case "$archive_external" in
+      .ssh | .config | workspace | .bashrc | .bash_profile | .profile | .zshrc | .zprofile | .zshenv)
+        die "archive requests reserved external destination '$archive_external'" ;;
+    esac
+    local approved=0
+    for external in "${externals[@]}"; do [[ "$external" == "$archive_external" ]] && approved=1; done
+    [[ "$approved" == 1 ]] || die "external provider '$archive_external' is unapproved; re-run with --external '$archive_external'"
+  done < <(jq -r '.external_top_level_entries[]' <<<"$validation")
+  for external in "${externals[@]}"; do
+    [[ -n "$external" ]] || continue
+    jq -e --arg name "$external" '.external_top_level_entries | index($name) != null' <<<"$validation" >/dev/null ||
+      die "approved external provider '$external' is not present in the archive"
+  done
   _acquire_lock "$n"
   _machine_exists "$n" || die "smolvm machine '$n' is missing"
   smolvm machine start --name "$n" >/dev/null
@@ -679,7 +714,9 @@ cmd_import_hermes() {
   smolvm machine cp "$file" "$n:$guest_tmp"
   smolvm machine exec --name "$n" -- chmod 0600 "$guest_tmp"
   local import_args=(import-zip "$guest_tmp")
-  [[ "$include_external" == 1 ]] && import_args+=(--include-external)
+  for external in "${externals[@]}"; do
+    [[ -n "$external" ]] && import_args+=(--external "$external")
+  done
   for map in "${maps[@]}"; do import_args+=(--map "$map"); done
   say "Importing validated Hermes state transactionally into '$n'"
   smolvm machine exec --name "$n" -- \
@@ -742,7 +779,7 @@ cmd_open() {
   _acquire_lock "$n"
   port="$(_reg_port "$n")"
   [[ -n "$port" ]] || die "'$n' has no exposed Executor host port"
-  smolvm machine start --name "$n" >/dev/null
+  _machine_running "$n" || die "box '$n' is not running; run './box start $n' before opening Executor"
   _guest_hb "$n" is-paused >/dev/null 2>&1 &&
     die "box '$n' is quiesced; run './box start $n' and 'hb resume' explicitly before opening Executor"
   _guest_hb "$n" up >/dev/null
@@ -877,7 +914,7 @@ hermes-box-lite — isolated, portable agent boxes (claude / codex / hermes / ex
   ./box stop|start <name>      Stop or start an instance
   ./box save <name> [out]      Quiesce, validate, encrypt, and verify /data
   ./box load <file> [name]     Validate first, then build and restore a fresh box
-  ./box import-hermes <name> <hermes-backup.zip> [--include-external] [--map OLD=NEW]...
+  ./box import-hermes <name> <hermes-backup.zip> [--external NAME]... [--map OLD=NEW]...
                                Transactionally import native Hermes state; gateway stays disabled
   ./box extract <file> [dir]   Validate and extract a backup without a VM
   ./box rm <name> [--force]    Delete after confirmation (or explicit --force)

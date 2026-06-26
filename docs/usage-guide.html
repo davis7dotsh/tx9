@@ -99,7 +99,7 @@ hb cutover-ready</code></pre>
 
       <h3>Import from Eventide or another Hermes host</h3>
       <pre><code>./box import-hermes alpha hermes-backup.zip --map /Users/davis=/data/home/agent</code></pre>
-      <p>Native import rejects traversal and symlink entries before guest mutation, stages and atomically swaps <code>~/.hermes</code>, rewrites only active config, env, cron, hook, and script files, and leaves historical sessions, memories, databases, and logs byte-for-byte unchanged. External provider destinations are previewed and require <code>--include-external</code>. Review the manifest, run <code>hb acknowledge-active-paths</code>, then require <code>hb cutover-ready</code> before enabling the gateway.</p>
+      <p>Native import rejects traversal and symlink entries before guest mutation, stages and atomically swaps <code>~/.hermes</code>, rewrites only active config, env, cron, hook, and script files, and leaves historical sessions, memories, databases, and logs byte-for-byte unchanged. Every external provider destination is previewed and requires a matching repeatable <code>--external NAME</code> approval; reserved destinations are rejected. Review the manifest, run <code>hb acknowledge-active-paths</code>, then require <code>hb cutover-ready</code> before enabling the gateway.</p>
 
       <h3>Inspect a backup without a VM</h3>
       <pre><code>./box extract backups/alpha-20260625-120000.tar.gz.gpg</code></pre>

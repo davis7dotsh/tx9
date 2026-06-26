@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# shellcheck disable=SC2030,SC2031
+# shellcheck disable=SC2016,SC2030,SC2031,SC2329
 set -euo pipefail
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -83,6 +83,104 @@ for missing_health_tool in curl jq mktemp; do
   fi
 done
 
+# Scheduled host health gates on an already-running box and never starts one.
+host_root="$tmp/tx9-host-root"
+mkdir -p "$host_root" "$tmp/tx9-host-state/scheduled"
+printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$*" >>"${TX9_BOX_CALLS:?}"\n' >"$host_root/box"
+chmod +x "$host_root/box"
+if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/tx9-inactive.smolvm" \
+  SMOLVM_STATE_DIR="$tmp/tx9-host-state" SMOLVM_BEHAVIOR=inactive \
+  SMOLVM_CALLED_UNUSED=1 TX9_ROOT="$host_root" TX9_BOX_CALLS="$tmp/tx9-inactive.box" \
+  "$PROJECT_ROOT/ops/tx9-host" health scheduled >/dev/null 2>&1; then
+  echo "scheduled health accepted an inactive box" >&2
+  exit 1
+fi
+[[ ! -e "$tmp/tx9-inactive.box" ]]
+if grep -q 'machine start' "$tmp/tx9-inactive.smolvm"; then
+  echo "scheduled health started an inactive box" >&2
+  exit 1
+fi
+PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/tx9-active.smolvm" \
+  SMOLVM_STATE_DIR="$tmp/tx9-host-state" SMOLVM_BEHAVIOR=success \
+  TX9_ROOT="$host_root" TX9_BOX_CALLS="$tmp/tx9-active.box" \
+  "$PROJECT_ROOT/ops/tx9-host" health scheduled >/dev/null
+grep -q '^doctor scheduled$' "$tmp/tx9-active.box"
+
+# The foreground supervisor starts once and restarts an unexpectedly stopped VM.
+PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/tx9-supervise.smolvm" \
+  SMOLVM_STATE_DIR="$tmp/tx9-host-state" SMOLVM_BEHAVIOR=inactive \
+  TX9_ROOT="$host_root" TX9_BOX_CALLS="$tmp/tx9-supervise.box" TX9_SUPERVISE_ONCE=1 \
+  "$PROJECT_ROOT/ops/tx9-host" supervise scheduled >/dev/null 2>&1
+[[ "$(grep -c '^start scheduled$' "$tmp/tx9-supervise.box")" == 2 ]]
+
+# A supervisor that receives stop intent exits without probing or restarting.
+PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/tx9-supervise-stop.smolvm" \
+  SMOLVM_STATE_DIR="$tmp/tx9-host-state" SMOLVM_BEHAVIOR=inactive \
+  TX9_ROOT="$host_root" TX9_BOX_CALLS="$tmp/tx9-supervise-stop.box" \
+  TX9_SUPERVISE_INTERVAL_SECONDS=300 \
+  "$PROJECT_ROOT/ops/tx9-host" supervise scheduled >/dev/null 2>&1 &
+supervisor_pid=$!
+pids+=("$supervisor_pid")
+wait_for_pattern '^start scheduled$' "$tmp/tx9-supervise-stop.box"
+kill -TERM "$supervisor_pid"
+wait "$supervisor_pid"
+[[ "$(grep -c '^start scheduled$' "$tmp/tx9-supervise-stop.box")" == 1 ]]
+[[ ! -e "$tmp/tx9-supervise-stop.smolvm" ]]
+
+# Root-run installer state is recursively returned to the agent and made
+# writable, including nested runtime directories created during full repair.
+hermes_fixture="$tmp/installer-hermes-home"
+mkdir -p "$hermes_fixture/sessions/deep" "$hermes_fixture/cron" "$hermes_fixture/logs"
+printf 'session\n' >"$hermes_fixture/sessions/deep/history.json"
+printf 'job\n' >"$hermes_fixture/cron/jobs.json"
+chmod 0500 "$hermes_fixture/sessions/deep"
+chmod 0400 "$hermes_fixture/sessions/deep/history.json" "$hermes_fixture/cron/jobs.json"
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/provision/provision.sh"
+  HERMES_HOME="$hermes_fixture"
+  chown() {
+    [[ "$1" == -R && "$2" == agent:agent && "$3" == "$hermes_fixture" ]]
+    printf 'recursive agent ownership\n' >"$tmp/hermes-chown.called"
+  }
+  own_hermes_home
+)
+[[ -s "$tmp/hermes-chown.called" ]]
+[[ -w "$hermes_fixture/sessions/deep/history.json" ]]
+[[ -w "$hermes_fixture/cron/jobs.json" ]]
+[[ -w "$hermes_fixture/sessions/deep" ]]
+
+# An unset systemd credential directory does not resolve to /backup-passphrase.
+if env -u BOX_PASSPHRASE_FILE -u CREDENTIALS_DIRECTORY \
+  PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/tx9-no-credential.smolvm" \
+  SMOLVM_STATE_DIR="$tmp/tx9-host-state" SMOLVM_BEHAVIOR=success \
+  TX9_ROOT="$host_root" TX9_BOX_CALLS="$tmp/tx9-no-credential.box" \
+  "$PROJECT_ROOT/ops/tx9-host" backup scheduled >/dev/null 2>&1; then
+  echo "scheduled backup accepted a missing credential" >&2
+  exit 1
+fi
+[[ ! -e "$tmp/tx9-no-credential.box" ]] || ! grep -q '^save ' "$tmp/tx9-no-credential.box"
+
+# Credential files without a trailing newline are accepted intact.
+printf 'no-newline-passphrase' >"$tmp/passphrase-no-newline"
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/box"
+  _BOX_PASS=""
+  BOX_PASSPHRASE_FILE="$tmp/passphrase-no-newline"
+  _resolve_passphrase
+  [[ "$_BOX_PASS" == no-newline-passphrase ]]
+)
+
+# Missing legacy resource settings use the documented production defaults.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/box"
+  unset BOX_CPUS BOX_MEM_MIB BOX_OVERLAY_GIB BOX_STORAGE_GIB
+  _validate_resources
+  [[ "$BOX_CPUS" == 4 && "$BOX_MEM_MIB" == 8192 && "$BOX_OVERLAY_GIB" == 64 && -z "$BOX_STORAGE_GIB" ]]
+)
+
 # The runtime manifest must be writable by the unprivileged durable-home owner,
 # atomically published beneath that home, and private.
 manifest_data="$tmp/manifest-data"
@@ -104,6 +202,46 @@ fi
 HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" gateway-enable \
   --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY >/dev/null
 [[ ! -e "$gateway_data/home/agent/.config/hermes-box/gateway-disabled" ]]
+
+# A failed gateway start restores the durable disabled policy marker.
+(
+  HB_DATA="$tmp/gateway-failure-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  _start_gateway() { return 1; }
+  if gateway_enable --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY >/dev/null 2>&1; then
+    echo "failed gateway start unexpectedly succeeded" >&2
+    exit 1
+  fi
+  [[ -e "$GATEWAY_DISABLED" ]]
+)
+
+# Executor startup failure is never masked by a later gateway result.
+(
+  HB_DATA="$tmp/up-failure-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init() { mkdir -p "$STATE_DIR"; }
+  _executor_up() { return 42; }
+  _start_gateway() { touch "$tmp/up-gateway-started"; }
+  if up; then echo "hb up masked Executor failure" >&2; exit 1; fi
+  [[ ! -e "$tmp/up-gateway-started" ]]
+  if reconcile; then echo "hb reconcile masked Executor failure" >&2; exit 1; fi
+  [[ ! -e "$tmp/up-gateway-started" ]]
+)
+
+# Hermes state validation is explicitly skipped when Hermes is disabled.
+(
+  HB_DATA="$tmp/hermes-disabled-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  _check() { :; }
+  _hermes_state_valid() { touch "$tmp/hermes-state-called"; }
+  output="$(INSTALL_HERMES=0 INSTALL_EXECUTOR=0 WIRE_EXECUTOR_MCP=0 doctor)"
+  grep -q 'Hermes state check skipped' <<<"$output"
+  [[ ! -e "$tmp/hermes-state-called" ]]
+)
 
 # Explicit MCP wiring refuses to clear durable quiesce.
 wire_quiesced="$tmp/wire-quiesced"
@@ -349,6 +487,7 @@ fi
   _host_preflight() { :; }
   _acquire_lock() { :; }
   _reg_port() { printf '4899\n'; }
+  _machine_running() { :; }
   smolvm() { printf 'smolvm %s\n' "$*" >>"$calls"; }
   _guest_hb() {
     printf 'hb %s\n' "$2" >>"$calls"
@@ -363,6 +502,28 @@ fi
     echo "box open cleared quiesce through hb up" >&2
     exit 1
   fi
+  if grep -q 'machine start' "$calls"; then
+    echo "box open started the VM" >&2
+    exit 1
+  fi
+)
+
+# Open refuses a stopped box and never changes its lifecycle state.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/box"
+  calls="$tmp/open-stopped.calls"
+  _host_preflight() { :; }
+  _acquire_lock() { :; }
+  _reg_port() { printf '4899\n'; }
+  _machine_running() { return 1; }
+  smolvm() { printf 'smolvm %s\n' "$*" >>"$calls"; }
+  _guest_hb() { printf 'hb %s\n' "$2" >>"$calls"; }
+  if (cmd_open stopped >/dev/null 2>&1); then
+    echo "box open accepted a stopped box" >&2
+    exit 1
+  fi
+  [[ ! -e "$calls" ]] || ! grep -q 'machine start' "$calls"
 )
 
 # Repair refreshes assets but preserves a pre-existing durable quiesce policy.
@@ -386,6 +547,43 @@ fi
     echo "repair resumed a previously quiesced box" >&2
     exit 1
   fi
+)
+
+# Repair validates a configured bundle before constructing the provision tar.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/box"
+  calls="$tmp/repair-invalid-bundle.calls"
+  HERMES_GIT_BUNDLE='../invalid.bundle'
+  _host_preflight() { :; }
+  _acquire_lock() { :; }
+  _machine_exists() { :; }
+  _guest_hb() { [[ "$2" == is-paused ]]; }
+  smolvm() { printf '%s\n' "$*" >>"$calls"; }
+  if (cmd_repair invalid-bundle >/dev/null 2>&1); then
+    echo "repair accepted an invalid Hermes bundle path" >&2
+    exit 1
+  fi
+  if grep -q 'machine exec -i' "$calls"; then
+    echo "repair streamed provision context before bundle validation" >&2
+    exit 1
+  fi
+)
+
+# Asset-only refreshes neither validate nor transport the optional source bundle.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/box"
+  calls="$tmp/provision-mode.calls"
+  HERMES_GIT_BUNDLE='artifacts/hermes.bundle'
+  _validate_bundle() { printf 'validate\n' >>"$calls"; }
+  tar() { printf 'tar %s\n' "$*" >>"$calls"; printf 'fixture'; }
+  smolvm() { if [[ "$*" == *'machine exec -i'* ]]; then cat >/dev/null; fi; }
+  _provision_into fixture assets >/dev/null
+  [[ ! -e "$calls" ]] || ! grep -q '^validate$\|artifacts/hermes.bundle' "$calls"
+  _provision_into fixture full >/dev/null
+  grep -q '^validate$' "$calls"
+  grep -q 'artifacts/hermes.bundle' "$calls"
 )
 
 mkdir -p "$tmp/valid/home/agent/workspace" "$tmp/gnupg" "$tmp/host-tmp"
@@ -517,7 +715,7 @@ fi
 if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/import-fail.calls" \
   SMOLVM_STATE_DIR="$tmp/import-state" SMOLVM_BEHAVIOR=import-post-fail \
   "$import_repo/box" import-hermes import-probe "$tmp/hermes-import.zip" \
-    --include-external >/dev/null 2>&1; then
+    --external .honcho >/dev/null 2>&1; then
   echo "post-import verification failure unexpectedly succeeded" >&2
   exit 1
 fi
@@ -530,7 +728,7 @@ rm -f "$tmp/import-state/import-probe/paused"
 if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/import-signal.calls" \
   SMOLVM_STATE_DIR="$tmp/import-state" SMOLVM_BEHAVIOR=signal-import \
   "$import_repo/box" import-hermes import-probe "$tmp/hermes-import.zip" \
-    --include-external >/dev/null 2>&1; then
+    --external .honcho >/dev/null 2>&1; then
   echo "signal-interrupted import unexpectedly succeeded" >&2
   exit 1
 fi
