@@ -5,15 +5,32 @@ set -euo pipefail
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 tmp="$(mktemp -d)"
 pids=()
+cleaned_up=0
 
 cleanup() {
   local pid
+  [[ "$cleaned_up" == 0 ]] || return 0
+  cleaned_up=1
   for pid in "${pids[@]:-}"; do
     [[ -n "$pid" ]] && kill "$pid" >/dev/null 2>&1 || true
   done
   rm -rf "$tmp"
 }
-trap cleanup EXIT HUP INT TERM
+
+handle_signal() {
+  local status="$1"
+  trap - EXIT HUP INT TERM
+  cleanup
+  exit "$status"
+}
+
+trap cleanup EXIT
+trap 'handle_signal 129' HUP
+trap 'handle_signal 130' INT
+trap 'handle_signal 143' TERM
+[[ "$(trap -p HUP)" == *"handle_signal 129"* ]]
+[[ "$(trap -p INT)" == *"handle_signal 130"* ]]
+[[ "$(trap -p TERM)" == *"handle_signal 143"* ]]
 
 wait_for_file() {
   local file="$1" attempt
@@ -36,16 +53,35 @@ wait_for_pattern() {
 }
 
 start_mcp_server() {
-  local status="$1" label="$2" mode="${3:-valid}" port_file delete_file
+  local status="$1" label="$2" mode="${3:-valid}" bind_host="${4:-127.0.0.1}" port_file delete_file
   port_file="$tmp/$label.port"
   delete_file="$tmp/$label.delete"
-  python3 "$PROJECT_ROOT/tests/fixtures/mcp-server.py" "$port_file" "$status" "$delete_file" "$mode" &
+  python3 "$PROJECT_ROOT/tests/fixtures/mcp-server.py" "$port_file" "$status" "$delete_file" "$mode" "$bind_host" &
   MCP_PID=$!
   pids+=("$MCP_PID")
   wait_for_file "$port_file"
   MCP_PORT="$(cat "$port_file")"
   MCP_DELETE_FILE="$delete_file"
 }
+
+# Basic VM operations do not require HTTP health tools; health operations do.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/box"
+  have() { [[ "$1" == awk || "$1" == smolvm ]]; }
+  _host_preflight basic
+)
+for missing_health_tool in curl jq; do
+  if (
+    # shellcheck disable=SC1090
+    source "$PROJECT_ROOT/box"
+    have() { [[ "$1" != "$missing_health_tool" ]]; }
+    _host_preflight health
+  ) 2>/dev/null; then
+    echo "health preflight passed without $missing_health_tool" >&2
+    exit 1
+  fi
+done
 
 # The runtime manifest must be writable by the unprivileged durable-home owner,
 # atomically published beneath that home, and private.
@@ -89,7 +125,13 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
       printf '%s\n' "$2" >>"$doctor_calls"
       [[ "$2" != executor-token ]] || printf 'fixture-token\n'
     }
-    _mcp_initialize() { printf 'host-mcp\n' >>"$doctor_calls"; }
+    mcp_attempts=0
+    sleep() { :; }
+    _mcp_initialize() {
+      printf 'host-mcp\n' >>"$doctor_calls"
+      mcp_attempts=$((mcp_attempts + 1))
+      [[ "$mcp_attempts" -ge 3 ]]
+    }
 
     doctor_output="$(cmd_doctor no-host-port)"
     grep -q 'host Executor MCP: skipped (no exposed host port)' <<<"$doctor_output"
@@ -97,7 +139,7 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
 
     printf 'doctor-host\t4899\n' >"$REG"
     cmd_doctor doctor-host >/dev/null
-    [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor\nup\nwire-once\ndoctor\nexecutor-token\nhost-mcp' ]]
+    [[ "$(cat "$doctor_calls")" == $'up\nwire-once\ndoctor\nup\nwire-once\ndoctor\nexecutor-token\nhost-mcp\nhost-mcp\nhost-mcp' ]]
 
     : >"$doctor_calls"
     : >"$REG"
@@ -132,6 +174,21 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
     -H 'Accept: application/json,text/event-stream' --data '{not-json' \
     "http://127.0.0.1:$MCP_PORT/mcp")"
   [[ "$malformed_code" == 400 ]]
+  for invalid_request in \
+    '[]' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":[]}' \
+    '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":[]}}'; do
+    invalid_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+      -H 'Authorization: Bearer fixture-token' -H 'Content-Type: application/json' \
+      -H 'Accept: application/json,text/event-stream' --data "$invalid_request" \
+      "http://127.0.0.1:$MCP_PORT/mcp")"
+    [[ "$invalid_code" == 400 ]]
+  done
+  invalid_length_code="$(curl -sS -o /dev/null -w '%{http_code}' -X POST \
+    -H 'Authorization: Bearer fixture-token' -H 'Content-Type: application/json' \
+    -H 'Accept: application/json,text/event-stream' -H 'Content-Length: invalid' \
+    --data '{}' "http://127.0.0.1:$MCP_PORT/mcp")"
+  [[ "$invalid_length_code" == 400 ]]
 
   guest_token_dir="$tmp/guest-token/.executor/server-control"
   mkdir -p "$guest_token_dir"
@@ -152,6 +209,18 @@ manifest="$manifest_data/home/agent/.config/hermes-box/runtime-manifest"
   fi
   kill "$MCP_PID"
   wait "$MCP_PID" 2>/dev/null || true
+
+  if python3 -c 'import socket; s = socket.socket(socket.AF_INET6); s.bind(("::1", 0)); s.close()'; then
+    start_mcp_server 200 ipv6-only valid ::1
+    if _port_free "$MCP_PORT"; then
+      echo "IPv6-only occupied TCP port was reported free" >&2
+      exit 1
+    fi
+    kill "$MCP_PID"
+    wait "$MCP_PID" 2>/dev/null || true
+  else
+    echo "IPv6 loopback unavailable; skipping IPv6 occupancy regression" >&2
+  fi
 
   start_mcp_server 200 malformed-json malformed-json
   if _mcp_initialize "http://127.0.0.1:$MCP_PORT/mcp" fixture-token; then
@@ -314,6 +383,7 @@ make_repo "$contention_repo"
 if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/contention.calls" \
   SMOLVM_STATE_DIR="$tmp/contention-state" SMOLVM_BEHAVIOR=registry-contention \
   SMOLVM_REGISTRY_LOCK_DIR="$contention_repo/.box-locks/registry.lock" \
+  SMOLVM_REGISTRY_LOCK_OWNER_PID="$$" \
   "$contention_repo/box" new contention-probe >/dev/null 2>&1; then
   echo "registry-contention provisioning unexpectedly succeeded" >&2
   exit 1
@@ -321,6 +391,21 @@ fi
 [[ ! -d "$tmp/contention-state/contention-probe" ]]
 grep -q '^contention-probe' "$contention_repo/.boxes"
 [[ ! -e "$contention_repo/.box-locks/contention-probe.lock" ]]
+
+# Rollback recovers a stale registry lock without aborting best-effort cleanup.
+stale_lock_repo="$tmp/stale-lock-repo"
+make_repo "$stale_lock_repo"
+if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/stale-lock.calls" \
+  SMOLVM_STATE_DIR="$tmp/stale-lock-state" SMOLVM_BEHAVIOR=stale-registry-lock \
+  SMOLVM_REGISTRY_LOCK_DIR="$stale_lock_repo/.box-locks/registry.lock" \
+  "$stale_lock_repo/box" new stale-lock-probe >/dev/null 2>&1; then
+  echo "stale-lock provisioning unexpectedly succeeded" >&2
+  exit 1
+fi
+[[ ! -d "$tmp/stale-lock-state/stale-lock-probe" ]]
+[[ ! -s "$stale_lock_repo/.boxes" ]]
+[[ ! -e "$stale_lock_repo/.box-locks/registry.lock" ]]
+[[ ! -e "$stale_lock_repo/.box-locks/stale-lock-probe.lock" ]]
 
 # A failed delete preserves both the incomplete machine and its registry record.
 delete_repo="$tmp/delete-repo"

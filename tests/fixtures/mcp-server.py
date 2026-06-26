@@ -2,6 +2,7 @@
 import http.server
 import json
 import pathlib
+import socket
 import sys
 
 
@@ -9,6 +10,7 @@ port_file = pathlib.Path(sys.argv[1])
 status = int(sys.argv[2])
 events_file = pathlib.Path(sys.argv[3])
 response_mode = sys.argv[4] if len(sys.argv) > 4 else "valid"
+bind_host = sys.argv[5] if len(sys.argv) > 5 else "127.0.0.1"
 
 
 def record(event):
@@ -39,21 +41,36 @@ class Handler(http.server.BaseHTTPRequestHandler):
         if "application/json" not in accept or "text/event-stream" not in accept:
             self.respond(400)
             return
-        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self.respond(400)
+            return
+        if length < 0:
+            self.respond(400)
+            return
         try:
             request = json.loads(self.rfile.read(length))
         except (json.JSONDecodeError, UnicodeDecodeError):
             self.respond(400)
             return
+        if not isinstance(request, dict):
+            self.respond(400)
+            return
         if request.get("method") == "initialize":
             params = request.get("params", {})
+            if not isinstance(params, dict):
+                self.respond(400)
+                return
+            client_info = params.get("clientInfo", {})
             if (
                 request.get("jsonrpc") != "2.0"
                 or request.get("id") != 1
                 or params.get("protocolVersion") != "2025-03-26"
                 or not isinstance(params.get("capabilities"), dict)
-                or params.get("clientInfo", {}).get("name") != "hermes-box-doctor"
-                or params.get("clientInfo", {}).get("version") != "1"
+                or not isinstance(client_info, dict)
+                or client_info.get("name") != "hermes-box-doctor"
+                or client_info.get("version") != "1"
             ):
                 self.respond(400)
                 return
@@ -114,6 +131,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         pass
 
 
-server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+class ThreadingHTTPServerV6(http.server.ThreadingHTTPServer):
+    address_family = socket.AF_INET6
+
+
+server_class = ThreadingHTTPServerV6 if bind_host == "::1" else http.server.ThreadingHTTPServer
+server = server_class((bind_host, 0), Handler)
 port_file.write_text(f"{server.server_port}\n")
 server.serve_forever()
