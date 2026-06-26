@@ -30,12 +30,15 @@
   <div class="page-content">
     <section id="quick-start">
       <h2>Quick start</h2>
-      <p>Run these commands from the <code>hermes-box-lite</code> repository on a Mac with <code>smolvm</code>, GPG, and standard command-line tools installed.</p>
+      <p>Run these commands from the <code>hermes-box-lite</code> repository on macOS, or on x86_64/arm64 Linux with KVM available and your user allowed to access <code>/dev/kvm</code>. Install <code>smolvm</code>, GPG, curl, jq, tar, awk, and standard Bash command-line tools first.</p>
+      <p>On Linux, verify virtualization access before creating a box:</p>
+      <pre><code>test -r /dev/kvm -a -w /dev/kvm
+smolvm machine ls</code></pre>
 
       <h3>1. Create and verify a box</h3>
       <pre><code>./box new alpha
 ./box doctor alpha</code></pre>
-      <p>Creation boots Ubuntu, installs the toolchain, starts Executor, registers its authenticated HTTP MCP endpoint with Claude and Codex, and runs health checks. A failed creation is removed automatically.</p>
+      <p>Creation boots Ubuntu, installs the toolchain, starts Executor, registers its authenticated HTTP MCP endpoint with Claude and Codex, and runs health checks. On failure, the command attempts verified cleanup only for a VM proven to have been created by that invocation.</p>
 
       <h3>2. Enter and authenticate</h3>
       <pre><code>./box enter alpha</code></pre>
@@ -47,7 +50,7 @@ codex</code></pre>
       <h3>3. Open Executor and save the state</h3>
       <pre><code>./box open alpha
 ./box save alpha</code></pre>
-      <p><code>box open</code> launches the authenticated Executor UI without printing its bearer token. <code>box save</code> pauses Executor, validates the archive, encrypts it, verifies it, and writes it under <code>backups/</code>.</p>
+      <p><code>box open</code> waits for the authenticated forwarded endpoint, then launches the Executor UI without printing its bearer token. It uses <code>open</code> on macOS and <code>xdg-open</code> or <code>gio</code> on Linux. Set <code>BOX_BROWSER</code> to another graphical opener when needed; it receives the secret authenticated URL as its sole argument, so do not use a wrapper that logs arguments. <code>box save</code> pauses Executor, validates the archive, encrypts it, verifies it, and writes it under <code>backups/</code>.</p>
     </section>
 
     <section id="daily-use">
@@ -64,7 +67,7 @@ codex</code></pre>
             <tr><th scope="row"><code>./box open alpha</code></th><td>Open the authenticated Executor UI.</td></tr>
             <tr><th scope="row"><code>./box stop alpha</code></th><td>Stop the VM without deleting its state.</td></tr>
             <tr><th scope="row"><code>./box start alpha</code></th><td>Start a stopped VM.</td></tr>
-            <tr><th scope="row"><code>./box doctor alpha</code></th><td>Check tools, Executor, MCP wiring, durable state, and host forwarding.</td></tr>
+            <tr><th scope="row"><code>./box doctor alpha</code></th><td>Check tools, durable state, guest MCP, and the forwarded host MCP endpoint when one is exposed.</td></tr>
           </tbody>
         </table>
       </div>
@@ -83,11 +86,11 @@ hb logs executor</code></pre>
       <pre><code>./box save alpha</code></pre>
       <p>By default, this creates <code>backups/alpha-&lt;timestamp&gt;.tar.gz.gpg</code>. The command refuses to overwrite an existing destination. Set a passphrase in the environment for unattended use:</p>
       <pre><code>BOX_PASSPHRASE='your-local-secret' ./box save alpha</code></pre>
-      <p>Do not actively edit workspace files during the save. Executor is quiesced, but arbitrary editor and agent processes are not frozen.</p>
+      <p>The mode-0600 runtime manifest is atomically published at <code>~/.config/hermes-box/runtime-manifest</code>. Host and guest plaintext temporaries are removed on failure or signals, and guest plaintext is removed before Executor resumes. Do not actively edit workspace files during the save. Executor is quiesced, but arbitrary editor and agent processes are not frozen.</p>
 
       <h3>Restore into a new box</h3>
       <pre><code>./box load backups/alpha-20260625-120000.tar.gz.gpg beta</code></pre>
-      <p>The archive is decrypted and validated before a VM is created. The destination is provisioned, restored while Executor is paused, refreshed with current managed assets, rewired, and health-checked. An incomplete destination is removed after failure.</p>
+      <p>The archive is decrypted and validated before a VM is created. The destination is provisioned, restored with fail-fast extraction while Executor is paused, refreshed with current managed assets, rewired, and health-checked. A failed or HUP/INT/TERM-interrupted operation attempts cleanup only for a VM proven to have been created by that invocation. Registry metadata is removed only after VM absence is verified; cleanup failures preserve metadata and print recovery guidance. A same-named unmanaged or ambiguous smolvm machine is preserved.</p>
 
       <h3>Inspect a backup without a VM</h3>
       <pre><code>./box extract backups/alpha-20260625-120000.tar.gz.gpg</code></pre>
@@ -106,6 +109,7 @@ hb logs executor</code></pre>
       <h2>Health and repair</h2>
       <p>Start with the doctor whenever a box feels partly broken:</p>
       <pre><code>./box doctor alpha</code></pre>
+      <p>Doctor performs a bounded, authenticated MCP handshake through the guest-local endpoint and, when web exposure is enabled, the forwarded host endpoint. It uses jq to validate the HTTP 200 JSON <code>initialize</code> result, negotiated protocol version, response content type, and session ID, sends the initialized notification, then closes the session best-effort. A bare listener, malformed result, 404, or HTTP 500 response fails health. Without an exposed port, doctor reports the host check as skipped.</p>
       <p>If managed tools, profiles, or MCP wiring need repair, re-run provisioning:</p>
       <pre><code>./box repair alpha</code></pre>
       <p>Repair pauses Executor, refreshes packages and repository-owned guest assets, resumes the daemon, repairs MCP wiring, and runs the doctor. It can contact upstream installers and may install newer releases.</p>
@@ -167,7 +171,7 @@ hb logs executor</code></pre>
 
       <h3>Validate the repository</h3>
       <pre><code>make check</code></pre>
-      <p>This runs Bash syntax checks, ShellCheck, static contracts, encrypted archive round-trip tests, validation-before-VM tests, temporary-file cleanup checks, and mock failure rollback.</p>
+      <p>This requires ShellCheck, Python 3, and jq, then runs Bash syntax checks, static contracts, protocol-health regressions, encrypted archive round-trip tests, validation-before-VM tests, temporary-file cleanup checks, and mock failure rollback.</p>
     </section>
   </div>
 </div>

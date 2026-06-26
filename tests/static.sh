@@ -12,11 +12,12 @@ files=(
   guest/agent-bash-profile.sh
   provision/provision.sh
   tests/lifecycle-smoke.sh
+  tests/regressions.sh
   tests/fixtures/smolvm
 )
 
 bash -n "${files[@]}"
-for file in box guest/hb guest/hb-workload provision/provision.sh tests/lifecycle-smoke.sh tests/fixtures/smolvm; do
+for file in box guest/hb guest/hb-workload provision/provision.sh tests/lifecycle-smoke.sh tests/regressions.sh tests/fixtures/smolvm; do
   [[ -x "$file" ]] || { echo "not executable: $file" >&2; exit 1; }
 done
 
@@ -29,7 +30,21 @@ fi
 grep -q 'trap _cleanup EXIT' box
 grep -q 'Decrypting and validating archive before creating a VM' box
 grep -q 'refusing to overwrite existing backup' box
+grep -q 'guest_tmp="/root/hb-data-' box
+grep -q 'guest_tmp="/root/hb-restore-' box
+if grep -Eq 'guest_tmp="/tmp/hb-(data|restore)-' box; then
+  echo "smolvm-incompatible /tmp archive staging remains" >&2
+  exit 1
+fi
+if grep -q '\blsof\b' box; then
+  echo "lsof dependency remains" >&2
+  exit 1
+fi
+grep -q 'protocolVersion.*2025-03-26' box
+grep -q 'protocolVersion.*2025-03-26' guest/hb
+grep -q 'ca-certificates curl git jq tmux' provision/provision.sh
+grep -q 'runuser -u agent.*hb.*write-manifest' provision/provision.sh
 grep -qi 'networking is always enabled' README.md
-grep -q 'There is intentionally no CI configuration yet' README.md
+grep -q 'intentionally no CI configuration yet' README.md
 
 echo "static checks passed"
