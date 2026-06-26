@@ -3,6 +3,7 @@ set -euo pipefail
 
 state="${SMOLVM_STATE_DIR:?SMOLVM_STATE_DIR must be set}"
 sentinel="${SMOLVM_CALLED:?SMOLVM_CALLED must point to a sentinel}"
+behavior="${SMOLVM_BEHAVIOR:-fail-exec}"
 mkdir -p "$state"
 printf '%q ' "$@" >>"$sentinel"
 printf '\n' >>"$sentinel"
@@ -20,23 +21,63 @@ name_from_args() {
 case "${2:-}" in
   status)
     name="$(name_from_args "$@")"
+    [[ "$behavior" != delete-status-fail ]] || exit 42
     [[ -d "$state/$name" ]]
     ;;
   create)
     name="$(name_from_args "$@")"
+    [[ ! -d "$state/$name" ]] || exit 1
     mkdir -p "$state/$name"
+    [[ "$behavior" != create-race ]] || exit 1
+    if [[ "$behavior" == signal-create-success ]]; then kill -TERM "$PPID"; fi
     ;;
   start | stop)
     name="$(name_from_args "$@")"
+    # Project syntax is `smolvm machine start`; the action is argument two.
+    if [[ "${2:-}" == start && "$behavior" == start-delete-fail ]]; then exit 42; fi
     [[ -d "$state/$name" ]]
     ;;
   delete)
     name="$(name_from_args "$@")"
+    [[ "$behavior" != delete-fail && "$behavior" != delete-status-fail && "$behavior" != start-delete-fail ]] || exit 42
     rm -rf "${state:?}/${name:?}"
     ;;
   exec)
+    name="$(name_from_args "$@")"
     if [[ " $* " == *" -i "* ]]; then cat >/dev/null; fi
-    exit 42
+    if [[ "$behavior" == fail-exec ]]; then exit 42; fi
+    if [[ "$behavior" == block-provision && "$*" == *"provision/provision.sh 'full'"* ]]; then
+      kill -TERM "$PPID"
+      sleep 1
+      exit 143
+    fi
+    if [[ "$behavior" == registry-contention && "$*" == *"provision/provision.sh 'full'"* ]]; then
+      mkdir -p "${SMOLVM_REGISTRY_LOCK_DIR:?missing registry lock dir}"
+      printf '%s\n' "${SMOLVM_REGISTRY_LOCK_OWNER_PID:?missing lock owner pid}" >"$SMOLVM_REGISTRY_LOCK_DIR/pid"
+      exit 42
+    fi
+    if [[ "$behavior" == stale-registry-lock && "$*" == *"provision/provision.sh 'full'"* ]]; then
+      mkdir -p "${SMOLVM_REGISTRY_LOCK_DIR:?missing registry lock dir}"
+      printf '99999999\n' >"$SMOLVM_REGISTRY_LOCK_DIR/pid"
+      exit 42
+    fi
+    if [[ ( "$behavior" == delete-fail || "$behavior" == delete-status-fail ) && "$*" == *"provision/provision.sh 'full'"* ]]; then exit 42; fi
+    if [[ "$behavior" == restore-tar-fail && "$*" == *"archive=\$1"* && "$*" == *"tar xzf"* ]]; then
+      exit 42
+    fi
+    if [[ "$*" == *" hb is-paused"* ]]; then [[ -e "$state/$name/paused" ]]; exit; fi
+    if [[ "$*" == *" hb pause"* ]]; then
+      touch "$state/$name/paused"
+      [[ "$behavior" != pause-fail ]] || exit 42
+    fi
+    if [[ "$*" == *" hb resume"* ]]; then rm -f "$state/$name/paused"; fi
+    if [[ "$*" == *" hb executor-token"* ]]; then printf 'fixture-token\n'; fi
+    ;;
+  cp)
+    if [[ "$behavior" == save-cp-fail ]]; then exit 42; fi
+    if [[ -n "${SMOLVM_ARCHIVE_SOURCE:-}" && "${3:-}" == *:* ]]; then
+      cp "$SMOLVM_ARCHIVE_SOURCE" "${4:?missing copy destination}"
+    fi
     ;;
   *) exit 2 ;;
 esac

@@ -14,6 +14,12 @@ _BOX_PASS=""
 _TEMP_PATHS=()
 _LOCK_DIRS=()
 _PAUSED_BOXES=()
+_PAUSED_RESUME_ON_CLEANUP=()
+_GUEST_TEMP_BOXES=()
+_GUEST_TEMP_PATHS=()
+_CREATED_BOXES=()
+_PENDING_SIGNAL=0
+_LOCK_FAILURE=""
 
 die() { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 say() { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -21,14 +27,26 @@ warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 _cleanup() {
-  local status=$? n path
+  local status=$? n path index
   trap - EXIT HUP INT TERM
-  for n in "${_PAUSED_BOXES[@]:-}"; do
-    [[ -n "$n" ]] || continue
-    _guest_hb "$n" resume >/dev/null 2>&1 || true
+  set +e
+  for index in "${!_GUEST_TEMP_PATHS[@]}"; do
+    n="${_GUEST_TEMP_BOXES[$index]}"
+    path="${_GUEST_TEMP_PATHS[$index]}"
+    [[ -n "$n" && -n "$path" ]] || continue
+    smolvm machine exec --name "$n" -- rm -f -- "$path" >/dev/null 2>&1 || true
   done
   for path in "${_TEMP_PATHS[@]:-}"; do
     [[ -n "$path" ]] && rm -f -- "$path"
+  done
+  for n in "${_CREATED_BOXES[@]:-}"; do
+    [[ -n "$n" ]] || continue
+    _rollback_created "$n" || true
+  done
+  for index in "${!_PAUSED_BOXES[@]}"; do
+    n="${_PAUSED_BOXES[$index]}"
+    [[ -n "$n" && "${_PAUSED_RESUME_ON_CLEANUP[$index]}" == 1 ]] || continue
+    _guest_hb "$n" resume >/dev/null 2>&1 || true
   done
   for path in "${_LOCK_DIRS[@]:-}"; do
     [[ -n "$path" ]] || continue
@@ -40,22 +58,67 @@ _cleanup() {
 
 _install_cleanup_traps() {
   trap _cleanup EXIT
+  _install_signal_traps
+}
+
+_install_signal_traps() {
   trap 'exit 129' HUP
   trap 'exit 130' INT
   trap 'exit 143' TERM
 }
 
+_defer_signals() {
+  _PENDING_SIGNAL=0
+  trap '_PENDING_SIGNAL=129' HUP
+  trap '_PENDING_SIGNAL=130' INT
+  trap '_PENDING_SIGNAL=143' TERM
+}
+
+_honor_pending_signal() {
+  local status="$_PENDING_SIGNAL"
+  _PENDING_SIGNAL=0
+  [[ "$status" == 0 ]] || exit "$status"
+}
+
 _track_temp() { _TEMP_PATHS+=("$1"); }
+
+_track_guest_temp() {
+  _GUEST_TEMP_BOXES+=("$1")
+  _GUEST_TEMP_PATHS+=("$2")
+}
+
+_untrack_guest_temp() {
+  local n="$1" path="$2" index
+  for index in "${!_GUEST_TEMP_PATHS[@]}"; do
+    if [[ "${_GUEST_TEMP_BOXES[$index]}" == "$n" && "${_GUEST_TEMP_PATHS[$index]}" == "$path" ]]; then
+      _GUEST_TEMP_BOXES[index]=""
+      _GUEST_TEMP_PATHS[index]=""
+    fi
+  done
+}
+
+_mark_created() { _CREATED_BOXES+=("$1"); }
+
+_clear_created() {
+  local n="$1" index
+  for index in "${!_CREATED_BOXES[@]}"; do
+    [[ "${_CREATED_BOXES[$index]}" == "$n" ]] && _CREATED_BOXES[index]=""
+  done
+}
 
 _require() { have "$1" || die "$1 not found on PATH"; }
 
 _host_preflight() {
-  local mode="${1:-vm}" cmd
-  for cmd in awk mktemp tar; do _require "$cmd"; done
-  if [[ "$mode" != archive-only ]]; then
-    for cmd in lsof smolvm; do _require "$cmd"; done
-  fi
-  if [[ "$mode" != vm-only ]]; then _require gpg; fi
+  local mode="${1:-full}" cmd requirements=()
+  case "$mode" in
+    basic) requirements=(awk smolvm) ;;
+    provision) requirements=(awk smolvm tar) ;;
+    health) requirements=(awk curl jq mktemp smolvm) ;;
+    archive) requirements=(awk gpg grep mktemp tar) ;;
+    full) requirements=(awk curl gpg grep jq mktemp smolvm tar) ;;
+    *) die "unknown host preflight mode '$mode'" ;;
+  esac
+  for cmd in "${requirements[@]}"; do _require "$cmd"; done
 }
 
 _validate_name() {
@@ -64,21 +127,39 @@ _validate_name() {
     die "invalid box name '$n' (use 1-63 letters, numbers, dots, underscores, or dashes)"
 }
 
-_acquire_lock() {
+_try_acquire_lock() {
   local key="$1" dir="$LOCK_ROOT/$1.lock"
-  mkdir -p "$LOCK_ROOT"
+  _LOCK_FAILURE=""
+  if ! mkdir -p "$LOCK_ROOT"; then
+    _LOCK_FAILURE="could not create the lock directory"
+    return 1
+  fi
   if ! mkdir "$dir" 2>/dev/null; then
     local owner=""
     [[ -r "$dir/pid" ]] && owner="$(cat "$dir/pid")"
     if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
       rm -rf "$dir"
-      mkdir "$dir" 2>/dev/null || die "could not recover stale '$key' lock"
+      if ! mkdir "$dir" 2>/dev/null; then
+        _LOCK_FAILURE="could not recover stale '$key' lock"
+        return 1
+      fi
     else
-      die "another operation already holds the '$key' lock${owner:+ (pid $owner)}"
+      _LOCK_FAILURE="another operation already holds the '$key' lock${owner:+ (pid $owner)}"
+      return 1
     fi
   fi
+  if ! printf '%s\n' "$$" >"$dir/pid"; then
+    rm -f -- "$dir/pid"
+    rmdir "$dir" >/dev/null 2>&1 || true
+    _LOCK_FAILURE="could not record ownership of the '$key' lock"
+    return 1
+  fi
   _LOCK_DIRS+=("$dir")
-  printf '%s\n' "$$" >"$dir/pid"
+}
+
+_acquire_lock() {
+  local key="$1"
+  _try_acquire_lock "$key" || die "$_LOCK_FAILURE"
 }
 
 _release_lock() {
@@ -103,10 +184,88 @@ _reg_port() { [[ -f "$REG" ]] && awk -F'\t' -v n="$1" '$1==n{print $2}' "$REG"; 
 
 _machine_exists() { smolvm machine status --name "$1" >/dev/null 2>&1; }
 
+_tcp_port_open() {
+  local host="$1" port="$2"
+  (exec 3<>"/dev/tcp/$host/$port") 2>/dev/null
+}
+
 _port_free() {
   awk -F'\t' -v p="$1" '$2==p{f=1} END{exit !f}' "$REG" 2>/dev/null && return 1
-  lsof -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1 && return 1
+  _tcp_port_open 127.0.0.1 "$1" && return 1
+  _tcp_port_open ::1 "$1" && return 1
   return 0
+}
+
+_mcp_initialize() {
+  local url="$1" token="$2" headers body code session content_type initialized_code initialized_ok=0
+  headers="$(mktemp)" || return 1
+  body="$(mktemp)" || { rm -f -- "$headers"; return 1; }
+  _track_temp "$headers"
+  _track_temp "$body"
+  if ! code="$(curl -sS --connect-timeout 2 --max-time 5 -D "$headers" -o "$body" -w '%{http_code}' \
+    -X POST \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json,text/event-stream' \
+    --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"hermes-box-doctor","version":"1"}}}' \
+    "$url")"; then
+    rm -f -- "$headers" "$body"
+    return 1
+  fi
+  session="$(awk 'tolower($1) == "mcp-session-id:" { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$headers")"
+  content_type="$(awk 'tolower($1) == "content-type:" { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print tolower($0); exit }' "$headers")"
+  if [[ "$code" != 200 || -z "$session" ]] || ! _mcp_response_valid "$body" "$content_type"; then
+    rm -f -- "$headers" "$body"
+    [[ -n "$session" ]] && _mcp_delete_session "$url" "$token" "$session"
+    return 1
+  fi
+  if initialized_code="$(curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' \
+    -X POST \
+    -H "Authorization: Bearer $token" \
+    -H 'Content-Type: application/json' \
+    -H 'Accept: application/json,text/event-stream' \
+    -H "Mcp-Session-Id: $session" \
+    --data '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$url")" &&
+    [[ "$initialized_code" == 202 ]]; then
+    initialized_ok=1
+  fi
+  rm -f -- "$headers" "$body"
+  _mcp_delete_session "$url" "$token" "$session"
+  [[ "$initialized_ok" == 1 ]]
+}
+
+_mcp_delete_session() {
+  local url="$1" token="$2" session="$3"
+  curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -X DELETE \
+    -H "Authorization: Bearer $token" \
+    -H 'Accept: application/json,text/event-stream' \
+    -H "Mcp-Session-Id: $session" "$url" >/dev/null 2>&1 || true
+}
+
+_mcp_response_valid() {
+  local body="$1" content_type="$2" filter
+  filter='type == "object" and .jsonrpc == "2.0" and .id == 1 and
+    has("result") and (has("error") | not) and
+    (.result | type == "object") and
+    .result.protocolVersion == "2025-03-26" and
+    (.result.serverInfo | type == "object") and
+    (.result.serverInfo.name | type == "string" and length > 0) and
+    (.result.serverInfo.version | type == "string") and
+    (.result.capabilities | type == "object")'
+  case "$content_type" in
+    application/json*) jq -e "$filter" "$body" >/dev/null 2>&1 ;;
+    text/event-stream*) sed -n 's/^data:[[:space:]]*//p' "$body" | jq -e "$filter" >/dev/null 2>&1 ;;
+    *) return 1 ;;
+  esac
+}
+
+_wait_mcp_ready() {
+  local url="$1" token="$2" attempt
+  for ((attempt = 0; attempt < 30; attempt++)); do
+    _mcp_initialize "$url" "$token" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
 }
 
 _assign_port() {
@@ -177,25 +336,28 @@ _guest_hb() {
 }
 
 _pause_box() {
-  local n="$1"
+  local n="$1" resume_on_cleanup="${2:-1}"
   if _guest_hb "$n" is-paused >/dev/null 2>&1; then return; fi
-  _guest_hb "$n" pause
   _PAUSED_BOXES+=("$n")
+  _PAUSED_RESUME_ON_CLEANUP+=("$resume_on_cleanup")
+  if ! _guest_hb "$n" pause; then return 1; fi
+  _guest_hb "$n" is-paused >/dev/null 2>&1
 }
 
 _resume_box() {
   local n="$1" index
   for index in "${!_PAUSED_BOXES[@]}"; do
     if [[ "${_PAUSED_BOXES[$index]}" == "$n" ]]; then
-      _guest_hb "$n" resume
+      _guest_hb "$n" resume || return 1
       _PAUSED_BOXES[index]=""
+      _PAUSED_RESUME_ON_CLEANUP[index]=""
       return
     fi
   done
 }
 
 _create_base() {
-  local n="$1" port="" wl_port opts=()
+  local n="$1" port="" wl_port create_status opts=()
   _acquire_lock registry
   [[ -z "$(_reg_port "$n")" ]] || { _release_lock registry; die "box '$n' is already registered"; }
   if _machine_exists "$n"; then
@@ -208,14 +370,32 @@ _create_base() {
     say "Assigned host port ${port} -> executor (http://localhost:${port})"
   fi
   wl_port="${port:-4788}"
-  if ! smolvm machine create --net "${opts[@]}" --name "$n" --image "$BASE_IMAGE" \
+  _defer_signals
+  if smolvm machine create --net "${opts[@]}" --name "$n" --image "$BASE_IMAGE" \
     -- bash -c "while [ ! -x /opt/hermes-box/bin/hb-workload ]; do sleep 2; done; exec runuser -u agent -- env HOME=/data/home/agent /opt/hermes-box/bin/hb-workload ${wl_port}"; then
+    create_status=0
+  else
+    create_status=$?
+  fi
+  if [[ "$create_status" != 0 ]]; then
+    _install_signal_traps
     _release_lock registry
+    warn "smolvm create failed for '$n'; ownership is unknown, so no VM will be deleted automatically"
+    warn "inspect with: smolvm machine status --name '$n'"
+    _honor_pending_signal
     return 1
   fi
-  smolvm machine start --name "$n" || { _release_lock registry; return 1; }
-  _reg_add "$n" "$port" || { _release_lock registry; return 1; }
+  _mark_created "$n"
+  if ! _reg_add "$n" "$port"; then
+    _install_signal_traps
+    _release_lock registry
+    _honor_pending_signal
+    return 1
+  fi
+  _install_signal_traps
   _release_lock registry
+  _honor_pending_signal
+  smolvm machine start --name "$n"
 }
 
 _provision_into() {
@@ -239,30 +419,53 @@ _provision_into() {
 
 _prepare_runtime() {
   local n="$1"
-  _guest_hb "$n" up && _guest_hb "$n" wire-once && _guest_hb "$n" doctor
+  _guest_hb "$n" up || return 1
+  _guest_hb "$n" wire-once || return 1
+  _guest_hb "$n" doctor
 }
 
 _rollback_created() {
-  local n="$1"
+  local n="$1" registry_lock="$LOCK_ROOT/registry.lock" owns_lock=0
   warn "rolling back incomplete box '$n'"
-  smolvm machine delete --name "$n" -f >/dev/null 2>&1 || true
-  if [[ ! -r "$LOCK_ROOT/registry.lock/pid" || "$(cat "$LOCK_ROOT/registry.lock/pid")" != "$$" ]]; then
-    _acquire_lock registry
+  if ! smolvm machine delete --name "$n" -f >/dev/null 2>&1; then
+    warn "could not remove incomplete box '$n'; registry metadata was preserved"
+    warn "recover with: ./box rm '$n' --force"
+    return 1
   fi
-  _reg_del "$n"
+  if _machine_exists "$n"; then
+    warn "could not remove incomplete box '$n'; registry metadata was preserved"
+    warn "recover with: ./box rm '$n' --force"
+    return 1
+  fi
+  if [[ -r "$registry_lock/pid" && "$(cat "$registry_lock/pid" 2>/dev/null)" == "$$" ]]; then
+    owns_lock=1
+  elif _try_acquire_lock registry; then
+    owns_lock=1
+  fi
+  if [[ "$owns_lock" != 1 ]]; then
+    warn "removed VM '$n', but the registry lock is busy; metadata was preserved"
+    warn "after the other operation finishes, remove the stale '$n' entry from $REG"
+    return 1
+  fi
+  if ! _reg_del "$n"; then
+    warn "removed VM '$n', but failed to update $REG"
+    _release_lock registry
+    return 1
+  fi
   _release_lock registry
+  return 0
 }
 
 cmd_new() {
   local n="${1:?usage: box new <name>}"
   _validate_name "$n"
-  _host_preflight vm-only
+  _host_preflight provision
   _acquire_lock "$n"
   say "Creating instance '$n' from $BASE_IMAGE"
   if ! _create_base "$n" || ! _provision_into "$n" full || ! _prepare_runtime "$n"; then
-    _rollback_created "$n"
     die "box creation failed"
   fi
+  _clear_created "$n"
   local port
   port="$(_reg_port "$n")"
   say "Ready. Enter with: ./box enter $n"
@@ -273,7 +476,7 @@ cmd_new() {
 cmd_enter() {
   local n="${1:?usage: box enter <name>}"
   _validate_name "$n"
-  _host_preflight vm-only
+  _host_preflight basic
   smolvm machine start --name "$n" >/dev/null
   exec smolvm machine exec -it --name "$n" -- login -f agent
 }
@@ -281,7 +484,7 @@ cmd_enter() {
 cmd_save() {
   local n="${1:?usage: box save <name> [out.tar.gz.gpg]}" ts out raw encrypted guest_tmp
   _validate_name "$n"
-  _host_preflight
+  _host_preflight full
   _acquire_lock "$n"
   ts="$(date +%Y%m%d-%H%M%S)"
   out="${2:-backups/${n}-${ts}.tar.gz.gpg}"
@@ -289,17 +492,21 @@ cmd_save() {
   mkdir -p "$(dirname "$out")"
   raw="$(mktemp)"
   encrypted="$(mktemp "${out}.tmp.XXXXXX")"
-  guest_tmp="/tmp/hb-data-${ts}-$$-${RANDOM}.tgz"
+  guest_tmp="/root/hb-data-${ts}-$$-${RANDOM}.tgz"
   _track_temp "$raw"
   _track_temp "$encrypted"
+  _track_guest_temp "$n" "$guest_tmp"
 
   say "Quiescing Executor inside '$n'"
   _pause_box "$n"
   _guest_hb "$n" write-manifest
   say "Archiving /data inside '$n'"
-  smolvm machine exec --name "$n" -- bash -lc "sync; tar czf '$guest_tmp' -C /data ."
+  # shellcheck disable=SC2016 # expanded by the guest shell; archive is positional
+  smolvm machine exec --name "$n" -- bash -c \
+    'set -euo pipefail; umask 077; archive=$1; sync; tar czf "$archive" -C /data .' bash "$guest_tmp"
   smolvm machine cp "$n:$guest_tmp" "$raw"
-  smolvm machine exec --name "$n" -- rm -f "$guest_tmp"
+  smolvm machine exec --name "$n" -- rm -f -- "$guest_tmp"
+  _untrack_guest_temp "$n" "$guest_tmp"
   _validate_archive "$raw" || die "generated archive failed validation"
   _resume_box "$n"
 
@@ -315,7 +522,7 @@ cmd_load() {
   local file="${1:?usage: box load <archive.tar.gz.gpg> [name]}" n="${2:-restored}" raw guest_tmp
   [[ -f "$file" ]] || die "no such archive: $file"
   _validate_name "$n"
-  _host_preflight
+  _host_preflight full
   _acquire_lock "$n"
   raw="$(mktemp)"
   _track_temp "$raw"
@@ -325,25 +532,32 @@ cmd_load() {
 
   say "Creating and provisioning fresh instance '$n'"
   if ! _create_base "$n" || ! _provision_into "$n" full; then
-    _rollback_created "$n"
     die "destination provisioning failed"
   fi
 
-  guest_tmp="/tmp/hb-restore-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}.tgz"
-  if ! _pause_box "$n" || ! smolvm machine cp "$raw" "$n:$guest_tmp" ||
-    ! smolvm machine exec --name "$n" -- bash -lc \
-      "find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +; tar xzf '$guest_tmp' --no-same-owner -C /data; rm -f '$guest_tmp'" ||
+  guest_tmp="/root/hb-restore-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}.tgz"
+  _track_guest_temp "$n" "$guest_tmp"
+  # shellcheck disable=SC2016 # expanded by the guest shell; archive is positional
+  if ! _pause_box "$n" 0 || ! smolvm machine cp "$raw" "$n:$guest_tmp" ||
+    ! smolvm machine exec --name "$n" -- chmod 0600 "$guest_tmp" ||
+    ! smolvm machine exec --name "$n" -- bash -c \
+      'set -euo pipefail
+       archive=$1
+       trap '\''rm -f -- "$archive"'\'' EXIT HUP INT TERM
+       find /data -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+       tar xzf "$archive" --no-same-owner -C /data' bash "$guest_tmp" ||
     ! _provision_into "$n" assets || ! _resume_box "$n" || ! _prepare_runtime "$n"; then
-    _rollback_created "$n"
-    die "restore failed; incomplete destination was removed"
+    die "restore failed; attempting cleanup of the incomplete destination"
   fi
+  _untrack_guest_temp "$n" "$guest_tmp"
+  _clear_created "$n"
   say "Restored and verified. Enter with: ./box enter $n"
 }
 
 cmd_extract() {
   local file="${1:?usage: box extract <archive.tar.gz.gpg> [dest-dir]}" base dest raw
   [[ -f "$file" ]] || die "no such archive: $file"
-  _host_preflight archive-only
+  _host_preflight archive
   base="$(basename "$file")"
   base="${base%.tar.gz.gpg}"
   dest="${2:-backups/${base}-extracted}"
@@ -361,7 +575,7 @@ cmd_extract() {
 }
 
 cmd_ls() {
-  _host_preflight vm-only
+  _host_preflight basic
   if [[ "${1:-}" == --all ]]; then smolvm machine ls; return; fi
   [[ -s "$REG" ]] || { echo "No hermes-box-lite boxes yet. Create one: ./box new <name>"; return; }
   printf '%-16s %-10s %s\n' BOX STATE EXECUTOR
@@ -383,7 +597,7 @@ cmd_ls() {
 cmd_open() {
   local n="${1:?usage: box open <name>}" port token url
   _validate_name "$n"
-  _host_preflight vm-only
+  _host_preflight health
   _acquire_lock "$n"
   port="$(_reg_port "$n")"
   [[ -n "$port" ]] || die "'$n' has no exposed Executor host port"
@@ -391,27 +605,50 @@ cmd_open() {
   _guest_hb "$n" up >/dev/null
   token="$(_guest_hb "$n" executor-token)" || die "could not read Executor's local token"
   [[ -n "$token" ]] || die "Executor token is unavailable"
+  _wait_mcp_ready "http://127.0.0.1:${port}/mcp" "$token" ||
+    die "Executor did not become ready on the forwarded host endpoint"
   url="http://localhost:${port}/?_token=${token}"
   say "Opening authenticated Executor UI at http://localhost:${port}"
-  if command -v open >/dev/null 2>&1; then
-    open "$url"
-  else
-    die "no browser opener found; enter the box and run 'hb web'"
+  _open_url "$url" ||
+    die "could not launch a browser; set BOX_BROWSER to a graphical opener (the authenticated URL is passed directly and never printed)"
+}
+
+_open_url() {
+  local url="$1" platform
+  if [[ -n "${BOX_BROWSER:-}" ]]; then
+    command -v "$BOX_BROWSER" >/dev/null 2>&1 || return 1
+    "$BOX_BROWSER" "$url" >/dev/null 2>&1
+    return
   fi
+  platform="$(uname -s)"
+  if [[ "$platform" == Darwin ]] && command -v open >/dev/null 2>&1; then
+    open "$url" >/dev/null 2>&1
+    return
+  elif [[ "$platform" == Linux ]]; then
+    if command -v xdg-open >/dev/null 2>&1 && xdg-open "$url" >/dev/null 2>&1; then return; fi
+    if command -v gio >/dev/null 2>&1 && gio open "$url" >/dev/null 2>&1; then return; fi
+  fi
+  return 1
 }
 
 cmd_doctor() {
-  local n="${1:?usage: box doctor <name>}" port
+  local n="${1:?usage: box doctor <name>}" port token
   _validate_name "$n"
-  _host_preflight vm-only
+  _host_preflight basic
   _acquire_lock "$n"
   port="$(_reg_port "$n")"
   _machine_exists "$n" || die "smolvm machine '$n' is missing"
   smolvm machine start --name "$n" >/dev/null
-  _guest_hb "$n" doctor
+  _prepare_runtime "$n" || die "guest readiness or health check failed for '$n'"
   if [[ -n "$port" ]]; then
-    lsof -nP -iTCP:"$port" -sTCP:LISTEN >/dev/null 2>&1 || die "host port $port is not listening"
-    say "host Executor listener: http://localhost:${port}"
+    _host_preflight health
+    token="$(_guest_hb "$n" executor-token)" || die "could not read Executor's local token"
+    [[ -n "$token" ]] || die "Executor token is unavailable"
+    _wait_mcp_ready "http://127.0.0.1:${port}/mcp" "$token" ||
+      die "host Executor MCP health check failed on port $port"
+    say "host Executor MCP: healthy on http://localhost:${port}"
+  else
+    say "host Executor MCP: skipped (no exposed host port)"
   fi
   say "doctor passed for '$n'"
 }
@@ -419,7 +656,7 @@ cmd_doctor() {
 cmd_repair() {
   local n="${1:?usage: box repair <name>}"
   _validate_name "$n"
-  _host_preflight vm-only
+  _host_preflight provision
   _acquire_lock "$n"
   _machine_exists "$n" || die "smolvm machine '$n' is missing"
   smolvm machine start --name "$n" >/dev/null
@@ -433,7 +670,7 @@ cmd_repair() {
 cmd_stop() {
   local n="${1:?usage: box stop <name>}"
   _validate_name "$n"
-  _host_preflight vm-only
+  _host_preflight basic
   _acquire_lock "$n"
   smolvm machine stop --name "$n"
 }
@@ -441,7 +678,7 @@ cmd_stop() {
 cmd_start() {
   local n="${1:?usage: box start <name>}"
   _validate_name "$n"
-  _host_preflight vm-only
+  _host_preflight basic
   _acquire_lock "$n"
   smolvm machine start --name "$n"
 }
@@ -449,7 +686,7 @@ cmd_start() {
 cmd_rm() {
   local n="${1:?usage: box rm <name> [--force]}" force="${2:-}" answer latest
   _validate_name "$n"
-  _host_preflight vm-only
+  _host_preflight basic
   latest="$(find backups -maxdepth 1 -type f -name "${n}-*.tar.gz.gpg" -print 2>/dev/null | sort | tail -1)"
   if [[ -n "$latest" ]]; then say "latest backup: $latest"; else warn "no backup found for '$n'"; fi
   if [[ "$force" != --force ]]; then

@@ -20,7 +20,7 @@ base_os() {
   apt-get update -qq
   # curl+git+xz-utils are the prereqs the hermes installer needs on Linux.
   apt-get install -y -qq \
-    ca-certificates curl git tmux xz-utils gnupg sudo \
+    ca-certificates curl git jq tmux xz-utils gnupg sudo \
     iproute2 less neovim util-linux ripgrep socat >/dev/null
   # Pre-install a minimal ffmpeg so the hermes installer's `command -v ffmpeg`
   # check passes and it skips pulling ffmpeg's 667MB desktop recommends tree
@@ -149,7 +149,7 @@ assets_only() {
   install_config
   place_assets
   seed_data
-  "$OPT/bin/hb" write-manifest
+  runuser -u agent -- env HOME=/data/home/agent "$OPT/bin/hb" write-manifest
   log "managed assets refreshed"
 }
 

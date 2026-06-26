@@ -38,6 +38,23 @@ current backups for anything important.
 
 ## Quick start
 
+Host prerequisites:
+
+- macOS with the smolvm-supported virtualization stack, or Linux on x86_64 or
+  arm64 with KVM available and the current user allowed to access `/dev/kvm`;
+- `smolvm`, GPG, curl, jq, tar, awk, and standard Bash command-line tools; and
+- a graphical opener for `box open` (`open` on macOS, or `xdg-open`/`gio` on
+  Linux). On another desktop, set `BOX_BROWSER` to a graphical opener. It
+  receives the secret authenticated URL directly as its sole argument, so do
+  not use a wrapper that logs arguments.
+
+On Linux, verify KVM access before creating a box:
+
+```bash
+test -r /dev/kvm -a -w /dev/kvm
+smolvm machine ls
+```
+
 ```bash
 ./box new alpha
 ./box doctor alpha
@@ -58,11 +75,11 @@ passphrases are read from the terminal without echo.
 
 | Command | Behavior |
 |---|---|
-| `box new <name>` | Create, provision, wire MCP, and health-check a box; remove it on failure |
+| `box new <name>` | Create, provision, wire MCP, and health-check a box; attempt verified cleanup on failure |
 | `box enter <name>` | Log in as `agent` and attach persistent tmux session `main` |
 | `box ls [--all]` | List managed boxes, or every smolvm VM |
 | `box open <name>` | Open the authenticated Executor UI without printing its token |
-| `box doctor <name>` | Check required tools, Executor/MCP health, durable state, and host forwarding |
+| `box doctor <name>` | Check required tools, durable state, guest MCP, and the host MCP endpoint when exposed |
 | `box repair <name>` | Re-run provisioning, refresh managed assets, and re-check health |
 | `box stop` / `start <name>` | Stop or start a VM under a per-box mutation lock |
 | `box save <name> [out]` | Pause Executor, archive `/data`, validate, encrypt, and verify without overwriting |
@@ -86,6 +103,14 @@ mcp` as a second process. The bearer token remains under `/data` in Executor's
 mode-0600 auth file and a mode-0600 Codex environment file. Set
 `WIRE_EXECUTOR_MCP=0` before provisioning to disable registration.
 
+The guest doctor check—and the host check when web exposure is enabled—performs
+a complete MCP handshake: it uses `jq` to validate the JSON `initialize`
+result and negotiated protocol version, sends the
+initialized notification, and closes the session best-effort. Requests have
+bounded timeouts. A listening socket, malformed result, 404 page, or HTTP 500
+response does not count as healthy. Without an exposed port, doctor explicitly
+reports that the host endpoint check was skipped.
+
 Inside a box:
 
 ```bash
@@ -104,23 +129,30 @@ hb logs executor
 
 1. acquires the box mutation lock;
 2. gracefully pauses Executor and waits for its port to close;
-3. writes a runtime-version manifest and archives `/data` inside the guest;
+3. atomically writes a mode-0600 runtime-version manifest at
+   `~/.config/hermes-box/runtime-manifest` and archives `/data` inside the guest;
 4. copies the archive using `smolvm machine cp`;
 5. validates its paths and required durable-home layout;
 6. encrypts to a unique temporary destination;
 7. decrypts and lists the encrypted result as a verification pass; and
 8. publishes it without overwriting an existing backup.
 
-Host plaintext temporaries and operation locks are removed by exit and signal
-traps. Executor is resumed even when a later save step fails. Do not actively
-edit workspace files during a save; Executor is quiesced, but arbitrary editor
-or agent processes are not frozen.
+Host and guest plaintext temporaries and operation locks are removed by exit
+and signal traps. Guest plaintext is removed before Executor is resumed, even
+when a later save step fails. Do not actively edit workspace files during a
+save; Executor is quiesced, but arbitrary editor or agent processes are not
+frozen.
 
 `box load` decrypts and validates before spending time or creating resources.
 It restores while Executor is paused, removes hidden as well as normal old
 state, refreshes repository-owned guest assets, starts a fresh daemon against
 the restored database, repairs MCP wiring, and runs the doctor. A failed new or
-load operation removes its incomplete destination VM and registry entry.
+load operation—including interruption by HUP, INT, or TERM—attempts to remove
+only an incomplete destination VM proven to have been created by that
+invocation. Registry metadata is removed only after VM absence is verified. If
+cleanup cannot delete the VM or acquire the registry lock, it preserves
+metadata and prints recovery guidance. An unmanaged or ambiguous same-named
+smolvm machine is never deleted.
 
 Backups are state-portable, not reproducible machine images. Restoring later
 provisions the then-current Ubuntu packages and upstream tool releases before
@@ -147,6 +179,7 @@ copy at `/etc/hermes-box.env`, so guest helpers honor `INSTALL_HERMES`,
 make check
 ```
 
-This runs Bash syntax checks, ShellCheck, static contract checks, and local
-archive/lifecycle smoke tests. It does not create a VM or contact upstream
-installers. There is intentionally no CI configuration yet.
+This requires ShellCheck, Python 3, and jq, and runs Bash syntax checks, static
+contract checks, protocol-health regressions, and local archive/lifecycle smoke
+tests. It does not create a VM or contact upstream installers. There is
+intentionally no CI configuration yet.
