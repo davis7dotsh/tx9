@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic health check for tx9 agent box %i
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=5min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

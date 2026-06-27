@@ -1,34 +1,107 @@
 #!/usr/bin/env bash
 # Persistent box service — smolvm runs this as the box's workload on every start
 # (as the agent user), and it stays alive for the box's lifetime. It keeps the
-# executor daemon up on localhost:4788 and, when a distinct PORT is given, a socat
-# bridge 0.0.0.0:PORT -> 127.0.0.1:4788 so a host port-forward can reach it.
+# Executor and the Hermes gateway healthy, plus optional host-forward bridges.
 # (executor's own 0.0.0.0 mode is ephemeral, and exec-started daemons don't
 # survive — so this boot-context loop is what makes host access durable.)
 set -u
 PORT="${1:-4788}"
+HERMES_BRIDGE_PORT="${2:-0}"
 # shellcheck disable=SC1091
 [ -f /etc/profile.d/hermes-box.sh ] && . /etc/profile.d/hermes-box.sh
-mkdir -p /data/logs
-PAUSE_FILE=/tmp/hermes-box-executor-paused
+QUIESCE_FILE="$HOME/.config/hermes-box/quiesced"
+LEGACY_QUIESCE_FILE="${HB_LEGACY_QUIESCE_FILE:-/tmp/hermes-box-executor-paused}"
+GATEWAY_DISABLED="$HOME/.config/hermes-box/gateway-disabled"
+EXECUTOR_TARGET_PORT="${EXECUTOR_PORT:-4788}"
+HERMES_TARGET_PORT="${HERMES_API_PORT:-8642}"
+LOGS="${HB_WORKLOAD_LOGS:-/data/logs}"
+BOX_ENV="${HB_BOX_ENV:-/etc/hermes-box.env}"
 
-_exec_up() { (exec 3<>/dev/tcp/127.0.0.1/4788) 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
+_exec_up() { (exec 3<>"/dev/tcp/127.0.0.1/$EXECUTOR_TARGET_PORT") 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
+_api_up() { (exec 3<>"/dev/tcp/127.0.0.1/$HERMES_TARGET_PORT") 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
 
-while true; do
-  if [ -e "$PAUSE_FILE" ]; then
-    sleep 2
-    continue
+_wait_api_ready() {
+  local _
+  for _ in 1 2 3 4 5; do
+    _api_up && return 0
+    sleep 1
+  done
+  return 1
+}
+
+_stop_bridge() {
+  local listener="$1" _
+  pkill -TERM -f "socat TCP-LISTEN:$listener," 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    ! pgrep -f "socat TCP-LISTEN:$listener," >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  pkill -KILL -f "socat TCP-LISTEN:$listener," 2>/dev/null || true
+}
+
+_stop_api_bridge() { [ "$HERMES_BRIDGE_PORT" = 0 ] || _stop_bridge "$HERMES_BRIDGE_PORT"; }
+
+_stop_executor_bridge() { [ "$PORT" = 4788 ] || _stop_bridge "$PORT"; }
+
+_migrate_legacy_quiesce() {
+  [ -e "$LEGACY_QUIESCE_FILE" ] || return 0
+  mkdir -p "$(dirname "$QUIESCE_FILE")" || return 1
+  chmod 0700 "$(dirname "$QUIESCE_FILE")" || return 1
+  touch "$QUIESCE_FILE" || return 1
+  rm -f "$LEGACY_QUIESCE_FILE"
+}
+
+_refresh_targets() {
+  local previous_executor="$EXECUTOR_TARGET_PORT" previous_api="$HERMES_TARGET_PORT"
+  EXECUTOR_PORT=4788
+  HERMES_API_PORT=8642
+  # Managed root-owned repair output; refresh it because this workload outlives repair.
+  # shellcheck disable=SC1090
+  [ ! -r "$BOX_ENV" ] || . "$BOX_ENV"
+  EXECUTOR_TARGET_PORT="${EXECUTOR_PORT:-4788}"
+  HERMES_TARGET_PORT="${HERMES_API_PORT:-8642}"
+  if [ "$previous_executor" != "$EXECUTOR_TARGET_PORT" ]; then _stop_executor_bridge; fi
+  if [ "$previous_api" != "$HERMES_TARGET_PORT" ]; then _stop_api_bridge; fi
+}
+
+reconcile_once() {
+  local reconciled=0
+  _refresh_targets
+  if [ -e "$LEGACY_QUIESCE_FILE" ] && ! _migrate_legacy_quiesce; then
+    _stop_executor_bridge
+    _stop_api_bridge
+    return
   fi
-  # executor on its persistent localhost daemon
-  if command -v executor >/dev/null 2>&1 && ! _exec_up; then
-    rm -f "$HOME/.executor"/daemon-active-* 2>/dev/null || true   # drop stale records
-    executor daemon run >>/data/logs/executor.log 2>&1 || true
+  if [ -e "$QUIESCE_FILE" ] || [ -e "$LEGACY_QUIESCE_FILE" ]; then
+    _stop_executor_bridge
+    _stop_api_bridge
+    return
   fi
+  if hb reconcile >>"$LOGS/workload.log" 2>&1; then reconciled=1; fi
   # socat bridge for host access (only when a distinct port was assigned)
   if [ "$PORT" != "4788" ] && command -v socat >/dev/null 2>&1 && _exec_up \
      && ! pgrep -f "TCP-LISTEN:$PORT," >/dev/null 2>&1; then
-    socat "TCP-LISTEN:$PORT,bind=0.0.0.0,fork,reuseaddr" TCP:127.0.0.1:4788 \
-      >>/data/logs/socat.log 2>&1 &
+    socat "TCP-LISTEN:$PORT,bind=0.0.0.0,fork,reuseaddr" "TCP:127.0.0.1:$EXECUTOR_TARGET_PORT" \
+      >>"$LOGS/socat.log" 2>&1 &
   fi
-  sleep 20
-done
+  if [ "$HERMES_BRIDGE_PORT" != 0 ] && [ "$reconciled" = 1 ] && [ ! -e "$GATEWAY_DISABLED" ] \
+     && command -v socat >/dev/null 2>&1 && _wait_api_ready; then
+    if ! pgrep -f "TCP-LISTEN:$HERMES_BRIDGE_PORT," >/dev/null 2>&1; then
+      socat "TCP-LISTEN:$HERMES_BRIDGE_PORT,bind=0.0.0.0,fork,reuseaddr" \
+        "TCP:127.0.0.1:$HERMES_TARGET_PORT" >>"$LOGS/hermes-api-socat.log" 2>&1 &
+    fi
+  else
+    _stop_api_bridge
+  fi
+}
+
+main() {
+  mkdir -p "$LOGS"
+  while true; do
+    reconcile_once
+    [[ "${HB_WORKLOAD_ONCE:-0}" != 1 ]] || break
+    sleep 20
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main; fi

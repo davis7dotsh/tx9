@@ -8,3 +8,7 @@
 /.boxes
 /.boxes.tmp
 /.box-locks/
+
+# Optional private/custom Hermes Git bundles used for exact-SHA provisioning.
+/artifacts/*
+!/artifacts/.gitkeep

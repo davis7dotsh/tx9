@@ -1,0 +1,508 @@
+#!/usr/bin/env python3
+"""Hermes state validation and transactional native-backup import."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import stat
+import tempfile
+import time
+import zipfile
+from pathlib import Path, PurePosixPath
+
+
+EXCLUDED_DIRS = {
+    "__pycache__", ".git", "node_modules", "backups",
+    "checkpoints", ".venv", "venv", "site-packages", ".cache", ".tox",
+    ".nox", ".pytest_cache", ".mypy_cache", ".ruff_cache",
+}
+EXCLUDED_SUFFIXES = (".pyc", ".pyo", ".db-wal", ".db-shm", ".db-journal")
+RUNTIME_NAMES = {
+    "gateway_state.json", "gateway.pid", "cron.pid", "gateway.lock",
+    "processes.json",
+}
+SECRET_NAMES = {".env", "auth.json", "state.db"}
+EXTERNAL_SECRET_SUFFIXES = {".json", ".env", ".conf", ".key", ".pem"}
+MARKERS = {"config.yaml", ".env", "state.db"}
+MAX_UNCOMPRESSED = 100 * 1024**3
+RESERVED_EXTERNAL = {
+    ".ssh", ".config", "workspace", ".bashrc", ".bash_profile", ".profile",
+    ".zshrc", ".zprofile", ".zshenv",
+}
+
+
+def _safe_relative(name: str) -> PurePosixPath:
+    if "\x00" in name or "\\" in name:
+        raise ValueError(f"unsafe archive path: {name!r}")
+    path = PurePosixPath(name)
+    if path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts):
+        raise ValueError(f"unsafe archive path: {name!r}")
+    return path
+
+
+def _zip_layout(zf: zipfile.ZipFile) -> tuple[str, list[zipfile.ZipInfo]]:
+    files: list[zipfile.ZipInfo] = []
+    total = 0
+    for info in zf.infolist():
+        _safe_relative(info.filename.rstrip("/"))
+        mode = (info.external_attr >> 16) & 0o170000
+        if mode == stat.S_IFLNK:
+            raise ValueError(f"symlink entry is not allowed: {info.filename}")
+        if info.is_dir():
+            continue
+        if mode not in {0, stat.S_IFREG}:
+            raise ValueError(f"non-regular entry is not allowed: {info.filename}")
+        total += info.file_size
+        if total > MAX_UNCOMPRESSED:
+            raise ValueError("archive expands beyond the 100 GiB safety limit")
+        files.append(info)
+    if not files:
+        raise ValueError("archive is empty")
+    first = {PurePosixPath(info.filename).parts[0] for info in files}
+    prefix = next(iter(first)) + "/" if len(first) == 1 and next(iter(first)) in {".hermes", "hermes"} else ""
+    found = set()
+    for info in files:
+        relative = PurePosixPath(
+            info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
+        )
+        if relative.parts[0] != "_external":
+            found.add(relative.name)
+    if not found.intersection(MARKERS):
+        raise ValueError("archive is not a native Hermes backup (no config, env, or state database)")
+    return prefix, files
+
+
+def validate_zip(path: Path) -> dict[str, object]:
+    if not path.is_file() or not zipfile.is_zipfile(path):
+        raise ValueError(f"not a valid ZIP file: {path}")
+    with zipfile.ZipFile(path) as zf:
+        prefix, files = _zip_layout(zf)
+        external = sorted({
+            PurePosixPath(
+                info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
+            ).parts[1]
+            for info in files
+            if len(PurePosixPath(
+                info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
+            ).parts) > 1
+            and PurePosixPath(
+                info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
+            ).parts[0] == "_external"
+        })
+        return {
+            "archive": str(path),
+            "files": len(files),
+            "uncompressed_bytes": sum(info.file_size for info in files),
+            "prefix": prefix,
+            "external_top_level_entries": external,
+        }
+
+
+def _skip(rel: PurePosixPath) -> bool:
+    parts = rel.parts
+    if not parts:
+        return True
+    if rel.name in RUNTIME_NAMES or rel.name.endswith(EXCLUDED_SUFFIXES):
+        return True
+    if parts[0] == "hermes-agent":
+        return True
+    return any(part in EXCLUDED_DIRS for part in parts)
+
+
+def _table_count(conn: sqlite3.Connection, table: str) -> int | None:
+    row = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone()
+    if not row:
+        return None
+    return int(conn.execute(f'SELECT COUNT(*) FROM "{table}"').fetchone()[0])
+
+
+def inspect_home(home: Path, checkpoint: bool = False) -> dict[str, object]:
+    databases: list[dict[str, object]] = []
+    for db in sorted(home.rglob("*.db")) if home.exists() else []:
+        if db.is_symlink() or any(part in EXCLUDED_DIRS for part in db.relative_to(home).parts):
+            continue
+        uri = f"file:{db}?mode={'rw' if checkpoint else 'ro'}"
+        conn = sqlite3.connect(uri, uri=True, timeout=30)
+        try:
+            if checkpoint:
+                conn.execute("PRAGMA busy_timeout=200")
+                checkpoint_result = (1, 0, 0)
+                for _attempt in range(5):
+                    row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                    checkpoint_result = tuple(int(value) for value in row) if row else (1, 0, 0)
+                    busy, log_frames, checkpointed_frames = checkpoint_result
+                    if busy == 0 and log_frames == checkpointed_frames:
+                        break
+                    time.sleep(0.2)
+                busy, log_frames, checkpointed_frames = checkpoint_result
+                if busy != 0 or log_frames != checkpointed_frames:
+                    raise ValueError(
+                        f"SQLite checkpoint incomplete for {db}: "
+                        f"busy={busy}, log={log_frames}, checkpointed={checkpointed_frames}"
+                    )
+            integrity = str(conn.execute("PRAGMA integrity_check").fetchone()[0])
+            if integrity != "ok":
+                raise ValueError(f"SQLite integrity failed for {db}: {integrity}")
+            entry: dict[str, object] = {
+                "path": str(db.relative_to(home)),
+                "integrity": integrity,
+                "user_version": int(conn.execute("PRAGMA user_version").fetchone()[0]),
+            }
+            for table in ("sessions", "messages"):
+                count = _table_count(conn, table)
+                if count is not None:
+                    entry[table] = count
+            databases.append(entry)
+        finally:
+            conn.close()
+
+    cron_jobs = 0
+    active_cron_jobs = 0
+    for cron_file in sorted(home.rglob("jobs.json")) if home.exists() else []:
+        if cron_file.parent.name != "cron":
+            continue
+        data = json.loads(cron_file.read_text())
+        jobs = data if isinstance(data, list) else data.get("jobs", []) if isinstance(data, dict) else []
+        cron_jobs += len(jobs)
+        active_cron_jobs += sum(
+            1 for job in jobs if isinstance(job, dict) and job.get("enabled", job.get("active", True))
+        )
+
+    gateway_states: list[dict[str, str]] = []
+    for state_file in sorted(home.rglob("gateway_state.json")) if home.exists() else []:
+        try:
+            data = json.loads(state_file.read_text())
+            gateway_states.append({
+                "path": str(state_file.relative_to(home)),
+                "state": str(data.get("gateway_state", data.get("state", "unknown"))),
+            })
+        except (OSError, ValueError):
+            gateway_states.append({"path": str(state_file.relative_to(home)), "state": "invalid"})
+
+    env_file = home / ".env"
+    discord_configured = False
+    if env_file.is_file():
+        for line in env_file.read_text(errors="replace").splitlines():
+            if line.startswith("DISCORD_BOT_TOKEN=") and line.partition("=")[2].strip().strip("'\""):
+                discord_configured = True
+                break
+
+    def count_area(name: str) -> int:
+        return sum(
+            1
+            for directory in home.rglob(name)
+            if directory.is_dir()
+            for candidate in directory.rglob("*")
+            if candidate.is_file()
+        ) if home.exists() else 0
+
+    return {
+        "home": str(home),
+        "exists": home.is_dir(),
+        "databases": databases,
+        "inventory": {
+            "session_files": count_area("sessions"),
+            "memory_files": count_area("memories"),
+            "skill_files": count_area("skills"),
+            "cron_jobs": cron_jobs,
+            "active_cron_jobs": active_cron_jobs,
+        },
+        "gateway_states": gateway_states,
+        "discord_configured": discord_configured,
+    }
+
+
+def _extract(
+    zf: zipfile.ZipFile,
+    stage: Path,
+    external_stage: Path,
+    prefix: str,
+    files: list[zipfile.ZipInfo],
+    approved_external: set[str],
+) -> dict[str, int]:
+    accounting = {"archive_files": len(files), "hermes_files": 0, "external_files": 0, "skipped_files": 0}
+    for info in files:
+        name = info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
+        rel = _safe_relative(name)
+        if rel.parts[0] == "_external":
+            if len(rel.parts) == 1:
+                accounting["skipped_files"] += 1
+                continue
+            if rel.parts[1] not in approved_external:
+                raise ValueError(f"unapproved external provider entry: {rel.parts[1]}")
+            target = external_stage.joinpath(*rel.parts[1:])
+            external = True
+        elif _skip(rel):
+            accounting["skipped_files"] += 1
+            continue
+        else:
+            target = stage.joinpath(*rel.parts)
+            external = False
+        target.parent.mkdir(parents=True, exist_ok=True)
+        with zf.open(info) as source, target.open("wb") as destination:
+            shutil.copyfileobj(source, destination, length=1024 * 1024)
+        secret = target.name in SECRET_NAMES or target.suffix.lower() in EXTERNAL_SECRET_SUFFIXES
+        archived_mode = (info.external_attr >> 16) & 0o777
+        executable_path = any(part in {"hooks", "scripts"} for part in rel.parts[:-1])
+        safe_mode = archived_mode if executable_path and archived_mode else 0o644
+        target.chmod(0o600 if secret else safe_mode & 0o777)
+        accounting["external_files" if external else "hermes_files"] += 1
+    if approved_external:
+        for directory in external_stage.rglob("*"):
+            if directory.is_dir():
+                directory.chmod(0o700)
+    return accounting
+
+
+def _active_rewrite_files(home: Path) -> list[Path]:
+    selected: list[Path] = []
+    for path in home.rglob("*"):
+        if not path.is_file() or path.is_symlink():
+            continue
+        rel = path.relative_to(home)
+        if path.name in {"config.yaml", ".env"} or (path.name == "jobs.json" and path.parent.name == "cron"):
+            selected.append(path)
+        elif any(part in {"hooks", "scripts"} for part in rel.parts[:-1]):
+            selected.append(path)
+    return selected
+
+
+def _rewrite_active(home: Path, mappings: list[tuple[str, str]]) -> list[str]:
+    changed: list[str] = []
+    for path in _active_rewrite_files(home):
+        try:
+            text = path.read_text()
+        except UnicodeDecodeError:
+            continue
+        rewritten = text
+        for source, destination in sorted(mappings, key=lambda item: len(item[0]), reverse=True):
+            rewritten = rewritten.replace(source, destination)
+        if rewritten != text:
+            path.write_text(rewritten)
+            path.chmod(0o600 if path.name == ".env" else path.stat().st_mode & 0o777)
+            changed.append(str(path.relative_to(home)))
+    return changed
+
+
+def _secure_external(target: Path) -> None:
+    if target.is_dir():
+        target.chmod(0o700)
+        for item in target.rglob("*"):
+            if item.is_dir():
+                item.chmod(0o700)
+            elif item.name in SECRET_NAMES or item.suffix.lower() in EXTERNAL_SECRET_SUFFIXES:
+                item.chmod(0o600)
+    elif target.name in SECRET_NAMES or target.suffix.lower() in EXTERNAL_SECRET_SUFFIXES:
+        target.chmod(0o600)
+
+
+def import_zip(
+    path: Path,
+    home: Path,
+    mappings: list[tuple[str, str]],
+    manifest: Path,
+    approved_external: set[str],
+) -> dict[str, object]:
+    archive_report = validate_zip(path)
+    archive_external = set(archive_report["external_top_level_entries"])
+    if archive_external & RESERVED_EXTERNAL:
+        raise ValueError(
+            "archive contains reserved external destinations: "
+            + ", ".join(sorted(archive_external & RESERVED_EXTERNAL))
+        )
+    if approved_external & RESERVED_EXTERNAL:
+        raise ValueError(
+            "reserved external destinations are never importable: "
+            + ", ".join(sorted(approved_external & RESERVED_EXTERNAL))
+        )
+    unapproved = archive_external - approved_external
+    unexpected = approved_external - archive_external
+    if unapproved:
+        raise ValueError("unapproved external provider entries: " + ", ".join(sorted(unapproved)))
+    if unexpected:
+        raise ValueError("approved external entries not present: " + ", ".join(sorted(unexpected)))
+    parent = home.parent
+    parent.mkdir(parents=True, exist_ok=True)
+    stage = Path(tempfile.mkdtemp(prefix=f".{home.name}.import-", dir=parent))
+    external_stage = Path(tempfile.mkdtemp(prefix=".hermes-external-import-", dir=parent))
+    external_merge = Path(tempfile.mkdtemp(prefix=".hermes-external-merge-", dir=parent))
+    external_previous = Path(tempfile.mkdtemp(prefix=".hermes-external-previous-", dir=parent))
+    previous = parent / f".{home.name}.previous-{os.getpid()}-{int(time.time())}"
+    swapped = False
+    external_swaps: list[tuple[Path, Path | None]] = []
+    try:
+        with zipfile.ZipFile(path) as zf:
+            prefix, files = _zip_layout(zf)
+            accounting = _extract(zf, stage, external_stage, prefix, files, approved_external)
+        source_report = inspect_home(stage)
+        source_report["external_files"] = sum(1 for item in external_stage.rglob("*") if item.is_file())
+        rewritten = _rewrite_active(stage, mappings)
+        rewritten.extend(f"_external/{item}" for item in _rewrite_active(external_stage, mappings))
+        inspect_home(stage)
+        if home.exists():
+            home.rename(previous)
+        stage.rename(home)
+        swapped = True
+        for source in sorted(external_stage.iterdir()):
+            target = home.parent / source.name
+            if target == home or source.name in {".", ".."}:
+                raise ValueError(f"unsafe external Hermes state target: {target}")
+            if target.is_symlink() or (
+                target.is_dir() and any(item.is_symlink() for item in target.rglob("*"))
+            ):
+                raise ValueError(f"existing external provider tree contains symlinks: {target}")
+            candidate = source
+            if source.is_dir() and target.is_dir():
+                candidate = external_merge / source.name
+                shutil.copytree(target, candidate, symlinks=True)
+                shutil.copytree(source, candidate, dirs_exist_ok=True)
+            old: Path | None = None
+            if target.exists() or target.is_symlink():
+                old = external_previous / source.name
+                target.rename(old)
+            external_swaps.append((target, old))
+            candidate.rename(target)
+            _secure_external(target)
+        destination_report = inspect_home(home)
+        destination_report["external_files"] = sum(
+            1 for target, _ in external_swaps
+            for item in ([target] if target.is_file() else target.rglob("*"))
+            if item.is_file()
+        )
+        result = {
+            "format": 1,
+            "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "source_archive": str(path),
+            "source": source_report,
+            "destination": destination_report,
+            "active_files_rewritten": rewritten,
+            "path_maps": [{"from": source, "to": destination} for source, destination in mappings],
+            "external_state_imported": bool(external_swaps),
+            "external_top_level_entries": [target.name for target, _ in external_swaps],
+            "external_approved": sorted(approved_external),
+            "accounting": accounting,
+            "active_paths_reviewed": False,
+            "gateway_enabled": False,
+        }
+        manifest.parent.mkdir(parents=True, exist_ok=True)
+        tmp_manifest = manifest.with_name(f"{manifest.name}.tmp.{os.getpid()}")
+        tmp_manifest.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n")
+        tmp_manifest.chmod(0o600)
+        tmp_manifest.replace(manifest)
+        if previous.exists():
+            shutil.rmtree(previous)
+        shutil.rmtree(external_previous)
+        return result
+    except Exception:
+        for target, old in reversed(external_swaps):
+            if target.is_dir() and not target.is_symlink():
+                shutil.rmtree(target)
+            elif target.exists() or target.is_symlink():
+                target.unlink()
+            if old is not None and old.exists():
+                old.rename(target)
+        if swapped and home.exists():
+            shutil.rmtree(home)
+        if previous.exists():
+            previous.rename(home)
+        raise
+    finally:
+        if stage.exists():
+            shutil.rmtree(stage)
+        for temporary in (external_stage, external_merge, external_previous):
+            if temporary.exists():
+                shutil.rmtree(temporary)
+
+
+def acknowledge_paths(manifest: Path) -> dict[str, object]:
+    if not manifest.is_file():
+        raise ValueError(f"import manifest not found: {manifest}")
+    data = json.loads(manifest.read_text())
+    data["active_paths_reviewed"] = True
+    data["active_paths_reviewed_at"] = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+    temporary = manifest.with_name(f"{manifest.name}.tmp.{os.getpid()}")
+    temporary.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    temporary.chmod(0o600)
+    temporary.replace(manifest)
+    return data
+
+
+def cutover_check(manifest: Path, home: Path) -> dict[str, object]:
+    if not manifest.is_file():
+        raise ValueError(f"import manifest not found: {manifest}")
+    data = json.loads(manifest.read_text())
+    source = data.get("source", {})
+    destination = data.get("destination", {})
+    accounting = data.get("accounting", {})
+    current = inspect_home(home)
+    gates = {
+        "database_integrity": bool(current.get("databases"))
+        and all(item.get("integrity") == "ok" for item in current.get("databases", [])),
+        "database_baseline_match": source.get("databases") == destination.get("databases"),
+        "inventory_baseline_match": source.get("inventory") == destination.get("inventory"),
+        "current_database_matches_source": current.get("databases") == source.get("databases"),
+        "current_database_matches_import": current.get("databases") == destination.get("databases"),
+        "current_inventory_matches_source": current.get("inventory") == source.get("inventory"),
+        "current_inventory_matches_import": current.get("inventory") == destination.get("inventory"),
+        "discord_configured": current.get("discord_configured") is True,
+        "active_paths_reviewed": data.get("active_paths_reviewed") is True,
+        "archive_accounted": accounting.get("archive_files")
+        == accounting.get("hermes_files", 0)
+        + accounting.get("external_files", 0)
+        + accounting.get("skipped_files", 0),
+    }
+    result = {"ready": all(gates.values()), "gates": gates, "current": current}
+    if not result["ready"]:
+        failed = ", ".join(name for name, passed in gates.items() if not passed)
+        raise ValueError(f"cutover gates failed: {failed}")
+    return result
+
+
+def _mapping(value: str) -> tuple[str, str]:
+    source, separator, destination = value.partition("=")
+    if not separator or not source or not destination:
+        raise argparse.ArgumentTypeError("path maps must be OLD=NEW")
+    return source, destination
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser()
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    validate = subparsers.add_parser("validate-zip")
+    validate.add_argument("archive", type=Path)
+    verify = subparsers.add_parser("verify")
+    verify.add_argument("--home", type=Path, default=Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")))
+    verify.add_argument("--checkpoint", action="store_true")
+    importer = subparsers.add_parser("import-zip")
+    importer.add_argument("archive", type=Path)
+    importer.add_argument("--home", type=Path, default=Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")))
+    importer.add_argument("--manifest", type=Path, default=Path.home() / ".config/hermes-box/import-manifest.json")
+    importer.add_argument("--map", action="append", type=_mapping, default=[])
+    importer.add_argument("--external", action="append", default=[])
+    acknowledge = subparsers.add_parser("acknowledge-paths")
+    acknowledge.add_argument("--manifest", type=Path, default=Path.home() / ".config/hermes-box/import-manifest.json")
+    cutover = subparsers.add_parser("cutover-check")
+    cutover.add_argument("--manifest", type=Path, default=Path.home() / ".config/hermes-box/import-manifest.json")
+    cutover.add_argument("--home", type=Path, default=Path(os.environ.get("HERMES_HOME", Path.home() / ".hermes")))
+    args = parser.parse_args()
+    if args.command == "validate-zip":
+        result = validate_zip(args.archive)
+    elif args.command == "verify":
+        result = inspect_home(args.home, args.checkpoint)
+    elif args.command == "import-zip":
+        result = import_zip(args.archive, args.home, args.map, args.manifest, set(args.external))
+    elif args.command == "acknowledge-paths":
+        result = acknowledge_paths(args.manifest)
+    else:
+        result = cutover_check(args.manifest, args.home)
+    print(json.dumps(result, indent=2, sort_keys=True))
+
+
+if __name__ == "__main__":
+    main()

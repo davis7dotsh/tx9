@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# hb — in-box control for durable layout, Executor, diagnostics, and MCP wiring.
+# hb — in-box control for durable layout, Hermes, Executor, and diagnostics.
 set -uo pipefail
 # shellcheck disable=SC1091
 [ -f /etc/profile.d/hermes-box.sh ] && . /etc/profile.d/hermes-box.sh
@@ -7,21 +7,40 @@ set -uo pipefail
 DATA="${HB_DATA:-/data}"
 AGENT_HOME="$DATA/home/agent"
 LOGS="$DATA/logs"
-PAUSE_FILE=/tmp/hermes-box-executor-paused
+STATE_DIR="$AGENT_HOME/.config/hermes-box"
+QUIESCE_FILE="$STATE_DIR/quiesced"
+LEGACY_QUIESCE_FILE="${HB_LEGACY_QUIESCE_FILE:-/tmp/hermes-box-executor-paused}"
+GATEWAY_DISABLED="$STATE_DIR/gateway-disabled"
+GATEWAY_POLICY="$STATE_DIR/gateway-policy-initialized"
+GATEWAY_PID="$STATE_DIR/gateway.pid"
 WIRE_VERSION=http-v1
 WIRED="$AGENT_HOME/.hermes-box-wired"
 TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
 TOKEN_ENV="$AGENT_HOME/.config/hermes-box/executor-mcp.env"
 
 init() {
-  mkdir -p "$AGENT_HOME"/{.claude,.codex,.hermes,workspace,.config/hermes-box,.local/share,.local/state} "$LOGS"
-  id agent >/dev/null 2>&1 && chown -R agent:agent "$AGENT_HOME" "$LOGS" 2>/dev/null || true
+  local managed=(
+    "$AGENT_HOME" "$AGENT_HOME/.claude" "$AGENT_HOME/.codex" "$AGENT_HOME/.hermes"
+    "$AGENT_HOME/workspace" "$AGENT_HOME/.config" "$AGENT_HOME/.config/hermes-box"
+    "$AGENT_HOME/.local" "$AGENT_HOME/.local/share" "$AGENT_HOME/.local/state" "$LOGS"
+  )
+  mkdir -p "${managed[@]}"
+  id agent >/dev/null 2>&1 && chown agent:agent "${managed[@]}" 2>/dev/null || true
+  if [[ -e "$LEGACY_QUIESCE_FILE" ]]; then
+    touch "$QUIESCE_FILE" || return 1
+    rm -f "$LEGACY_QUIESCE_FILE" || return 1
+  fi
+  if [[ ! -e "$GATEWAY_POLICY" ]]; then
+    touch "$GATEWAY_DISABLED" "$GATEWAY_POLICY"
+  fi
 }
 
 _port_open() {
   (exec 3<>"/dev/tcp/127.0.0.1/${EXECUTOR_PORT:-4788}") 2>/dev/null && { exec 3>&-; return 0; }
   return 1
 }
+
+_port_closed() { ! _port_open; }
 
 _wait_port() {
   local expected="$1" attempt
@@ -33,9 +52,8 @@ _wait_port() {
   return 1
 }
 
-up() {
+_executor_up() {
   init
-  rm -f "$PAUSE_FILE"
   command -v executor >/dev/null 2>&1 || {
     [[ "${INSTALL_EXECUTOR:-0}" == 1 ]] && { echo "executor not installed" >&2; return 1; }
     echo "executor disabled"
@@ -49,6 +67,40 @@ up() {
   echo "executor daemon: ready"
 }
 
+_gateway_running() {
+  pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' >/dev/null 2>&1
+}
+
+_start_gateway() {
+  [[ "${INSTALL_HERMES:-0}" == 1 ]] || return 0
+  [[ ! -e "$QUIESCE_FILE" && ! -e "$GATEWAY_DISABLED" ]] || return 0
+  command -v hermes >/dev/null 2>&1 || { echo "hermes not installed" >&2; return 1; }
+  if _gateway_running; then
+    local count
+    count="$(pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' | wc -l | tr -d ' ')"
+    [[ "$count" == 1 ]] || { echo "multiple Hermes gateway processes detected" >&2; return 1; }
+    pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' | head -1 >"$GATEWAY_PID"
+    return 0
+  fi
+  rm -f "$GATEWAY_PID"
+  nohup hermes gateway run --replace >>"$LOGS/hermes-gateway.log" 2>&1 &
+  printf '%s\n' "$!" >"$GATEWAY_PID"
+}
+
+up() {
+  init
+  rm -f "$QUIESCE_FILE"
+  _executor_up || return 1
+  _start_gateway
+}
+
+reconcile() {
+  init
+  [[ ! -e "$QUIESCE_FILE" ]] || return 0
+  _executor_up || return 1
+  _start_gateway
+}
+
 _stop_executor() {
   command -v executor >/dev/null 2>&1 && executor daemon stop >/dev/null 2>&1 || true
   pkill -f "executor daemon run" 2>/dev/null || true
@@ -56,19 +108,77 @@ _stop_executor() {
   _wait_port closed || { echo "executor failed to stop" >&2; return 1; }
 }
 
+_stop_gateway() {
+  local attempt
+  pkill -TERM -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true
+  for ((attempt = 0; attempt < 30; attempt++)); do
+    _gateway_running || break
+    sleep 1
+  done
+  pkill -KILL -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true
+  rm -f "$GATEWAY_PID"
+  _gateway_running && { echo "Hermes gateway failed to stop" >&2; return 1; }
+}
+
 pause() {
-  touch "$PAUSE_FILE"
-  _stop_executor
-  echo "executor daemon: paused"
+  local failed=0
+  init
+  touch "$QUIESCE_FILE"
+  _stop_gateway || failed=1
+  _stop_executor || failed=1
+  if command -v hermes-state >/dev/null 2>&1; then
+    hermes-state verify --checkpoint >/dev/null || failed=1
+  fi
+  [[ "$failed" == 0 ]] || return 1
+  echo "Hermes gateway and Executor: quiesced"
 }
 
 resume() {
-  rm -f "$PAUSE_FILE"
+  rm -f "$QUIESCE_FILE"
   up
 }
 
 down() { pause; }
-is_paused() { [[ -e "$PAUSE_FILE" ]]; }
+is_paused() { [[ -e "$QUIESCE_FILE" ]]; }
+gateway_is_disabled() { [[ -e "$GATEWAY_DISABLED" ]]; }
+
+gateway_enable() {
+  local flag="${1:-}" phrase="${2:-}"
+  init
+  [[ "$flag" == --confirm-single-writer && "$phrase" == I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY ]] || {
+    echo "refusing gateway start without: --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY" >&2
+    return 1
+  }
+  [[ ! -e "$QUIESCE_FILE" ]] || { echo "box is quiesced; resume it before requesting gateway startup" >&2; return 1; }
+  if [[ -r "$STATE_DIR/import-manifest.json" ]]; then cutover_ready || return 1; fi
+  rm -f "$GATEWAY_DISABLED"
+  if ! _start_gateway; then
+    touch "$GATEWAY_DISABLED"
+    return 1
+  fi
+  echo "Hermes gateway startup requested; run 'hb doctor' and require deep health before declaring cutover complete"
+}
+
+gateway_disable() {
+  init
+  touch "$GATEWAY_DISABLED"
+  _stop_gateway || return 1
+  echo "Hermes gateway: disabled"
+}
+
+verify_state() { hermes-state verify "$@"; }
+
+acknowledge_active_paths() {
+  hermes-state acknowledge-paths >/dev/null || return 1
+  echo "active import paths acknowledged"
+}
+
+cutover_ready() {
+  [[ -e "$GATEWAY_DISABLED" ]] || { echo "gateway must be disabled before cutover" >&2; return 1; }
+  ! _gateway_running || { echo "gateway is still running" >&2; return 1; }
+  hermes-state cutover-check
+  echo "cutover-ready: import report, DB and inventory baselines, Discord config, active paths, disabled marker, and single-writer process gates passed"
+}
 
 web() {
   command -v executor >/dev/null 2>&1 || { echo "executor not installed" >&2; return 1; }
@@ -99,6 +209,10 @@ _unwire_legacy() {
 }
 
 wire_mcp() {
+  [[ ! -e "$QUIESCE_FILE" ]] || {
+    echo "box is quiesced; run 'hb resume' explicitly before changing MCP wiring" >&2
+    return 1
+  }
   if [[ "${WIRE_EXECUTOR_MCP:-0}" != 1 ]]; then
     echo "executor MCP wiring disabled"
     _unwire_legacy
@@ -161,9 +275,23 @@ write_manifest() {
 }
 
 status() {
+  local gateway_status
+  if [[ -e "$GATEWAY_DISABLED" ]]; then
+    gateway_status=disabled
+  elif _gateway_running; then
+    gateway_status=running
+  else
+    gateway_status=stopped
+  fi
   printf 'executor: %s\n' "$(_port_open && echo running || echo stopped)"
-  printf 'paused:   %s\n' "$([[ -e "$PAUSE_FILE" ]] && echo yes || echo no)"
+  printf 'quiesced: %s\n' "$([[ -e "$QUIESCE_FILE" ]] && echo yes || echo no)"
   printf 'hermes:   %s\n' "$(command -v hermes >/dev/null 2>&1 && echo installed || echo 'not installed')"
+  printf 'gateway:  %s\n' "$gateway_status"
+  if [[ -r "$HERMES_HOME/gateway_state.json" ]]; then
+    printf 'platform: %s\n' "$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("gateway_state", "unknown"))' "$HERMES_HOME/gateway_state.json" 2>/dev/null || echo invalid)"
+  else
+    printf 'platform: no runtime state\n'
+  fi
   printf 'mcp:      %s\n' "$([[ -f "$WIRED" ]] && cat "$WIRED" || echo unwired)"
   printf 'data:     %s\n' "$(du -sh "$DATA" 2>/dev/null | cut -f1)"
 }
@@ -185,6 +313,7 @@ _check() {
 }
 
 _command_exists() { command -v "$1" >/dev/null 2>&1; }
+_hermes_state_valid() { hermes-state verify >/dev/null; }
 
 _claude_http_config() {
   (cd "$AGENT_HOME/workspace" && claude mcp get executor 2>/dev/null) | grep -q "http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp"
@@ -258,31 +387,57 @@ doctor() {
     _check "$cmd installed" _command_exists "$cmd" || failed=1
   done
   if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then _check "hermes installed" _command_exists hermes || failed=1; fi
+  if [[ "${INSTALL_HERMES:-0}" == 1 && ! -e "$GATEWAY_DISABLED" && ! -e "$QUIESCE_FILE" ]]; then
+    _check "Hermes gateway process" _gateway_running || failed=1
+    _check "Hermes gateway deep status" hermes gateway status --deep || failed=1
+  else
+    printf 'ok   Hermes gateway intentionally disabled or quiesced\n'
+  fi
   if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then
     _check "executor installed" _command_exists executor || failed=1
-    _check "executor listening" _port_open || failed=1
-    _check "executor MCP bearer accepted" _mcp_auth_works || failed=1
+    if [[ -e "$QUIESCE_FILE" ]]; then
+      _check "Executor target port closed while quiesced" _port_closed || failed=1
+    else
+      _check "executor listening" _port_open || failed=1
+      _check "executor MCP bearer accepted" _mcp_auth_works || failed=1
+    fi
   fi
   _check "durable home writable" test -w "$AGENT_HOME" || failed=1
   _check "managed profile present" test -r /etc/profile.d/hermes-box.sh || failed=1
+  if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then
+    _check "Hermes state integrity" _hermes_state_valid || failed=1
+  else
+    printf 'ok   Hermes state check skipped (INSTALL_HERMES != 1)\n'
+  fi
   if [[ "${WIRE_EXECUTOR_MCP:-0}" == 1 ]]; then
     _check "MCP wiring version" test "$(cat "$WIRED" 2>/dev/null)" = "$WIRE_VERSION" || failed=1
     _check "MCP token environment" test -r "$TOKEN_ENV" || failed=1
     _check "Claude HTTP MCP config" _claude_http_config || failed=1
-    _check "Codex HTTP MCP config" grep -q 'url = "http://127.0.0.1:4788/mcp"' "$CODEX_HOME/config.toml" || failed=1
+    _check "Codex HTTP MCP config" grep -q "url = \"http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp\"" "$CODEX_HOME/config.toml" || failed=1
   fi
   [[ "$failed" == 0 ]]
 }
 
-logs() { tail -n 200 -F "$LOGS/${1:-executor}.log"; }
+logs() {
+  local name="${1:-executor}"
+  [[ "$name" == hermes || "$name" == gateway ]] && name=hermes-gateway
+  tail -n 200 -F "$LOGS/${name}.log"
+}
 
 main() {
   case "${1:-status}" in
     init) init ;;
     up) up ;;
+    reconcile) reconcile ;;
     down | pause) pause ;;
     resume) resume ;;
     is-paused) is_paused ;;
+    gateway-is-disabled) gateway_is_disabled ;;
+    gateway-enable) shift; gateway_enable "$@" ;;
+    gateway-disable) gateway_disable ;;
+    verify-state) shift; verify_state "$@" ;;
+    acknowledge-active-paths) acknowledge_active_paths ;;
+    cutover-ready) cutover_ready ;;
     web) shift; web "$@" ;;
     executor-token) executor_token ;;
     wire-mcp) wire_mcp ;;
@@ -292,7 +447,7 @@ main() {
     status) status ;;
     versions) versions ;;
     logs) shift; logs "${1:-executor}" ;;
-    *) echo "usage: hb {init|up|down|pause|resume|web|wire-mcp|doctor|status|versions|logs}"; return 1 ;;
+    *) echo "usage: hb {init|up|reconcile|down|pause|resume|gateway-enable|gateway-disable|verify-state|acknowledge-active-paths|cutover-ready|web|wire-mcp|doctor|status|versions|logs}"; return 1 ;;
   esac
 }
 
