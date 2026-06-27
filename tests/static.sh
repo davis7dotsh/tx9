@@ -59,9 +59,11 @@ destructive_checkout = source.index('rm -rf "$install_dir"')
 if checksum >= destructive_checkout:
     raise SystemExit("Hermes checkout is modified before installer verification")
 installer = source.index('if bash "$installer"')
+user_args = source.index('"${args[@]}"', installer)
+pinned_dir = source.index('--dir "$install_dir"', user_args)
 head_check = source.index('git -C "$install_dir" rev-parse HEAD', installer)
 origin_reset = source.index('git -C "$install_dir" remote set-url origin', head_check)
-if not installer < head_check < origin_reset:
+if not installer < user_args < pinned_dir < head_check < origin_reset:
     raise SystemExit("bundle origin is reset before installer and exact-HEAD verification")
 
 box = Path("box").read_text()
@@ -78,6 +80,7 @@ if grep -q 'curl .*install.sh.*|.*bash' provision/provision.sh; then
   echo "unverified Hermes installer execution remains" >&2
   exit 1
 fi
+grep -q 'HERMES_INSTALL_ARGS cannot override protected installer option' provision/provision.sh
 if grep -q 'git -C "$install_dir" fetch origin main' provision/provision.sh; then
   echo "bundle provisioning still fetches the public origin" >&2
   exit 1
@@ -112,6 +115,13 @@ grep -q '\[ ! -e "$GATEWAY_DISABLED" \]' guest/hb-workload
 grep -q '\[ "$reconciled" = 1 \]' guest/hb-workload
 grep -q '_refresh_targets' guest/hb-workload
 grep -q '\. "$BOX_ENV"' guest/hb-workload
+grep -q '_stop_executor_bridge' guest/hb-workload
+grep -q 'EXECUTOR_PORT:-4788.*mcp' guest/hb
+grep -q 'guest_tmp="/data/home/agent/.config/hermes-box/import-' box
+if grep -q 'guest_tmp="/root/hermes-import-' box; then
+  echo "Hermes import remains unreadable to the agent" >&2
+  exit 1
+fi
 grep -qi 'networking is always enabled' README.md
 grep -q 'intentionally no CI configuration yet' README.md
 

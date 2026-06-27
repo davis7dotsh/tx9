@@ -751,9 +751,12 @@ cmd_import_hermes() {
   _guest_hb "$n" is-paused >/dev/null 2>&1 && already_paused=1
   _guest_hb "$n" gateway-disable >/dev/null
   _pause_box "$n"
-  guest_tmp="/root/hermes-import-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}.zip"
+  guest_tmp="/data/home/agent/.config/hermes-box/import-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}.zip"
   _track_guest_temp "$n" "$guest_tmp"
+  smolvm machine exec --name "$n" -- \
+    install -d -o agent -g agent -m 0700 /data/home/agent/.config/hermes-box
   smolvm machine cp "$file" "$n:$guest_tmp"
+  smolvm machine exec --name "$n" -- chown agent:agent "$guest_tmp"
   smolvm machine exec --name "$n" -- chmod 0600 "$guest_tmp"
   local import_args=(import-zip "$guest_tmp")
   for external in "${externals[@]}"; do

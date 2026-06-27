@@ -98,8 +98,17 @@ install_hermes() {
       log "Hermes Git bundle is incomplete or invalid"; return 1;
     }
   fi
-  local args=()
+  local arg args=()
   read -r -a args <<<"${HERMES_INSTALL_ARGS:-}"
+  for arg in "${args[@]}"; do
+    case "$arg" in
+      --dir | --dir=* | --hermes-home | --hermes-home=* | --commit | --commit=* | \
+      --skip-setup | --skip-setup=* | --non-interactive | --non-interactive=*)
+        log "HERMES_INSTALL_ARGS cannot override protected installer option: $arg"
+        return 1
+        ;;
+    esac
+  done
   installer="$(mktemp)"
   if ! curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o "$installer"; then
     rm -f "$installer"
@@ -121,8 +130,8 @@ install_hermes() {
       return 1
     fi
   fi
-  if bash "$installer" --dir "$install_dir" --hermes-home "$HERMES_HOME" \
-       --commit "$sha" --skip-setup --non-interactive "${args[@]}"; then
+  if bash "$installer" "${args[@]}" --dir "$install_dir" --hermes-home "$HERMES_HOME" \
+       --commit "$sha" --skip-setup --non-interactive; then
     rm -f "$installer"
     [[ "$(git -C "$install_dir" rev-parse HEAD)" == "$sha" ]] || {
       log "Hermes checkout verification failed"; return 1;

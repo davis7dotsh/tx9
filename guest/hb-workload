@@ -59,6 +59,7 @@ reconcile_once() {
   local reconciled=0
   _refresh_targets
   if [ -e "$QUIESCE_FILE" ]; then
+    _stop_executor_bridge
     _stop_api_bridge
     return
   fi

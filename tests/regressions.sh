@@ -228,6 +228,12 @@ PY
   touch "$GATEWAY_DISABLED"
   reconcile_once
   [[ "$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")" -gt "$api_stops_before" ]]
+  executor_stops_before="$(grep -c 'stopped.*TCP-LISTEN:4799,' "$tmp/api-bridge.events")"
+  api_stops_before="$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")"
+  touch "$QUIESCE_FILE"
+  reconcile_once
+  [[ "$(grep -c 'stopped.*TCP-LISTEN:4799,' "$tmp/api-bridge.events")" -gt "$executor_stops_before" ]]
+  [[ "$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")" -gt "$api_stops_before" ]]
 )
 
 # Active-path acknowledgement reports success only when persistence succeeds.
@@ -333,6 +339,22 @@ HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" gateway-enable \
   output="$(INSTALL_HERMES=0 INSTALL_EXECUTOR=0 WIRE_EXECUTOR_MCP=0 doctor)"
   grep -q 'Hermes state check skipped' <<<"$output"
   [[ ! -e "$tmp/hermes-state-called" ]]
+)
+
+# Doctor validates Codex MCP wiring against the configured Executor port.
+(
+  HB_DATA="$tmp/doctor-port-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  CODEX_HOME="$AGENT_HOME/.codex"
+  mkdir -p "$CODEX_HOME"
+  printf 'url = "http://127.0.0.1:5999/mcp"\n' >"$CODEX_HOME/config.toml"
+  _check() {
+    local label="$1"
+    shift
+    if [[ "$label" == 'Codex HTTP MCP config' ]]; then "$@"; else return 0; fi
+  }
+  INSTALL_HERMES=0 INSTALL_EXECUTOR=0 WIRE_EXECUTOR_MCP=1 EXECUTOR_PORT=5999 doctor >/dev/null
 )
 
 # Explicit MCP wiring refuses to clear durable quiesce.
@@ -841,6 +863,21 @@ fi
 [[ ! -e "$tmp/import-state/import-probe/gateway-restarted" ]]
 grep -q 'hb gateway-disable' "$tmp/import-fail.calls"
 grep -q 'hb resume' "$tmp/import-fail.calls"
+grep -q '/data/home/agent/.config/hermes-box/import-' "$tmp/import-fail.calls"
+if grep -q '/root/hermes-import-' "$tmp/import-fail.calls"; then
+  echo "Hermes import still stages beneath root-only storage" >&2
+  exit 1
+fi
+import_dir_line="$(grep -n 'install -d -o agent -g agent -m 0700 /data/home/agent/.config/hermes-box' "$tmp/import-fail.calls" | head -1 | cut -d: -f1)"
+import_cp_line="$(grep -n 'machine cp.*\.config/hermes-box/import-' "$tmp/import-fail.calls" | head -1 | cut -d: -f1)"
+import_chown_line="$(grep -n 'chown agent:agent /data/home/agent/.config/hermes-box/import-' "$tmp/import-fail.calls" | head -1 | cut -d: -f1)"
+import_chmod_line="$(grep -n 'chmod 0600 /data/home/agent/.config/hermes-box/import-' "$tmp/import-fail.calls" | head -1 | cut -d: -f1)"
+import_setpriv_line="$(grep -n 'setpriv.*hermes-state.*import-zip.*/data/home/agent/.config/hermes-box/import-' "$tmp/import-fail.calls" | head -1 | cut -d: -f1)"
+[[ -n "$import_dir_line" && -n "$import_cp_line" && -n "$import_chown_line" && -n "$import_chmod_line" && -n "$import_setpriv_line" ]]
+[[ "$import_dir_line" -lt "$import_cp_line" && "$import_cp_line" -lt "$import_chown_line" && "$import_chown_line" -lt "$import_chmod_line" && "$import_chmod_line" -lt "$import_setpriv_line" ]]
+import_remove_line="$(grep -n 'rm -f -- /data/home/agent/.config/hermes-box/import-' "$tmp/import-fail.calls" | head -1 | cut -d: -f1)"
+import_resume_line="$(grep -n 'hb resume' "$tmp/import-fail.calls" | head -1 | cut -d: -f1)"
+[[ -n "$import_remove_line" && -n "$import_resume_line" && "$import_remove_line" -lt "$import_resume_line" ]]
 
 rm -f "$tmp/import-state/import-probe/paused"
 if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/import-signal.calls" \
@@ -853,6 +890,9 @@ fi
 [[ -e "$tmp/import-state/import-probe/gateway-disabled" ]]
 [[ ! -e "$tmp/import-state/import-probe/gateway-restarted" ]]
 grep -q 'hb resume' "$tmp/import-signal.calls"
+signal_remove_line="$(grep -n 'rm -f -- /data/home/agent/.config/hermes-box/import-' "$tmp/import-signal.calls" | head -1 | cut -d: -f1)"
+signal_resume_line="$(grep -n 'hb resume' "$tmp/import-signal.calls" | head -1 | cut -d: -f1)"
+[[ -n "$signal_remove_line" && -n "$signal_resume_line" && "$signal_remove_line" -lt "$signal_resume_line" ]]
 
 # Import temporarily starts a stopped target, preserves its unpaused policy,
 # keeps the gateway disabled, and returns it to stopped on success or failure.
