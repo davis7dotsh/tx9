@@ -58,6 +58,21 @@ checksum = source.index('sha256sum --check --status')
 destructive_checkout = source.index('rm -rf "$install_dir"')
 if checksum >= destructive_checkout:
     raise SystemExit("Hermes checkout is modified before installer verification")
+installer = source.index('if bash "$installer"')
+head_check = source.index('git -C "$install_dir" rev-parse HEAD', installer)
+origin_reset = source.index('git -C "$install_dir" remote set-url origin', head_check)
+if not installer < head_check < origin_reset:
+    raise SystemExit("bundle origin is reset before installer and exact-HEAD verification")
+
+box = Path("box").read_text()
+stage_root = box.index('chown root:root "$stage" "$stage/home"')
+stage_traverse = box.index('chmod 0711 "$stage" "$stage/home"', stage_root)
+nested_owner = box.index('chown -R agent:agent "$stage/home/agent"', stage_traverse)
+staged_verify = box.index('setpriv --reuid=agent', nested_owner)
+if not stage_root < stage_traverse < nested_owner < staged_verify:
+    raise SystemExit("restore ownership boundary is not established before agent verification")
+if 'chown agent:agent "$stage"' in box:
+    raise SystemExit("restore stage root is writable by the agent")
 PY
 if grep -q 'curl .*install.sh.*|.*bash' provision/provision.sh; then
   echo "unverified Hermes installer execution remains" >&2
@@ -95,6 +110,8 @@ grep -q 'TCP:127.0.0.1:$EXECUTOR_TARGET_PORT' guest/hb-workload
 grep -q '_wait_api_ready' guest/hb-workload
 grep -q '\[ ! -e "$GATEWAY_DISABLED" \]' guest/hb-workload
 grep -q '\[ "$reconciled" = 1 \]' guest/hb-workload
+grep -q '_refresh_targets' guest/hb-workload
+grep -q '\. "$BOX_ENV"' guest/hb-workload
 grep -qi 'networking is always enabled' README.md
 grep -q 'intentionally no CI configuration yet' README.md
 

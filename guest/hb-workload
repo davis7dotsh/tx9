@@ -14,6 +14,7 @@ GATEWAY_DISABLED="$HOME/.config/hermes-box/gateway-disabled"
 EXECUTOR_TARGET_PORT="${EXECUTOR_PORT:-4788}"
 HERMES_TARGET_PORT="${HERMES_API_PORT:-8642}"
 LOGS="${HB_WORKLOAD_LOGS:-/data/logs}"
+BOX_ENV="${HB_BOX_ENV:-/etc/hermes-box.env}"
 
 _exec_up() { (exec 3<>"/dev/tcp/127.0.0.1/$EXECUTOR_TARGET_PORT") 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
 _api_up() { (exec 3<>"/dev/tcp/127.0.0.1/$HERMES_TARGET_PORT") 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
@@ -27,12 +28,36 @@ _wait_api_ready() {
   return 1
 }
 
-_stop_api_bridge() {
-  [ "$HERMES_BRIDGE_PORT" = 0 ] || pkill -f "socat TCP-LISTEN:$HERMES_BRIDGE_PORT," 2>/dev/null || true
+_stop_bridge() {
+  local listener="$1" _
+  pkill -TERM -f "socat TCP-LISTEN:$listener," 2>/dev/null || true
+  for _ in 1 2 3 4 5; do
+    ! pgrep -f "socat TCP-LISTEN:$listener," >/dev/null 2>&1 && return 0
+    sleep 0.1
+  done
+  pkill -KILL -f "socat TCP-LISTEN:$listener," 2>/dev/null || true
+}
+
+_stop_api_bridge() { [ "$HERMES_BRIDGE_PORT" = 0 ] || _stop_bridge "$HERMES_BRIDGE_PORT"; }
+
+_stop_executor_bridge() { [ "$PORT" = 4788 ] || _stop_bridge "$PORT"; }
+
+_refresh_targets() {
+  local previous_executor="$EXECUTOR_TARGET_PORT" previous_api="$HERMES_TARGET_PORT"
+  EXECUTOR_PORT=4788
+  HERMES_API_PORT=8642
+  # Managed root-owned repair output; refresh it because this workload outlives repair.
+  # shellcheck disable=SC1090
+  [ ! -r "$BOX_ENV" ] || . "$BOX_ENV"
+  EXECUTOR_TARGET_PORT="${EXECUTOR_PORT:-4788}"
+  HERMES_TARGET_PORT="${HERMES_API_PORT:-8642}"
+  if [ "$previous_executor" != "$EXECUTOR_TARGET_PORT" ]; then _stop_executor_bridge; fi
+  if [ "$previous_api" != "$HERMES_TARGET_PORT" ]; then _stop_api_bridge; fi
 }
 
 reconcile_once() {
   local reconciled=0
+  _refresh_targets
   if [ -e "$QUIESCE_FILE" ]; then
     _stop_api_bridge
     return

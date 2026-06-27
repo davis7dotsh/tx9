@@ -649,12 +649,23 @@ cmd_load() {
        mkdir -m 0700 "$stage" "$rollback"
        tar xzf "$archive" --no-same-owner -C "$stage"
        test -d "$stage/home/agent"
+       chown root:root "$stage" "$stage/home"
+       chmod 0711 "$stage" "$stage/home"
        chown -R agent:agent "$stage/home/agent" "$stage/logs" 2>/dev/null || true
+       test "$(stat -c %u "$stage")" = 0
+       test "$(stat -c %u "$stage/home")" = 0
+       test "$(stat -c %a "$stage")" = 711
+       test "$(stat -c %a "$stage/home")" = 711
        mkdir -p "$stage/home/agent/.config/hermes-box"
        touch "$stage/home/agent/.config/hermes-box/quiesced" \
          "$stage/home/agent/.config/hermes-box/gateway-disabled" \
          "$stage/home/agent/.config/hermes-box/gateway-policy-initialized"
        chown -R agent:agent "$stage/home/agent/.config/hermes-box"
+       setpriv --reuid=agent --regid=agent --init-groups test -x "$stage"
+       setpriv --reuid=agent --regid=agent --init-groups test ! -w "$stage"
+       setpriv --reuid=agent --regid=agent --init-groups test -x "$stage/home"
+       setpriv --reuid=agent --regid=agent --init-groups test ! -w "$stage/home"
+       setpriv --reuid=agent --regid=agent --init-groups test -w "$stage/home/agent"
        setpriv --reuid=agent --regid=agent --init-groups env HOME=/data/home/agent \
          /opt/hermes-box/bin/hermes-state verify --home "$stage/home/agent/.hermes" >/dev/null
        shopt -s dotglob nullglob

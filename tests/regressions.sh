@@ -161,6 +161,30 @@ chmod 0400 "$hermes_fixture/sessions/deep/history.json" "$hermes_fixture/cron/jo
 [[ -w "$hermes_fixture/cron/jobs.json" ]]
 [[ -w "$hermes_fixture/sessions/deep" ]]
 
+# Restore staging grants non-owners traversal but not top-level mutation; only
+# the nested agent home models owner-writable imported state.
+permission_stage="$tmp/restore-permission-model"
+mkdir -p "$permission_stage/home/agent"
+chmod 0711 "$permission_stage" "$permission_stage/home"
+chmod 0700 "$permission_stage/home/agent"
+python3 - "$permission_stage" <<'PY'
+import os
+import stat
+import sys
+from pathlib import Path
+
+stage = Path(sys.argv[1])
+home = stage / "home"
+agent = home / "agent"
+for envelope in (stage, home):
+    mode = stat.S_IMODE(envelope.stat().st_mode)
+    assert mode == 0o711
+    assert mode & 0o001
+    assert not mode & 0o002
+assert stat.S_IMODE(agent.stat().st_mode) == 0o700
+assert os.access(agent, os.W_OK)
+PY
+
 # Hermes API forwarding requires a successful reconcile, an enabled gateway,
 # and a listening target API.
 (
@@ -168,31 +192,42 @@ chmod 0400 "$hermes_fixture/sessions/deep/history.json" "$hermes_fixture/cron/jo
   mkdir -p "$HOME/.config/hermes-box" "$tmp/workload-logs"
   # shellcheck disable=SC1090
   source "$PROJECT_ROOT/guest/hb-workload"
-  PORT=4788
+  PORT=4799
   HERMES_BRIDGE_PORT=8650
   LOGS="$tmp/workload-logs"
+  BOX_ENV="$tmp/workload-box.env"
+  printf 'EXECUTOR_PORT=4788\nHERMES_API_PORT=8642\n' >"$BOX_ENV"
   pgrep() { return 1; }
-  pkill() { printf 'stopped\n' >>"$tmp/api-bridge.events"; }
-  socat() { printf 'started\n' >>"$tmp/api-bridge.events"; }
+  pkill() { printf 'stopped %s\n' "$*" >>"$tmp/api-bridge.events"; }
+  socat() { printf 'started %s\n' "$*" >>"$tmp/api-bridge.events"; }
+  _exec_up() { return 0; }
   hb() { return 1; }
   _wait_api_ready() { return 0; }
   reconcile_once
-  if grep -q started "$tmp/api-bridge.events" 2>/dev/null; then
+  if grep -q 'started.*TCP-LISTEN:8650,' "$tmp/api-bridge.events" 2>/dev/null; then
     echo "API bridge started after failed reconcile" >&2; exit 1
   fi
   hb() { return 0; }
   _wait_api_ready() { return 1; }
   reconcile_once
-  if grep -q started "$tmp/api-bridge.events" 2>/dev/null; then
+  if grep -q 'started.*TCP-LISTEN:8650,' "$tmp/api-bridge.events" 2>/dev/null; then
     echo "API bridge started before its target was ready" >&2; exit 1
   fi
   _wait_api_ready() { return 0; }
   reconcile_once
   wait
   grep -q started "$tmp/api-bridge.events"
+  printf 'EXECUTOR_PORT=4990\nHERMES_API_PORT=8990\n' >"$BOX_ENV"
+  reconcile_once
+  wait
+  grep -q 'stopped.*TCP-LISTEN:4799,' "$tmp/api-bridge.events"
+  grep -q 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events"
+  grep -q 'started.*TCP:127.0.0.1:4990' "$tmp/api-bridge.events"
+  grep -q 'started.*TCP:127.0.0.1:8990' "$tmp/api-bridge.events"
+  api_stops_before="$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")"
   touch "$GATEWAY_DISABLED"
   reconcile_once
-  [[ "$(tail -1 "$tmp/api-bridge.events")" == stopped ]]
+  [[ "$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")" -gt "$api_stops_before" ]]
 )
 
 # Active-path acknowledgement reports success only when persistence succeeds.

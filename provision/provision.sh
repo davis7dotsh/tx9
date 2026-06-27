@@ -127,6 +127,10 @@ install_hermes() {
     [[ "$(git -C "$install_dir" rev-parse HEAD)" == "$sha" ]] || {
       log "Hermes checkout verification failed"; return 1;
     }
+    if [[ -n "$bundle" ]]; then
+      git -C "$install_dir" remote set-url origin \
+        "${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
+    fi
     own_hermes_home
     log "hermes installed -> $(command -v hermes || echo '/usr/local/bin/hermes')"
   else

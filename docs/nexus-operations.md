@@ -22,12 +22,19 @@ Install this checkout at `/opt/tx9`, owned by `tx9`, and run `make check`
 before using it. Do not copy Eventide's macOS virtual environments,
 `node_modules`, caches, launchd files, or ARM64 binaries.
 
-For Eventide's custom runtime, create a complete Git bundle outside this repo,
-copy it locally to ignored `artifacts/hermes-eventide.bundle`, and set both:
+For Eventide's custom runtime, create a complete Git bundle outside this repo
+and copy it locally to ignored `artifacts/hermes-eventide.bundle`. Then edit the
+installed tx9 checkout itself; transient shell variables are overwritten by
+`box.env` and are not reliably carried through `sudo`:
 
 ```bash
-HERMES_GIT_SHA="b9e586ec7534fad49d6599a742830a0024cc0906"
-HERMES_GIT_BUNDLE="artifacts/hermes-eventide.bundle"
+cd /opt/tx9
+sudoedit box.env
+# Set these exact keys in /opt/tx9/box.env:
+# HERMES_GIT_SHA="b9e586ec7534fad49d6599a742830a0024cc0906"
+# HERMES_GIT_BUNDLE="artifacts/hermes-eventide.bundle"
+grep -E '^(HERMES_GIT_SHA|HERMES_GIT_BUNDLE)=' box.env
+sudo -u tx9 ./box new hermes
 ```
 
 The host and guest validate the bundle, the official installer rebuilds the
@@ -82,6 +89,7 @@ documented durable path, then update active config references explicitly.
 On Nexus:
 
 ```bash
+# Skip this line if the custom-runtime steps above already created the box.
 sudo -u tx9 /opt/tx9/box new hermes
 sudo -u tx9 python3 /opt/tx9/guest/hermes-state validate-zip \
   /var/lib/tx9/hermes-backup.zip | jq '.external_top_level_entries'
