@@ -375,26 +375,113 @@ import sys
 import tarfile
 from pathlib import PurePosixPath
 
+def safe_text(value, label):
+    if "\x00" in value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{label} contains control characters")
+
+def link_parts(value):
+    safe_text(value, "archive link target")
+    path = PurePosixPath(value)
+    if path.is_absolute():
+        raise ValueError("archive link target is absolute")
+    return [part for part in path.parts if part not in {"", "."}]
+
+def validate_link_target(member, key):
+    parts = link_parts(member.linkname)
+    if not parts:
+        raise ValueError("archive link target is empty")
+    resolved = key.split("/")[:-1] if member.issym() else []
+    for part in parts:
+        if part == "..":
+            if not resolved:
+                raise ValueError("archive link target lexically escapes extraction root")
+            resolved.pop()
+        else:
+            resolved.append(part)
+
 try:
     with tarfile.open(sys.argv[1], "r:gz") as archive:
         members = archive.getmembers()
         if not members:
             raise ValueError("archive is empty")
-        durable_home = False
+        by_name = {}
         for member in members:
             name = member.name
-            if any(ord(char) < 32 or ord(char) == 127 for char in name):
-                raise ValueError("archive path contains control characters")
+            safe_text(name, "archive path")
             path = PurePosixPath(name)
             if path.is_absolute() or any(part == ".." for part in path.parts):
                 raise ValueError("archive path escapes its extraction root")
             parts = tuple(part for part in path.parts if part not in {"", "."})
-            if parts[:2] == ("home", "agent"):
-                durable_home = True
-            if not (member.isfile() or member.isdir()):
-                raise ValueError("archive contains links or special files")
-        if not durable_home:
-            raise ValueError("archive does not contain home/agent")
+            key = "/".join(parts)
+            if key in by_name:
+                raise ValueError(f"archive contains duplicate path: {key or '.'}")
+            if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+                raise ValueError("archive contains a device, FIFO, socket, or unknown special file")
+            if not key and not member.isdir():
+                raise ValueError("archive root member must be a real directory")
+            if member.issym() or member.islnk():
+                validate_link_target(member, key)
+            by_name[key] = member
+
+        for key in by_name:
+            parts = key.split("/") if key else []
+            for length in range(1, len(parts)):
+                parent = by_name.get("/".join(parts[:length]))
+                if parent is not None and (parent.issym() or parent.islnk()):
+                    raise ValueError(f"archive member is nested beneath a link: {key}")
+
+        for required in ("home", "home/agent"):
+            entry = by_name.get(required)
+            if entry is None or not entry.isdir() or entry.issym() or entry.islnk():
+                raise ValueError(f"{required} must be a real directory")
+
+        def resolve(key):
+            pending = key.split("/") if key else []
+            resolved = []
+            seen_states = set()
+            steps = 0
+            while pending:
+                steps += 1
+                if steps > len(by_name) * 8 + 32:
+                    raise ValueError("archive link chain exceeds safety bound")
+                state = (tuple(resolved), tuple(pending))
+                if state in seen_states:
+                    raise ValueError("archive link cycle detected")
+                seen_states.add(state)
+                part = pending.pop(0)
+                if part in {"", "."}:
+                    continue
+                if part == "..":
+                    if not resolved:
+                        raise ValueError("archive link target escapes extraction root")
+                    resolved.pop()
+                    continue
+                candidate = "/".join((*resolved, part))
+                entry = by_name.get(candidate)
+                if entry is not None and (entry.issym() or entry.islnk()):
+                    base = candidate.split("/")[:-1] if entry.issym() else []
+                    pending = base + link_parts(entry.linkname) + pending
+                    resolved = []
+                    continue
+                if pending and (entry is None or not entry.isdir()):
+                    raise ValueError(f"archive path resolves through missing or non-directory member: {candidate}")
+                resolved.append(part)
+            final = "/".join(resolved)
+            entry = by_name.get(final)
+            if entry is None:
+                raise ValueError(f"archive link resolves to missing member: {final or '.'}")
+            return entry
+
+        for key, member in by_name.items():
+            if not key:
+                continue
+            parent = key.rpartition("/")[0]
+            if parent and not resolve(parent).isdir():
+                raise ValueError(f"archive member parent is not a directory: {key}")
+            if member.issym() or member.islnk():
+                target = resolve(key)
+                if member.islnk() and not target.isfile():
+                    raise ValueError("archive hardlink does not resolve to a regular file")
 except (OSError, tarfile.TarError, ValueError) as error:
     print(f"unsafe archive: {error}", file=sys.stderr)
     raise SystemExit(1)

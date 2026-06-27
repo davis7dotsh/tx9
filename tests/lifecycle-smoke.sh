@@ -9,10 +9,16 @@ trap cleanup EXIT HUP INT TERM
 mkdir -p "$tmp/valid/home/agent/workspace" "$tmp/invalid/not-home" "$tmp/gnupg" "$tmp/host-tmp"
 chmod 0700 "$tmp/gnupg"
 printf 'portable state\n' >"$tmp/valid/home/agent/workspace/probe.txt"
+ln -s probe.txt "$tmp/valid/home/agent/workspace/probe-link"
+ln "$tmp/valid/home/agent/workspace/probe.txt" "$tmp/valid/home/agent/workspace/probe-hard"
 printf 'invalid state\n' >"$tmp/invalid/not-home/probe.txt"
 tar czf "$tmp/valid.tgz" -C "$tmp/valid" .
 tar czf "$tmp/invalid.tgz" -C "$tmp/invalid" .
-python3 - "$tmp/symlink.tgz" "$tmp/hardlink.tgz" <<'PY'
+python3 - "$tmp/absolute-symlink.tgz" "$tmp/traversal-symlink.tgz" \
+  "$tmp/invalid-hardlink.tgz" "$tmp/special-file.tgz" "$tmp/home-link.tgz" \
+  "$tmp/cycle-link.tgz" "$tmp/pivot-link.tgz" "$tmp/root-symlink.tgz" \
+  "$tmp/root-hardlink.tgz" "$tmp/linked-parent-alias.tgz" \
+  "$tmp/linked-parent-regular.tgz" <<'PY'
 import io
 import sys
 import tarfile
@@ -34,14 +40,103 @@ with tarfile.open(sys.argv[1], "w:gz") as archive:
 with tarfile.open(sys.argv[2], "w:gz") as archive:
     archive.addfile(directory("home"))
     archive.addfile(directory("home/agent"))
-    payload = b"fixture\n"
-    target = tarfile.TarInfo("home/agent/target")
-    target.size = len(payload)
-    archive.addfile(target, io.BytesIO(payload))
+    link = tarfile.TarInfo("home/escape-link")
+    link.type = tarfile.SYMTYPE
+    link.linkname = "../../"
+    archive.addfile(link)
+
+with tarfile.open(sys.argv[3], "w:gz") as archive:
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
     link = tarfile.TarInfo("home/agent/workspace")
     link.type = tarfile.LNKTYPE
-    link.linkname = "home/agent/target"
+    link.linkname = "../../escape"
     archive.addfile(link)
+
+with tarfile.open(sys.argv[4], "w:gz") as archive:
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+    fifo = tarfile.TarInfo("home/agent/runtime.fifo")
+    fifo.type = tarfile.FIFOTYPE
+    archive.addfile(fifo)
+
+with tarfile.open(sys.argv[5], "w:gz") as archive:
+    archive.addfile(directory("home"))
+    link = tarfile.TarInfo("home/agent")
+    link.type = tarfile.SYMTYPE
+    link.linkname = "/"
+    archive.addfile(link)
+
+with tarfile.open(sys.argv[6], "w:gz") as archive:
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+    first = tarfile.TarInfo("home/agent/first")
+    first.type = tarfile.SYMTYPE
+    first.linkname = "second"
+    archive.addfile(first)
+    second = tarfile.TarInfo("home/agent/second")
+    second.type = tarfile.SYMTYPE
+    second.linkname = "first"
+    archive.addfile(second)
+
+with tarfile.open(sys.argv[7], "w:gz") as archive:
+    archive.addfile(directory("."))
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+    victim_data = b"victim\n"
+    victim = tarfile.TarInfo("home/agent/victim")
+    victim.size = len(victim_data)
+    archive.addfile(victim, io.BytesIO(victim_data))
+    up = tarfile.TarInfo("home/agent/up")
+    up.type = tarfile.SYMTYPE
+    up.linkname = "../.."
+    archive.addfile(up)
+    pivot = tarfile.TarInfo("home/agent/x")
+    pivot.type = tarfile.SYMTYPE
+    pivot.linkname = "up/../victim"
+    archive.addfile(pivot)
+
+with tarfile.open(sys.argv[8], "w:gz") as archive:
+    root = tarfile.TarInfo("./")
+    root.type = tarfile.SYMTYPE
+    root.linkname = "home"
+    archive.addfile(root)
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+
+with tarfile.open(sys.argv[9], "w:gz") as archive:
+    root = tarfile.TarInfo(".")
+    root.type = tarfile.LNKTYPE
+    root.linkname = "home/agent"
+    archive.addfile(root)
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+
+with tarfile.open(sys.argv[10], "w:gz") as archive:
+    archive.addfile(directory("."))
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+    up = tarfile.TarInfo("home/agent/up")
+    up.type = tarfile.SYMTYPE
+    up.linkname = "../.."
+    archive.addfile(up)
+    alias = tarfile.TarInfo("home/agent/up/home")
+    alias.type = tarfile.SYMTYPE
+    alias.linkname = "/tmp/linked-parent-escape"
+    archive.addfile(alias)
+
+with tarfile.open(sys.argv[11], "w:gz") as archive:
+    archive.addfile(directory("."))
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+    up = tarfile.TarInfo("home/agent/up")
+    up.type = tarfile.SYMTYPE
+    up.linkname = "../.."
+    archive.addfile(up)
+    payload = b"must not extract through link\n"
+    child = tarfile.TarInfo("home/agent/up/owned")
+    child.size = len(payload)
+    archive.addfile(child, io.BytesIO(payload))
 PY
 
 (
@@ -53,7 +148,11 @@ PY
     echo "archive without durable home passed validation" >&2
     exit 1
   fi
-  for unsafe in "$tmp/symlink.tgz" "$tmp/hardlink.tgz"; do
+  for unsafe in "$tmp/absolute-symlink.tgz" "$tmp/traversal-symlink.tgz" \
+    "$tmp/invalid-hardlink.tgz" "$tmp/special-file.tgz" "$tmp/home-link.tgz" \
+    "$tmp/cycle-link.tgz" "$tmp/pivot-link.tgz" "$tmp/root-symlink.tgz" \
+    "$tmp/root-hardlink.tgz" "$tmp/linked-parent-alias.tgz" \
+    "$tmp/linked-parent-regular.tgz"; do
     if _validate_archive "$unsafe"; then
       echo "linked archive passed validation: $unsafe" >&2
       exit 1
@@ -76,16 +175,27 @@ gpg --batch --yes --pinentry-mode loopback --passphrase "$BOX_PASSPHRASE" \
   --symmetric --cipher-algo AES256 -o "$tmp/valid.tar.gz.gpg" "$tmp/valid.tgz"
 gpg --batch --yes --pinentry-mode loopback --passphrase "$BOX_PASSPHRASE" \
   --symmetric --cipher-algo AES256 -o "$tmp/invalid.tar.gz.gpg" "$tmp/invalid.tgz"
-for unsafe in symlink hardlink; do
+for unsafe in absolute-symlink traversal-symlink invalid-hardlink special-file home-link cycle-link \
+  pivot-link root-symlink root-hardlink linked-parent-alias linked-parent-regular; do
   gpg --batch --yes --pinentry-mode loopback --passphrase "$BOX_PASSPHRASE" \
     --symmetric --cipher-algo AES256 -o "$tmp/${unsafe}.tar.gz.gpg" "$tmp/${unsafe}.tgz"
 done
 
 TMPDIR="$tmp/host-tmp" "$PROJECT_ROOT/box" extract "$tmp/valid.tar.gz.gpg" "$tmp/extracted" >/dev/null
 cmp "$tmp/valid/home/agent/workspace/probe.txt" "$tmp/extracted/home/agent/workspace/probe.txt"
+[[ -L "$tmp/extracted/home/agent/workspace/probe-link" ]]
+[[ "$(readlink "$tmp/extracted/home/agent/workspace/probe-link")" == probe.txt ]]
+cmp "$tmp/extracted/home/agent/workspace/probe-link" "$tmp/extracted/home/agent/workspace/probe.txt"
+python3 - "$tmp/extracted/home/agent/workspace/probe.txt" \
+  "$tmp/extracted/home/agent/workspace/probe-hard" <<'PY'
+import os
+import sys
+assert os.stat(sys.argv[1]).st_ino == os.stat(sys.argv[2]).st_ino
+PY
 [[ -z "$(find "$tmp/host-tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
-for unsafe in symlink hardlink; do
+for unsafe in absolute-symlink traversal-symlink invalid-hardlink special-file home-link cycle-link \
+  pivot-link root-symlink root-hardlink linked-parent-alias linked-parent-regular; do
   unsafe_sentinel="$tmp/${unsafe}-smolvm-called"
   if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$unsafe_sentinel" \
     SMOLVM_STATE_DIR="$tmp/smolvm-state" TMPDIR="$tmp/host-tmp" \
