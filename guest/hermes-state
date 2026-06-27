@@ -9,6 +9,8 @@ import os
 import shutil
 import sqlite3
 import stat
+import struct
+import sys
 import tempfile
 import time
 import zipfile
@@ -32,6 +34,24 @@ MAX_UNCOMPRESSED = 100 * 1024**3
 RESERVED_EXTERNAL = {
     ".ssh", ".config", "workspace", ".bashrc", ".bash_profile", ".profile",
     ".zshrc", ".zprofile", ".zshenv",
+}
+THIN_MACHO_MAGICS = {
+    b"\xfe\xed\xfa\xce": ">",
+    b"\xce\xfa\xed\xfe": "<",
+    b"\xfe\xed\xfa\xcf": ">",
+    b"\xcf\xfa\xed\xfe": "<",
+}
+FAT_MACHO_MAGICS = {
+    b"\xca\xfe\xba\xbe": (">", 20),
+    b"\xbe\xba\xfe\xca": ("<", 20),
+    b"\xca\xfe\xba\xbf": (">", 32),
+    b"\xbf\xba\xfe\xca": ("<", 32),
+}
+MIGRATION_POLICY = {
+    "version": 1,
+    "root_transient_paths": ["tmp/"],
+    "mach_o": "skip files with a thin Mach-O magic or a structurally valid universal Mach-O header",
+    "archive_handling": "read-only; the source ZIP is never rewritten",
 }
 
 
@@ -73,6 +93,15 @@ def _zip_layout(zf: zipfile.ZipFile) -> tuple[str, list[zipfile.ZipInfo]]:
             found.add(relative.name)
     if not found.intersection(MARKERS):
         raise ValueError("archive is not a native Hermes backup (no config, env, or state database)")
+    normalized: set[str] = set()
+    for info in files:
+        relative = _safe_relative(
+            info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
+        )
+        key = str(relative)
+        if key in normalized:
+            raise ValueError(f"duplicate normalized archive path: {key}")
+        normalized.add(key)
     return prefix, files
 
 
@@ -81,6 +110,8 @@ def validate_zip(path: Path) -> dict[str, object]:
         raise ValueError(f"not a valid ZIP file: {path}")
     with zipfile.ZipFile(path) as zf:
         prefix, files = _zip_layout(zf)
+        entries = _classify_entries(zf, prefix, files)
+        _require_importable_marker(entries)
         external = sorted({
             PurePosixPath(
                 info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
@@ -99,18 +130,146 @@ def validate_zip(path: Path) -> dict[str, object]:
             "uncompressed_bytes": sum(info.file_size for info in files),
             "prefix": prefix,
             "external_top_level_entries": external,
+            "migration_policy": MIGRATION_POLICY,
+            "migration_scope": _accounting(entries),
         }
 
 
-def _skip(rel: PurePosixPath) -> bool:
+def _path_skip_reason(rel: PurePosixPath) -> str | None:
     parts = rel.parts
     if not parts:
-        return True
-    if rel.name in RUNTIME_NAMES or rel.name.endswith(EXCLUDED_SUFFIXES):
-        return True
+        return "empty_path"
+    if parts[0] == "tmp":
+        return "root_tmp"
+    if rel.name in RUNTIME_NAMES:
+        return "runtime_state"
+    if rel.name.endswith(EXCLUDED_SUFFIXES):
+        return "excluded_suffix"
     if parts[0] == "hermes-agent":
+        return "hermes_agent_checkout"
+    if any(part in EXCLUDED_DIRS for part in parts):
+        return "excluded_directory"
+    return None
+
+
+def _is_mach_o(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> bool:
+    with zf.open(info) as source:
+        header = source.read(8)
+        magic = header[:4]
+        if magic in THIN_MACHO_MAGICS:
+            return True
+        fat_layout = FAT_MACHO_MAGICS.get(magic)
+        if fat_layout is None or len(header) != 8:
+            return False
+        endian, architecture_size = fat_layout
+        architecture_count = struct.unpack(f"{endian}I", header[4:])[0]
+        if architecture_count < 1 or architecture_count > 64:
+            return False
+        table_size = architecture_count * architecture_size
+        data_start = len(header) + table_size
+        if data_start > info.file_size:
+            return False
+        table = source.read(table_size)
+        if len(table) != table_size:
+            return False
+        slices: list[tuple[int, int, int]] = []
+        for offset in range(0, table_size, architecture_size):
+            architecture = table[offset:offset + architecture_size]
+            if architecture_size == 20:
+                cpu_type, _subtype, slice_offset, slice_size, alignment = struct.unpack(
+                    f"{endian}IIIII", architecture
+                )
+            else:
+                cpu_type, _subtype, slice_offset, slice_size, alignment, _reserved = struct.unpack(
+                    f"{endian}IIQQII", architecture
+                )
+            if (
+                slice_size < 8
+                or slice_offset < data_start
+                or slice_offset + slice_size > info.file_size
+                or alignment > 63
+            ):
+                return False
+            slices.append((slice_offset, slice_size, cpu_type))
+        for slice_offset, _slice_size, cpu_type in slices:
+            source.seek(slice_offset)
+            slice_header = source.read(8)
+            thin_endian = THIN_MACHO_MAGICS.get(slice_header[:4])
+            if thin_endian is None or len(slice_header) != 8:
+                return False
+            if struct.unpack(f"{thin_endian}I", slice_header[4:])[0] != cpu_type:
+                return False
         return True
-    return any(part in EXCLUDED_DIRS for part in parts)
+
+
+def _classify_entries(
+    zf: zipfile.ZipFile,
+    prefix: str,
+    files: list[zipfile.ZipInfo],
+) -> list[tuple[zipfile.ZipInfo, PurePosixPath, bool, str | None]]:
+    entries: list[tuple[zipfile.ZipInfo, PurePosixPath, bool, str | None]] = []
+    for info in files:
+        name = info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
+        rel = _safe_relative(name)
+        external = rel.parts[0] == "_external"
+        if external and len(rel.parts) == 1:
+            reason = "external_root_entry"
+        elif not external:
+            reason = _path_skip_reason(rel)
+        else:
+            reason = None
+        if reason is None and _is_mach_o(zf, info):
+            reason = "mach_o_binary"
+        entries.append((info, rel, external, reason))
+    return entries
+
+
+def _require_importable_marker(
+    entries: list[tuple[zipfile.ZipInfo, PurePosixPath, bool, str | None]],
+) -> None:
+    if not any(
+        len(rel.parts) == 1
+        and rel.name in MARKERS
+        and not external
+        and reason is None
+        for _info, rel, external, reason in entries
+    ):
+        raise ValueError(
+            "archive has no importable canonical root Hermes marker "
+            "(config.yaml, .env, or state.db)"
+        )
+
+
+def _accounting(
+    entries: list[tuple[zipfile.ZipInfo, PurePosixPath, bool, str | None]],
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "archive_files": len(entries),
+        "archive_bytes": sum(info.file_size for info, _rel, _external, _reason in entries),
+        "hermes_files": 0,
+        "hermes_bytes": 0,
+        "external_files": 0,
+        "external_bytes": 0,
+        "skipped_files": 0,
+        "skipped_bytes": 0,
+    }
+    skipped_entries: list[dict[str, object]] = []
+    skipped_by_reason: dict[str, int] = {}
+    for info, rel, external, reason in entries:
+        if reason is not None:
+            result["skipped_files"] = int(result["skipped_files"]) + 1
+            result["skipped_bytes"] = int(result["skipped_bytes"]) + info.file_size
+            skipped_by_reason[reason] = skipped_by_reason.get(reason, 0) + 1
+            skipped_entries.append({"path": str(rel), "reason": reason, "bytes": info.file_size})
+            continue
+        category = "external" if external else "hermes"
+        result[f"{category}_files"] = int(result[f"{category}_files"]) + 1
+        result[f"{category}_bytes"] = int(result[f"{category}_bytes"]) + info.file_size
+    result["normalized_files"] = int(result["hermes_files"]) + int(result["external_files"])
+    result["normalized_bytes"] = int(result["hermes_bytes"]) + int(result["external_bytes"])
+    result["skipped_by_reason"] = dict(sorted(skipped_by_reason.items()))
+    result["skipped_entries"] = sorted(skipped_entries, key=lambda item: str(item["path"]))
+    return result
 
 
 def _table_count(conn: sqlite3.Connection, table: str) -> int | None:
@@ -225,25 +384,21 @@ def _extract(
     prefix: str,
     files: list[zipfile.ZipInfo],
     approved_external: set[str],
-) -> dict[str, int]:
-    accounting = {"archive_files": len(files), "hermes_files": 0, "external_files": 0, "skipped_files": 0}
-    for info in files:
-        name = info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
-        rel = _safe_relative(name)
-        if rel.parts[0] == "_external":
-            if len(rel.parts) == 1:
-                accounting["skipped_files"] += 1
-                continue
+) -> dict[str, object]:
+    entries = _classify_entries(zf, prefix, files)
+    # Recheck viability against this exact open ZIP snapshot. The host-side
+    # preview may refer to an archive replaced before import reopened it.
+    _require_importable_marker(entries)
+    accounting = _accounting(entries)
+    for info, rel, external, reason in entries:
+        if reason is not None:
+            continue
+        if external:
             if rel.parts[1] not in approved_external:
                 raise ValueError(f"unapproved external provider entry: {rel.parts[1]}")
             target = external_stage.joinpath(*rel.parts[1:])
-            external = True
-        elif _skip(rel):
-            accounting["skipped_files"] += 1
-            continue
         else:
             target = stage.joinpath(*rel.parts)
-            external = False
         target.parent.mkdir(parents=True, exist_ok=True)
         with zf.open(info) as source, target.open("wb") as destination:
             shutil.copyfileobj(source, destination, length=1024 * 1024)
@@ -252,7 +407,6 @@ def _extract(
         executable_path = any(part in {"hooks", "scripts"} for part in rel.parts[:-1])
         safe_mode = archived_mode if executable_path and archived_mode else 0o644
         target.chmod(0o600 if secret else safe_mode & 0o777)
-        accounting["external_files" if external else "hermes_files"] += 1
     if approved_external:
         for directory in external_stage.rglob("*"):
             if directory.is_dir():
@@ -376,7 +530,8 @@ def import_zip(
             if item.is_file()
         )
         result = {
-            "format": 1,
+            "format": 2,
+            "status": "completed_with_skips" if accounting["skipped_files"] else "completed",
             "imported_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
             "source_archive": str(path),
             "source": source_report,
@@ -386,6 +541,7 @@ def import_zip(
             "external_state_imported": bool(external_swaps),
             "external_top_level_entries": [target.name for target, _ in external_swaps],
             "external_approved": sorted(approved_external),
+            "migration_policy": MIGRATION_POLICY,
             "accounting": accounting,
             "active_paths_reviewed": False,
             "gateway_enabled": False,
@@ -433,6 +589,68 @@ def acknowledge_paths(manifest: Path) -> dict[str, object]:
     return data
 
 
+def _nonnegative_integer(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _format2_scope_accounted(accounting: object) -> bool:
+    if not isinstance(accounting, dict):
+        return False
+    numeric_fields = (
+        "archive_files", "archive_bytes", "hermes_files", "hermes_bytes",
+        "external_files", "external_bytes", "skipped_files", "skipped_bytes",
+        "normalized_files", "normalized_bytes",
+    )
+    if not all(_nonnegative_integer(accounting.get(field)) for field in numeric_fields):
+        return False
+    skipped_entries = accounting.get("skipped_entries")
+    skipped_by_reason = accounting.get("skipped_by_reason")
+    if not isinstance(skipped_entries, list) or not isinstance(skipped_by_reason, dict):
+        return False
+    if not all(
+        isinstance(reason, str)
+        and bool(reason)
+        and _nonnegative_integer(count)
+        for reason, count in skipped_by_reason.items()
+    ):
+        return False
+    grouped_reasons: dict[str, int] = {}
+    skipped_paths: list[str] = []
+    skipped_byte_total = 0
+    for entry in skipped_entries:
+        if not isinstance(entry, dict) or set(entry) != {"path", "reason", "bytes"}:
+            return False
+        path = entry.get("path")
+        reason = entry.get("reason")
+        byte_count = entry.get("bytes")
+        if (
+            not isinstance(path, str)
+            or not path
+            or not isinstance(reason, str)
+            or not reason
+            or not _nonnegative_integer(byte_count)
+        ):
+            return False
+        skipped_paths.append(path)
+        skipped_byte_total += byte_count
+        grouped_reasons[reason] = grouped_reasons.get(reason, 0) + 1
+    if skipped_paths != sorted(set(skipped_paths)):
+        return False
+    return (
+        accounting["skipped_files"] == len(skipped_entries)
+        and accounting["skipped_bytes"] == skipped_byte_total
+        and skipped_by_reason == dict(sorted(grouped_reasons.items()))
+        and accounting["normalized_files"]
+        == accounting["hermes_files"] + accounting["external_files"]
+        and accounting["archive_files"]
+        == accounting["normalized_files"] + accounting["skipped_files"]
+        and accounting["normalized_bytes"]
+        == accounting["hermes_bytes"] + accounting["external_bytes"]
+        and accounting["archive_bytes"]
+        == accounting["normalized_bytes"] + accounting["skipped_bytes"]
+    )
+
+
 def cutover_check(manifest: Path, home: Path) -> dict[str, object]:
     if not manifest.is_file():
         raise ValueError(f"import manifest not found: {manifest}")
@@ -440,6 +658,18 @@ def cutover_check(manifest: Path, home: Path) -> dict[str, object]:
     source = data.get("source", {})
     destination = data.get("destination", {})
     accounting = data.get("accounting", {})
+    if not isinstance(accounting, dict):
+        accounting = {}
+    manifest_format = data.get("format", 1)
+    # Format 1 predates normalized byte/path accounting. Keep its established
+    # archive-accounted gate while requiring the stronger invariant for v2+.
+    migration_scope_accounted = (
+        type(manifest_format) is int
+        and (
+            manifest_format < 2
+            or _format2_scope_accounted(accounting)
+        )
+    )
     current = inspect_home(home)
     gates = {
         "database_integrity": bool(current.get("databases"))
@@ -456,6 +686,7 @@ def cutover_check(manifest: Path, home: Path) -> dict[str, object]:
         == accounting.get("hermes_files", 0)
         + accounting.get("external_files", 0)
         + accounting.get("skipped_files", 0),
+        "migration_scope_accounted": migration_scope_accounted,
     }
     result = {"ready": all(gates.values()), "gates": gates, "current": current}
     if not result["ready"]:
@@ -497,6 +728,13 @@ def main() -> None:
         result = inspect_home(args.home, args.checkpoint)
     elif args.command == "import-zip":
         result = import_zip(args.archive, args.home, args.map, args.manifest, set(args.external))
+        if result["accounting"]["skipped_files"]:
+            print(
+                "warning: import completed with "
+                f"{result['accounting']['skipped_files']} intentionally skipped file(s); "
+                "inspect accounting.skipped_entries in the import manifest",
+                file=sys.stderr,
+            )
     elif args.command == "acknowledge-paths":
         result = acknowledge_paths(args.manifest)
     else:

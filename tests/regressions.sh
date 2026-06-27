@@ -916,6 +916,7 @@ import sys, zipfile
 with zipfile.ZipFile(sys.argv[1], "w") as archive:
     archive.writestr("config.yaml", "model: fixture\n")
     archive.writestr(".env", "DISCORD_BOT_TOKEN=fixture\n")
+    archive.writestr("tmp/transient.log", "do not migrate\n")
     archive.writestr("_external/.honcho/config.json", "{}\n")
 PY
 import_repo="$tmp/import-repo"
@@ -983,7 +984,7 @@ for stopped_case in success failure; do
   if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/${stopped_name}.calls" \
     SMOLVM_STATE_DIR="$tmp/import-state" SMOLVM_BEHAVIOR="$behavior" \
     "$import_repo/box" import-hermes "$stopped_name" "$tmp/hermes-import.zip" \
-      --external .honcho >/dev/null 2>&1; then
+      --external .honcho >"$tmp/${stopped_name}.output" 2>&1; then
     [[ "$stopped_case" == success ]] || {
       echo "stopped import failure case unexpectedly succeeded" >&2; exit 1;
     }
@@ -999,6 +1000,9 @@ for stopped_case in success failure; do
   [[ ! -e "$tmp/import-state/$stopped_name/paused" ]]
   [[ ! -e "$tmp/import-state/$stopped_name/gateway-restarted" ]]
 done
+grep -q 'Native import will intentionally skip 1 non-portable or transient file(s)' \
+  "$tmp/stopped-import-success.output"
+grep -q 'Hermes import verified. Gateway remains disabled' "$tmp/stopped-import-success.output"
 
 # Pause may have taken effect even when the pause command reports failure. The
 # existing box is tracked early and resumed during cleanup.
