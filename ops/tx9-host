@@ -1,20 +1,22 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-name="${2:-}"
-[[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] || {
+requested_name="${2:-}"
+[[ "$requested_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] || {
   echo "usage: tx9-host {start|stop|supervise|health|backup} <box>" >&2
   exit 2
 }
+readonly requested_name
 
 TX9_CONFIG="${TX9_CONFIG:-/etc/tx9/tx9.conf}"
 [[ ! -r "$TX9_CONFIG" ]] || { # shellcheck disable=SC1090
   source "$TX9_CONFIG"
 }
-box_config="${TX9_BOX_CONFIG_DIR:-/etc/tx9/boxes}/${name}.conf"
+box_config="${TX9_BOX_CONFIG_DIR:-/etc/tx9/boxes}/${requested_name}.conf"
 [[ ! -r "$box_config" ]] || { # shellcheck disable=SC1090
   source "$box_config"
 }
+name="$requested_name"
 
 root="${TX9_ROOT:-/opt/tx9}"
 box="$root/box"

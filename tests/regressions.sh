@@ -106,6 +106,17 @@ PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/tx9-active.smolvm"
   "$PROJECT_ROOT/ops/tx9-host" health scheduled >/dev/null
 grep -q '^doctor scheduled$' "$tmp/tx9-active.box"
 
+# Sourced configuration cannot redirect an operation to another box name.
+mkdir -p "$tmp/tx9-config/boxes"
+printf 'name=global-override\nTX9_BOX_CONFIG_DIR=%s\n' "$tmp/tx9-config/boxes" >"$tmp/tx9-config/global.conf"
+printf 'name=box-override\n' >"$tmp/tx9-config/boxes/scheduled.conf"
+PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/tx9-config-name.smolvm" \
+  SMOLVM_STATE_DIR="$tmp/tx9-host-state" SMOLVM_BEHAVIOR=success \
+  TX9_CONFIG="$tmp/tx9-config/global.conf" TX9_ROOT="$host_root" \
+  TX9_BOX_CALLS="$tmp/tx9-config-name.box" \
+  "$PROJECT_ROOT/ops/tx9-host" health scheduled >/dev/null
+[[ "$(cat "$tmp/tx9-config-name.box")" == 'doctor scheduled' ]]
+
 # The foreground supervisor starts once and restarts an unexpectedly stopped VM.
 PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/tx9-supervise.smolvm" \
   SMOLVM_STATE_DIR="$tmp/tx9-host-state" SMOLVM_BEHAVIOR=inactive \
@@ -149,6 +160,52 @@ chmod 0400 "$hermes_fixture/sessions/deep/history.json" "$hermes_fixture/cron/jo
 [[ -w "$hermes_fixture/sessions/deep/history.json" ]]
 [[ -w "$hermes_fixture/cron/jobs.json" ]]
 [[ -w "$hermes_fixture/sessions/deep" ]]
+
+# Hermes API forwarding requires a successful reconcile, an enabled gateway,
+# and a listening target API.
+(
+  HOME="$tmp/workload-home"
+  mkdir -p "$HOME/.config/hermes-box" "$tmp/workload-logs"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb-workload"
+  PORT=4788
+  HERMES_BRIDGE_PORT=8650
+  LOGS="$tmp/workload-logs"
+  pgrep() { return 1; }
+  pkill() { printf 'stopped\n' >>"$tmp/api-bridge.events"; }
+  socat() { printf 'started\n' >>"$tmp/api-bridge.events"; }
+  hb() { return 1; }
+  _wait_api_ready() { return 0; }
+  reconcile_once
+  if grep -q started "$tmp/api-bridge.events" 2>/dev/null; then
+    echo "API bridge started after failed reconcile" >&2; exit 1
+  fi
+  hb() { return 0; }
+  _wait_api_ready() { return 1; }
+  reconcile_once
+  if grep -q started "$tmp/api-bridge.events" 2>/dev/null; then
+    echo "API bridge started before its target was ready" >&2; exit 1
+  fi
+  _wait_api_ready() { return 0; }
+  reconcile_once
+  wait
+  grep -q started "$tmp/api-bridge.events"
+  touch "$GATEWAY_DISABLED"
+  reconcile_once
+  [[ "$(tail -1 "$tmp/api-bridge.events")" == stopped ]]
+)
+
+# Active-path acknowledgement reports success only when persistence succeeds.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  hermes-state() { return 1; }
+  if output="$(acknowledge_active_paths 2>&1)"; then
+    echo "active-path acknowledgement masked helper failure" >&2
+    exit 1
+  fi
+  [[ "$output" != *'active import paths acknowledged'* ]]
+)
 
 # An unset systemd credential directory does not resolve to /backup-passphrase.
 if env -u BOX_PASSPHRASE_FILE -u CREDENTIALS_DIRECTORY \
@@ -570,6 +627,32 @@ fi
   fi
 )
 
+# Guest bundle verification is independent of the caller's repository and
+# rejects incremental bundles whose prerequisite objects are unavailable.
+bundle_repo="$tmp/bundle-source"
+mkdir -p "$bundle_repo" "$tmp/bundle-nonrepo" "$tmp/bundle-verify-tmp"
+git -C "$bundle_repo" init -q
+printf 'base\n' >"$bundle_repo/state.txt"
+git -C "$bundle_repo" add state.txt
+git -C "$bundle_repo" -c user.name=Fixture -c user.email=fixture@example.invalid commit -q -m base
+base_commit="$(git -C "$bundle_repo" rev-parse HEAD)"
+git -C "$bundle_repo" bundle create "$tmp/complete.bundle" --all
+printf 'next\n' >>"$bundle_repo/state.txt"
+git -C "$bundle_repo" add state.txt
+git -C "$bundle_repo" -c user.name=Fixture -c user.email=fixture@example.invalid commit -q -m next
+git -C "$bundle_repo" bundle create "$tmp/incremental.bundle" HEAD "^$base_commit"
+(
+  cd "$tmp/bundle-nonrepo"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/provision/provision.sh"
+  TMPDIR="$tmp/bundle-verify-tmp" verify_self_contained_bundle "$tmp/complete.bundle"
+  if TMPDIR="$tmp/bundle-verify-tmp" verify_self_contained_bundle "$tmp/incremental.bundle"; then
+    echo "incremental bundle passed self-contained verification" >&2
+    exit 1
+  fi
+)
+[[ -z "$(find "$tmp/bundle-verify-tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+
 # Asset-only refreshes neither validate nor transport the optional source bundle.
 (
   # shellcheck disable=SC1090
@@ -735,6 +818,34 @@ fi
 [[ -e "$tmp/import-state/import-probe/gateway-disabled" ]]
 [[ ! -e "$tmp/import-state/import-probe/gateway-restarted" ]]
 grep -q 'hb resume' "$tmp/import-signal.calls"
+
+# Import temporarily starts a stopped target, preserves its unpaused policy,
+# keeps the gateway disabled, and returns it to stopped on success or failure.
+for stopped_case in success failure; do
+  stopped_name="stopped-import-$stopped_case"
+  mkdir -p "$tmp/import-state/$stopped_name"
+  printf '%s\t\n' "$stopped_name" >>"$import_repo/.boxes"
+  behavior=inactive
+  [[ "$stopped_case" == success ]] || behavior=inactive-import-post-fail
+  if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/${stopped_name}.calls" \
+    SMOLVM_STATE_DIR="$tmp/import-state" SMOLVM_BEHAVIOR="$behavior" \
+    "$import_repo/box" import-hermes "$stopped_name" "$tmp/hermes-import.zip" \
+      --external .honcho >/dev/null 2>&1; then
+    [[ "$stopped_case" == success ]] || {
+      echo "stopped import failure case unexpectedly succeeded" >&2; exit 1;
+    }
+  else
+    [[ "$stopped_case" == failure ]] || {
+      echo "stopped import success case failed" >&2; exit 1;
+    }
+  fi
+  grep -q 'machine start' "$tmp/${stopped_name}.calls"
+  grep -q 'machine stop' "$tmp/${stopped_name}.calls"
+  grep -q 'hb gateway-disable' "$tmp/${stopped_name}.calls"
+  [[ -e "$tmp/import-state/$stopped_name/gateway-disabled" ]]
+  [[ ! -e "$tmp/import-state/$stopped_name/paused" ]]
+  [[ ! -e "$tmp/import-state/$stopped_name/gateway-restarted" ]]
+done
 
 # Pause may have taken effect even when the pause command reports failure. The
 # existing box is tracked early and resumed during cleanup.

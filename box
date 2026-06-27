@@ -18,6 +18,7 @@ _PAUSED_RESUME_ON_CLEANUP=()
 _GUEST_TEMP_BOXES=()
 _GUEST_TEMP_PATHS=()
 _CREATED_BOXES=()
+_STOP_AFTER_BOXES=()
 _PENDING_SIGNAL=0
 _LOCK_FAILURE=""
 
@@ -47,6 +48,9 @@ _cleanup() {
     n="${_PAUSED_BOXES[$index]}"
     [[ -n "$n" && "${_PAUSED_RESUME_ON_CLEANUP[$index]}" == 1 ]] || continue
     _guest_hb "$n" resume >/dev/null 2>&1 || true
+  done
+  for n in "${_STOP_AFTER_BOXES[@]:-}"; do
+    [[ -n "$n" ]] && smolvm machine stop --name "$n" >/dev/null 2>&1 || true
   done
   for path in "${_LOCK_DIRS[@]:-}"; do
     [[ -n "$path" ]] || continue
@@ -97,6 +101,14 @@ _untrack_guest_temp() {
   done
 }
 
+_track_stop_after() { _STOP_AFTER_BOXES+=("$1"); }
+_clear_stop_after() {
+  local n="$1" index
+  for index in "${!_STOP_AFTER_BOXES[@]}"; do
+    [[ "${_STOP_AFTER_BOXES[$index]}" == "$n" ]] && _STOP_AFTER_BOXES[index]=""
+  done
+}
+
 _mark_created() { _CREATED_BOXES+=("$1"); }
 
 _clear_created() {
@@ -115,8 +127,8 @@ _host_preflight() {
     provision) requirements=(awk smolvm tar) ;;
     health) requirements=(awk curl jq mktemp smolvm) ;;
     import) requirements=(awk jq mktemp python3 smolvm) ;;
-    archive) requirements=(awk gpg grep mktemp tar) ;;
-    full) requirements=(awk curl gpg grep jq mktemp smolvm tar) ;;
+    archive) requirements=(awk gpg grep mktemp python3 tar) ;;
+    full) requirements=(awk curl gpg grep jq mktemp python3 smolvm tar) ;;
     *) die "unknown host preflight mode '$mode'" ;;
   esac
   for cmd in "${requirements[@]}"; do _require "$cmd"; done
@@ -358,18 +370,35 @@ gpg_dec() {
 }
 
 _validate_archive() {
-  local raw="$1" listing status=0
-  listing="$(mktemp)"
-  tar tzf "$raw" >"$listing" || status=1
-  [[ -s "$listing" ]] || status=1
-  if ! awk '
-    /^\// { exit 1 }
-    /(^|\/)\.\.($|\/)/ { exit 1 }
-    /[[:cntrl:]]/ { exit 1 }
-  ' "$listing"; then status=1; fi
-  grep -Eq '^\.?/?home/agent(/|$)' "$listing" || status=1
-  rm -f "$listing"
-  [[ "$status" == 0 ]]
+  python3 - "$1" <<'PY'
+import sys
+import tarfile
+from pathlib import PurePosixPath
+
+try:
+    with tarfile.open(sys.argv[1], "r:gz") as archive:
+        members = archive.getmembers()
+        if not members:
+            raise ValueError("archive is empty")
+        durable_home = False
+        for member in members:
+            name = member.name
+            if any(ord(char) < 32 or ord(char) == 127 for char in name):
+                raise ValueError("archive path contains control characters")
+            path = PurePosixPath(name)
+            if path.is_absolute() or any(part == ".." for part in path.parts):
+                raise ValueError("archive path escapes its extraction root")
+            parts = tuple(part for part in path.parts if part not in {"", "."})
+            if parts[:2] == ("home", "agent"):
+                durable_home = True
+            if not (member.isfile() or member.isdir()):
+                raise ValueError("archive contains links or special files")
+        if not durable_home:
+            raise ValueError("archive does not contain home/agent")
+except (OSError, tarfile.TarError, ValueError) as error:
+    print(f"unsafe archive: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
 }
 
 _guest_hb() {
@@ -649,7 +678,7 @@ cmd_load() {
 cmd_import_hermes() {
   local n="${1:?usage: box import-hermes <name> <hermes-backup.zip> [--external NAME]... [--map OLD=NEW]...}"
   local file="${2:?usage: box import-hermes <name> <hermes-backup.zip> [--external NAME]... [--map OLD=NEW]...}"
-  local guest_tmp map external already_paused=0 validation external_count archive_external
+  local guest_tmp map external already_paused=0 was_running=0 validation external_count archive_external
   shift 2
   _validate_name "$n"
   [[ -f "$file" ]] || die "no such Hermes backup: $file"
@@ -705,10 +734,12 @@ cmd_import_hermes() {
   done
   _acquire_lock "$n"
   _machine_exists "$n" || die "smolvm machine '$n' is missing"
+  _machine_running "$n" && was_running=1
+  [[ "$was_running" == 1 ]] || _track_stop_after "$n"
   smolvm machine start --name "$n" >/dev/null
   _guest_hb "$n" is-paused >/dev/null 2>&1 && already_paused=1
-  _pause_box "$n"
   _guest_hb "$n" gateway-disable >/dev/null
+  _pause_box "$n"
   guest_tmp="/root/hermes-import-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}.zip"
   _track_guest_temp "$n" "$guest_tmp"
   smolvm machine cp "$file" "$n:$guest_tmp"
@@ -727,6 +758,10 @@ cmd_import_hermes() {
   _untrack_guest_temp "$n" "$guest_tmp"
   _guest_hb "$n" verify-state >/dev/null
   if [[ "$already_paused" == 0 ]]; then _resume_box "$n"; fi
+  if [[ "$was_running" == 0 ]]; then
+    smolvm machine stop --name "$n"
+    _clear_stop_after "$n"
+  fi
   say "Hermes import verified. Gateway remains disabled; inspect active paths, acknowledge them, then run the cutover gates."
 }
 

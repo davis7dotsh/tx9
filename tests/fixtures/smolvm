@@ -23,7 +23,7 @@ case "${2:-}" in
     name="$(name_from_args "$@")"
     [[ "$behavior" != delete-status-fail ]] || exit 42
     [[ -d "$state/$name" ]] || exit 1
-    if [[ "$behavior" == inactive ]]; then
+    if [[ "$behavior" == inactive || "$behavior" == inactive-import-post-fail ]]; then
       printf "Machine '%s': stopped\n" "$name"
     else
       printf "Machine '%s': running\n" "$name"
@@ -75,7 +75,7 @@ case "${2:-}" in
       sleep 1
       exit 143
     fi
-    if [[ "$behavior" == import-post-fail && "$*" == *" hb verify-state"* ]]; then exit 42; fi
+    if [[ ( "$behavior" == import-post-fail || "$behavior" == inactive-import-post-fail ) && "$*" == *" hb verify-state"* ]]; then exit 42; fi
     if [[ "$*" == *" hb is-paused"* ]]; then [[ -e "$state/$name/paused" ]]; exit; fi
     if [[ "$*" == *" hb pause"* ]]; then
       touch "$state/$name/paused"

@@ -350,7 +350,7 @@ def import_zip(
         stage.rename(home)
         swapped = True
         for source in sorted(external_stage.iterdir()):
-            target = Path.home() / source.name
+            target = home.parent / source.name
             if target == home or source.name in {".", ".."}:
                 raise ValueError(f"unsafe external Hermes state target: {target}")
             if target.is_symlink() or (

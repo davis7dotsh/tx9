@@ -12,6 +12,37 @@ printf 'portable state\n' >"$tmp/valid/home/agent/workspace/probe.txt"
 printf 'invalid state\n' >"$tmp/invalid/not-home/probe.txt"
 tar czf "$tmp/valid.tgz" -C "$tmp/valid" .
 tar czf "$tmp/invalid.tgz" -C "$tmp/invalid" .
+python3 - "$tmp/symlink.tgz" "$tmp/hardlink.tgz" <<'PY'
+import io
+import sys
+import tarfile
+
+def directory(name):
+    info = tarfile.TarInfo(name)
+    info.type = tarfile.DIRTYPE
+    info.mode = 0o700
+    return info
+
+with tarfile.open(sys.argv[1], "w:gz") as archive:
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+    link = tarfile.TarInfo("home/agent/workspace")
+    link.type = tarfile.SYMTYPE
+    link.linkname = "/tmp/escape"
+    archive.addfile(link)
+
+with tarfile.open(sys.argv[2], "w:gz") as archive:
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+    payload = b"fixture\n"
+    target = tarfile.TarInfo("home/agent/target")
+    target.size = len(payload)
+    archive.addfile(target, io.BytesIO(payload))
+    link = tarfile.TarInfo("home/agent/workspace")
+    link.type = tarfile.LNKTYPE
+    link.linkname = "home/agent/target"
+    archive.addfile(link)
+PY
 
 (
   # shellcheck disable=SC1090
@@ -22,6 +53,12 @@ tar czf "$tmp/invalid.tgz" -C "$tmp/invalid" .
     echo "archive without durable home passed validation" >&2
     exit 1
   fi
+  for unsafe in "$tmp/symlink.tgz" "$tmp/hardlink.tgz"; do
+    if _validate_archive "$unsafe"; then
+      echo "linked archive passed validation: $unsafe" >&2
+      exit 1
+    fi
+  done
 )
 
 if (
@@ -39,10 +76,25 @@ gpg --batch --yes --pinentry-mode loopback --passphrase "$BOX_PASSPHRASE" \
   --symmetric --cipher-algo AES256 -o "$tmp/valid.tar.gz.gpg" "$tmp/valid.tgz"
 gpg --batch --yes --pinentry-mode loopback --passphrase "$BOX_PASSPHRASE" \
   --symmetric --cipher-algo AES256 -o "$tmp/invalid.tar.gz.gpg" "$tmp/invalid.tgz"
+for unsafe in symlink hardlink; do
+  gpg --batch --yes --pinentry-mode loopback --passphrase "$BOX_PASSPHRASE" \
+    --symmetric --cipher-algo AES256 -o "$tmp/${unsafe}.tar.gz.gpg" "$tmp/${unsafe}.tgz"
+done
 
 TMPDIR="$tmp/host-tmp" "$PROJECT_ROOT/box" extract "$tmp/valid.tar.gz.gpg" "$tmp/extracted" >/dev/null
 cmp "$tmp/valid/home/agent/workspace/probe.txt" "$tmp/extracted/home/agent/workspace/probe.txt"
 [[ -z "$(find "$tmp/host-tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
+
+for unsafe in symlink hardlink; do
+  unsafe_sentinel="$tmp/${unsafe}-smolvm-called"
+  if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$unsafe_sentinel" \
+    SMOLVM_STATE_DIR="$tmp/smolvm-state" TMPDIR="$tmp/host-tmp" \
+    "$PROJECT_ROOT/box" load "$tmp/${unsafe}.tar.gz.gpg" "${unsafe}-destination" >/dev/null 2>&1; then
+    echo "$unsafe archive unexpectedly loaded" >&2
+    exit 1
+  fi
+  [[ ! -e "$unsafe_sentinel" ]] || { echo "VM command ran before $unsafe validation" >&2; exit 1; }
+done
 
 sentinel="$tmp/smolvm-called"
 if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$sentinel" \

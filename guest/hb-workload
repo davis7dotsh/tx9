@@ -9,28 +9,59 @@ PORT="${1:-4788}"
 HERMES_BRIDGE_PORT="${2:-0}"
 # shellcheck disable=SC1091
 [ -f /etc/profile.d/hermes-box.sh ] && . /etc/profile.d/hermes-box.sh
-mkdir -p /data/logs
 QUIESCE_FILE="$HOME/.config/hermes-box/quiesced"
+GATEWAY_DISABLED="$HOME/.config/hermes-box/gateway-disabled"
 EXECUTOR_TARGET_PORT="${EXECUTOR_PORT:-4788}"
+HERMES_TARGET_PORT="${HERMES_API_PORT:-8642}"
+LOGS="${HB_WORKLOAD_LOGS:-/data/logs}"
 
 _exec_up() { (exec 3<>"/dev/tcp/127.0.0.1/$EXECUTOR_TARGET_PORT") 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
+_api_up() { (exec 3<>"/dev/tcp/127.0.0.1/$HERMES_TARGET_PORT") 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
 
-while true; do
+_wait_api_ready() {
+  local _
+  for _ in 1 2 3 4 5; do
+    _api_up && return 0
+    sleep 1
+  done
+  return 1
+}
+
+_stop_api_bridge() {
+  [ "$HERMES_BRIDGE_PORT" = 0 ] || pkill -f "socat TCP-LISTEN:$HERMES_BRIDGE_PORT," 2>/dev/null || true
+}
+
+reconcile_once() {
+  local reconciled=0
   if [ -e "$QUIESCE_FILE" ]; then
-    sleep 2
-    continue
+    _stop_api_bridge
+    return
   fi
-  hb reconcile >>/data/logs/workload.log 2>&1 || true
+  if hb reconcile >>"$LOGS/workload.log" 2>&1; then reconciled=1; fi
   # socat bridge for host access (only when a distinct port was assigned)
   if [ "$PORT" != "4788" ] && command -v socat >/dev/null 2>&1 && _exec_up \
      && ! pgrep -f "TCP-LISTEN:$PORT," >/dev/null 2>&1; then
     socat "TCP-LISTEN:$PORT,bind=0.0.0.0,fork,reuseaddr" "TCP:127.0.0.1:$EXECUTOR_TARGET_PORT" \
-      >>/data/logs/socat.log 2>&1 &
+      >>"$LOGS/socat.log" 2>&1 &
   fi
-  if [ "$HERMES_BRIDGE_PORT" != 0 ] && command -v socat >/dev/null 2>&1 \
-     && ! pgrep -f "TCP-LISTEN:$HERMES_BRIDGE_PORT," >/dev/null 2>&1; then
-    socat "TCP-LISTEN:$HERMES_BRIDGE_PORT,bind=0.0.0.0,fork,reuseaddr" \
-      "TCP:127.0.0.1:${HERMES_API_PORT:-8642}" >>/data/logs/hermes-api-socat.log 2>&1 &
+  if [ "$HERMES_BRIDGE_PORT" != 0 ] && [ "$reconciled" = 1 ] && [ ! -e "$GATEWAY_DISABLED" ] \
+     && command -v socat >/dev/null 2>&1 && _wait_api_ready; then
+    if ! pgrep -f "TCP-LISTEN:$HERMES_BRIDGE_PORT," >/dev/null 2>&1; then
+      socat "TCP-LISTEN:$HERMES_BRIDGE_PORT,bind=0.0.0.0,fork,reuseaddr" \
+        "TCP:127.0.0.1:$HERMES_TARGET_PORT" >>"$LOGS/hermes-api-socat.log" 2>&1 &
+    fi
+  else
+    _stop_api_bridge
   fi
-  sleep 20
-done
+}
+
+main() {
+  mkdir -p "$LOGS"
+  while true; do
+    reconcile_once
+    [[ "${HB_WORKLOAD_ONCE:-0}" != 1 ]] || break
+    sleep 20
+  done
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main; fi

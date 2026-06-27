@@ -15,6 +15,17 @@ export DEBIAN_FRONTEND=noninteractive
 
 log() { printf '\033[35m[provision]\033[0m %s\n' "$*"; }
 
+verify_self_contained_bundle() {
+  local bundle_path="$1" verify_repo status=0
+  verify_repo="$(mktemp -d)" || return 1
+  git init --bare "$verify_repo" >/dev/null 2>&1 || status=$?
+  if [[ "$status" == 0 ]]; then
+    git -C "$verify_repo" bundle verify "$bundle_path" >/dev/null 2>&1 || status=$?
+  fi
+  rm -rf "$verify_repo"
+  return "$status"
+}
+
 base_os() {
   log "base packages"
   apt-get update -qq
@@ -83,11 +94,9 @@ install_hermes() {
       log "HERMES_GIT_BUNDLE must be a safe path beneath artifacts/"; return 1;
     }
     [[ -f "$CTX/$bundle" ]] || { log "Hermes Git bundle is missing: $CTX/$bundle"; return 1; }
-    git bundle verify "$CTX/$bundle" >/dev/null
-    rm -rf "$install_dir"
-    git clone --no-checkout "$CTX/$bundle" "$install_dir" >/dev/null
-    git -C "$install_dir" cat-file -e "$sha^{commit}"
-    git -C "$install_dir" checkout --detach "$sha"
+    verify_self_contained_bundle "$CTX/$bundle" || {
+      log "Hermes Git bundle is incomplete or invalid"; return 1;
+    }
   fi
   local args=()
   read -r -a args <<<"${HERMES_INSTALL_ARGS:-}"
@@ -101,6 +110,16 @@ install_hermes() {
     rm -f "$installer"
     log "Hermes installer checksum verification failed"
     return 1
+  fi
+  if [[ -n "$bundle" ]]; then
+    if ! rm -rf "$install_dir" \
+      || ! git clone --no-checkout "$CTX/$bundle" "$install_dir" >/dev/null \
+      || ! git -C "$install_dir" cat-file -e "$sha^{commit}" \
+      || ! git -C "$install_dir" checkout --detach "$sha"; then
+      rm -f "$installer"
+      log "Hermes bundle checkout failed"
+      return 1
+    fi
   fi
   if bash "$installer" --dir "$install_dir" --hermes-home "$HERMES_HOME" \
        --commit "$sha" --skip-setup --non-interactive "${args[@]}"; then

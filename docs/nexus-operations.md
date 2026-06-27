@@ -32,6 +32,8 @@ HERMES_GIT_BUNDLE="artifacts/hermes-eventide.bundle"
 
 The host and guest validate the bundle, the official installer rebuilds the
 checkout and venv for Linux x86_64, and provisioning verifies the final HEAD.
+The bundle must be self-contained: incremental bundles that depend on external
+prerequisite objects are intentionally unsupported for offline reproducibility.
 The checked-in default remains the known official SHA in `box.env`.
 
 ## 2. Install boot, health, and backup supervision

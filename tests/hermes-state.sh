@@ -128,6 +128,15 @@ grep -q keep "$tmp/home/.honcho/keep"
 [[ "$(stat -c '%a' "$tmp/home/.honcho/.env" 2>/dev/null || stat -f '%Lp' "$tmp/home/.honcho/.env")" == 600 ]]
 jq -e '.external_state_imported == true' "$tmp/external-result.json" >/dev/null
 
+# Explicit --home anchors approved provider state beside that Hermes home,
+# independent of the process HOME used for manifest defaults.
+custom_target="$tmp/custom-agent/.hermes"
+HOME="$tmp/unrelated-process-home" "$ROOT/guest/hermes-state" import-zip "$tmp/valid.zip" \
+  --home "$custom_target" --manifest "$tmp/custom-manifest.json" \
+  --external .honcho --map /Users/davis=/srv/custom-agent >/dev/null
+grep -q '/srv/custom-agent' "$tmp/custom-agent/.honcho/.env"
+[[ ! -e "$tmp/unrelated-process-home/.honcho" ]]
+
 # A reader holding an older WAL snapshot must make checkpoint verification fail.
 wal_home="$tmp/wal-home"
 mkdir -p "$wal_home"

@@ -161,7 +161,7 @@ gateway_disable() {
 verify_state() { hermes-state verify "$@"; }
 
 acknowledge_active_paths() {
-  hermes-state acknowledge-paths >/dev/null
+  hermes-state acknowledge-paths >/dev/null || return 1
   echo "active import paths acknowledged"
 }
 

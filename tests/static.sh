@@ -50,6 +50,15 @@ grep -q 'runuser -u agent.*hb.*write-manifest' provision/provision.sh
 grep -q -- '--commit.*sha' provision/provision.sh
 grep -q 'HERMES_INSTALLER_SHA256="[0-9a-f]\{64\}"' box.env
 grep -q 'sha256sum --check --status' provision/provision.sh
+python3 - <<'PY'
+from pathlib import Path
+
+source = Path("provision/provision.sh").read_text()
+checksum = source.index('sha256sum --check --status')
+destructive_checkout = source.index('rm -rf "$install_dir"')
+if checksum >= destructive_checkout:
+    raise SystemExit("Hermes checkout is modified before installer verification")
+PY
 if grep -q 'curl .*install.sh.*|.*bash' provision/provision.sh; then
   echo "unverified Hermes installer execution remains" >&2
   exit 1
@@ -72,7 +81,7 @@ if grep -q '^Requires=tx9-box@' ops/systemd/tx9-*.service; then
 fi
 grep -q '^Type=simple$' ops/systemd/tx9-box@.service
 grep -q 'tx9-host supervise %i' ops/systemd/tx9-box@.service
-grep -Fq 'ExecStop=/bin/kill -TERM $MAINPID' ops/systemd/tx9-box@.service
+grep -Fq 'ExecStop=-/bin/kill -TERM $MAINPID' ops/systemd/tx9-box@.service
 if grep -q '^RemainAfterExit=' ops/systemd/tx9-box@.service; then
   echo "box supervisor is still modeled as a oneshot service" >&2
   exit 1
@@ -83,6 +92,9 @@ if grep -q 'chown -R' guest/hb; then
 fi
 grep -q 'EXECUTOR_TARGET_PORT="${EXECUTOR_PORT:-4788}"' guest/hb-workload
 grep -q 'TCP:127.0.0.1:$EXECUTOR_TARGET_PORT' guest/hb-workload
+grep -q '_wait_api_ready' guest/hb-workload
+grep -q '\[ ! -e "$GATEWAY_DISABLED" \]' guest/hb-workload
+grep -q '\[ "$reconciled" = 1 \]' guest/hb-workload
 grep -qi 'networking is always enabled' README.md
 grep -q 'intentionally no CI configuration yet' README.md
 
