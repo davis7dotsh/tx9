@@ -9,6 +9,7 @@ AGENT_HOME="$DATA/home/agent"
 LOGS="$DATA/logs"
 STATE_DIR="$AGENT_HOME/.config/hermes-box"
 QUIESCE_FILE="$STATE_DIR/quiesced"
+LEGACY_QUIESCE_FILE="${HB_LEGACY_QUIESCE_FILE:-/tmp/hermes-box-executor-paused}"
 GATEWAY_DISABLED="$STATE_DIR/gateway-disabled"
 GATEWAY_POLICY="$STATE_DIR/gateway-policy-initialized"
 GATEWAY_PID="$STATE_DIR/gateway.pid"
@@ -25,6 +26,10 @@ init() {
   )
   mkdir -p "${managed[@]}"
   id agent >/dev/null 2>&1 && chown agent:agent "${managed[@]}" 2>/dev/null || true
+  if [[ -e "$LEGACY_QUIESCE_FILE" ]]; then
+    touch "$QUIESCE_FILE" || return 1
+    rm -f "$LEGACY_QUIESCE_FILE" || return 1
+  fi
   if [[ ! -e "$GATEWAY_POLICY" ]]; then
     touch "$GATEWAY_DISABLED" "$GATEWAY_POLICY"
   fi
@@ -34,6 +39,8 @@ _port_open() {
   (exec 3<>"/dev/tcp/127.0.0.1/${EXECUTOR_PORT:-4788}") 2>/dev/null && { exec 3>&-; return 0; }
   return 1
 }
+
+_port_closed() { ! _port_open; }
 
 _wait_port() {
   local expected="$1" attempt
@@ -133,6 +140,7 @@ resume() {
 
 down() { pause; }
 is_paused() { [[ -e "$QUIESCE_FILE" ]]; }
+gateway_is_disabled() { [[ -e "$GATEWAY_DISABLED" ]]; }
 
 gateway_enable() {
   local flag="${1:-}" phrase="${2:-}"
@@ -388,7 +396,7 @@ doctor() {
   if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then
     _check "executor installed" _command_exists executor || failed=1
     if [[ -e "$QUIESCE_FILE" ]]; then
-      printf 'ok   Executor intentionally quiesced\n'
+      _check "Executor target port closed while quiesced" _port_closed || failed=1
     else
       _check "executor listening" _port_open || failed=1
       _check "executor MCP bearer accepted" _mcp_auth_works || failed=1
@@ -424,6 +432,7 @@ main() {
     down | pause) pause ;;
     resume) resume ;;
     is-paused) is_paused ;;
+    gateway-is-disabled) gateway_is_disabled ;;
     gateway-enable) shift; gateway_enable "$@" ;;
     gateway-disable) gateway_disable ;;
     verify-state) shift; verify_state "$@" ;;

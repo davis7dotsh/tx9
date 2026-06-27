@@ -861,7 +861,7 @@ _open_url() {
 }
 
 cmd_doctor() {
-  local n="${1:?usage: box doctor <name>}" port api_port token guest_quiesced=0
+  local n="${1:?usage: box doctor <name>}" port api_port token guest_quiesced=0 gateway_disabled=0
   _validate_name "$n"
   _host_preflight basic
   _acquire_lock "$n"
@@ -869,6 +869,9 @@ cmd_doctor() {
   api_port="$(_reg_api_port "$n")"
   _machine_exists "$n" || die "smolvm machine '$n' is missing"
   _guest_hb "$n" is-paused >/dev/null 2>&1 && guest_quiesced=1
+  if [[ -n "$api_port" && "$guest_quiesced" == 0 ]]; then
+    _guest_hb "$n" gateway-is-disabled >/dev/null 2>&1 && gateway_disabled=1
+  fi
   _guest_hb "$n" doctor || die "guest readiness or health check failed for '$n' (doctor never starts or resumes a box)"
   if [[ -n "$port" && "$guest_quiesced" == 0 ]]; then
     _host_preflight health
@@ -882,12 +885,14 @@ cmd_doctor() {
   else
     say "host Executor MCP: skipped (no exposed host port)"
   fi
-  if [[ -n "$api_port" && "$guest_quiesced" == 0 ]]; then
+  if [[ -n "$api_port" && "$guest_quiesced" == 0 && "$gateway_disabled" == 0 ]]; then
     _host_preflight health
     _hermes_api_healthy "$api_port" || die "host Hermes API health failed on port $api_port (expected 2xx Hermes JSON)"
     say "host Hermes API: healthy on http://localhost:${api_port}"
   elif [[ "$guest_quiesced" == 1 ]]; then
     say "host Hermes API: intentionally quiesced"
+  elif [[ "$gateway_disabled" == 1 ]]; then
+    say "host Hermes API: intentionally disabled by gateway policy"
   else
     say "host Hermes API: skipped (disabled)"
   fi

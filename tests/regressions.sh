@@ -196,6 +196,7 @@ PY
   HERMES_BRIDGE_PORT=8650
   LOGS="$tmp/workload-logs"
   BOX_ENV="$tmp/workload-box.env"
+  LEGACY_QUIESCE_FILE="$tmp/workload-legacy-paused"
   printf 'EXECUTOR_PORT=4788\nHERMES_API_PORT=8642\n' >"$BOX_ENV"
   pgrep() { return 1; }
   pkill() { printf 'stopped %s\n' "$*" >>"$tmp/api-bridge.events"; }
@@ -231,6 +232,13 @@ PY
   executor_stops_before="$(grep -c 'stopped.*TCP-LISTEN:4799,' "$tmp/api-bridge.events")"
   api_stops_before="$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")"
   touch "$QUIESCE_FILE"
+  reconcile_once
+  [[ "$(grep -c 'stopped.*TCP-LISTEN:4799,' "$tmp/api-bridge.events")" -gt "$executor_stops_before" ]]
+  [[ "$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")" -gt "$api_stops_before" ]]
+  rm -f "$QUIESCE_FILE"
+  executor_stops_before="$(grep -c 'stopped.*TCP-LISTEN:4799,' "$tmp/api-bridge.events")"
+  api_stops_before="$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")"
+  touch "$LEGACY_QUIESCE_FILE"
   reconcile_once
   [[ "$(grep -c 'stopped.*TCP-LISTEN:4799,' "$tmp/api-bridge.events")" -gt "$executor_stops_before" ]]
   [[ "$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")" -gt "$api_stops_before" ]]
@@ -352,10 +360,45 @@ HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" gateway-enable \
   _check() {
     local label="$1"
     shift
-    if [[ "$label" == 'Codex HTTP MCP config' ]]; then "$@"; else return 0; fi
+    if [[ "$label" == 'Codex HTTP MCP config' ]]; then
+      touch "$tmp/codex-doctor-check-ran"
+      "$@"
+    else
+      return 0
+    fi
   }
   INSTALL_HERMES=0 INSTALL_EXECUTOR=0 WIRE_EXECUTOR_MCP=1 EXECUTOR_PORT=5999 doctor >/dev/null
+  [[ -e "$tmp/codex-doctor-check-ran" ]]
 )
+
+# Quiesced doctor requires the Executor target to be closed, not just marked.
+(
+  HB_DATA="$tmp/quiesced-doctor-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  mkdir -p "$STATE_DIR"
+  touch "$QUIESCE_FILE"
+  _check() {
+    local label="$1"
+    shift
+    if [[ "$label" == 'Executor target port closed while quiesced' ]]; then "$@"; else return 0; fi
+  }
+  _port_open() { return 1; }
+  INSTALL_HERMES=0 INSTALL_EXECUTOR=1 WIRE_EXECUTOR_MCP=0 doctor >/dev/null
+  _port_open() { return 0; }
+  if INSTALL_HERMES=0 INSTALL_EXECUTOR=1 WIRE_EXECUTOR_MCP=0 doctor >/dev/null 2>&1; then
+    echo "quiesced doctor accepted a listening Executor target" >&2
+    exit 1
+  fi
+)
+
+# Rolling upgrades migrate the legacy pause marker durably before removing it.
+legacy_pause="$tmp/legacy-executor-paused"
+legacy_data="$tmp/legacy-pause-data"
+touch "$legacy_pause"
+HB_DATA="$legacy_data" HB_LEGACY_QUIESCE_FILE="$legacy_pause" "$PROJECT_ROOT/guest/hb" init
+[[ -e "$legacy_data/home/agent/.config/hermes-box/quiesced" ]]
+[[ ! -e "$legacy_pause" ]]
 
 # Explicit MCP wiring refuses to clear durable quiesce.
 wire_quiesced="$tmp/wire-quiesced"
@@ -392,12 +435,14 @@ fi
   (
     doctor_calls="$tmp/doctor.calls"
     mock_quiesced=0
+    mock_gateway_disabled=0
     have() { [[ "$1" == awk || "$1" == smolvm ]]; }
     _acquire_lock() { :; }
     _machine_exists() { :; }
     _guest_hb() {
       printf '%s\n' "$2" >>"$doctor_calls"
       if [[ "$2" == is-paused ]]; then [[ "$mock_quiesced" == 1 ]]; return; fi
+      if [[ "$2" == gateway-is-disabled ]]; then [[ "$mock_gateway_disabled" == 1 ]]; return; fi
       [[ "$2" != executor-token ]] || printf 'fixture-token\n'
     }
     mcp_attempts=0
@@ -429,6 +474,22 @@ fi
     cmd_doctor doctor-host >/dev/null
     [[ "$(cat "$doctor_calls")" == $'is-paused\ndoctor' ]]
     mock_quiesced=0
+
+    : >"$doctor_calls"
+    printf 'api-host\t\t8650\t8650\n' >"$REG"
+    _hermes_api_healthy() { printf 'host-api\n' >>"$doctor_calls"; }
+    api_output="$(cmd_doctor api-host)"
+    grep -q 'host Hermes API: healthy' <<<"$api_output"
+    [[ "$(cat "$doctor_calls")" == $'is-paused\ngateway-is-disabled\ndoctor\nhost-api' ]]
+
+    : >"$doctor_calls"
+    mock_gateway_disabled=1
+    _hermes_api_healthy() { touch "$tmp/disabled-api-probed"; return 1; }
+    api_output="$(cmd_doctor api-host)"
+    grep -q 'host Hermes API: intentionally disabled by gateway policy' <<<"$api_output"
+    [[ "$(cat "$doctor_calls")" == $'is-paused\ngateway-is-disabled\ndoctor' ]]
+    [[ ! -e "$tmp/disabled-api-probed" ]]
+    mock_gateway_disabled=0
 
     : >"$doctor_calls"
     : >"$REG"

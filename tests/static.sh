@@ -116,6 +116,9 @@ grep -q '\[ "$reconciled" = 1 \]' guest/hb-workload
 grep -q '_refresh_targets' guest/hb-workload
 grep -q '\. "$BOX_ENV"' guest/hb-workload
 grep -q '_stop_executor_bridge' guest/hb-workload
+grep -q 'LEGACY_QUIESCE_FILE' guest/hb guest/hb-workload
+grep -q 'Executor target port closed while quiesced' guest/hb
+grep -q 'gateway-is-disabled' guest/hb box
 grep -q 'EXECUTOR_PORT:-4788.*mcp' guest/hb
 grep -q 'guest_tmp="/data/home/agent/.config/hermes-box/import-' box
 if grep -q 'guest_tmp="/root/hermes-import-' box; then
