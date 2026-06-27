@@ -238,10 +238,27 @@ PY
   rm -f "$QUIESCE_FILE"
   executor_stops_before="$(grep -c 'stopped.*TCP-LISTEN:4799,' "$tmp/api-bridge.events")"
   api_stops_before="$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")"
+  hb() { touch "$tmp/legacy-workload-reconciled"; return 0; }
   touch "$LEGACY_QUIESCE_FILE"
   reconcile_once
+  [[ -e "$QUIESCE_FILE" ]]
+  [[ ! -e "$LEGACY_QUIESCE_FILE" ]]
+  [[ ! -e "$tmp/legacy-workload-reconciled" ]]
   [[ "$(grep -c 'stopped.*TCP-LISTEN:4799,' "$tmp/api-bridge.events")" -gt "$executor_stops_before" ]]
   [[ "$(grep -c 'stopped.*TCP-LISTEN:8650,' "$tmp/api-bridge.events")" -gt "$api_stops_before" ]]
+
+  migration_failure="$tmp/workload-migration-failure"
+  mkdir -p "$migration_failure"
+  chmod 0500 "$migration_failure"
+  QUIESCE_FILE="$migration_failure/state/quiesced"
+  LEGACY_QUIESCE_FILE="$tmp/workload-legacy-failure"
+  rm -f "$tmp/legacy-workload-reconciled"
+  touch "$LEGACY_QUIESCE_FILE"
+  reconcile_once 2>/dev/null
+  [[ ! -e "$QUIESCE_FILE" ]]
+  [[ -e "$LEGACY_QUIESCE_FILE" ]]
+  [[ ! -e "$tmp/legacy-workload-reconciled" ]]
+  chmod 0700 "$migration_failure"
 )
 
 # Active-path acknowledgement reports success only when persistence succeeds.

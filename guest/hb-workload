@@ -43,6 +43,14 @@ _stop_api_bridge() { [ "$HERMES_BRIDGE_PORT" = 0 ] || _stop_bridge "$HERMES_BRID
 
 _stop_executor_bridge() { [ "$PORT" = 4788 ] || _stop_bridge "$PORT"; }
 
+_migrate_legacy_quiesce() {
+  [ -e "$LEGACY_QUIESCE_FILE" ] || return 0
+  mkdir -p "$(dirname "$QUIESCE_FILE")" || return 1
+  chmod 0700 "$(dirname "$QUIESCE_FILE")" || return 1
+  touch "$QUIESCE_FILE" || return 1
+  rm -f "$LEGACY_QUIESCE_FILE"
+}
+
 _refresh_targets() {
   local previous_executor="$EXECUTOR_TARGET_PORT" previous_api="$HERMES_TARGET_PORT"
   EXECUTOR_PORT=4788
@@ -59,6 +67,11 @@ _refresh_targets() {
 reconcile_once() {
   local reconciled=0
   _refresh_targets
+  if [ -e "$LEGACY_QUIESCE_FILE" ] && ! _migrate_legacy_quiesce; then
+    _stop_executor_bridge
+    _stop_api_bridge
+    return
+  fi
   if [ -e "$QUIESCE_FILE" ] || [ -e "$LEGACY_QUIESCE_FILE" ]; then
     _stop_executor_bridge
     _stop_api_bridge
