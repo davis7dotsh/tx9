@@ -47,6 +47,12 @@ FAT_MACHO_MAGICS = {
     b"\xca\xfe\xba\xbf": (">", 32),
     b"\xbf\xba\xfe\xca": ("<", 32),
 }
+FAT_MACHO_CPU_TYPES = {
+    7, 12, 18,  # i386, arm, ppc
+    0x01000007, 0x0100000C, 0x01000012,  # x86_64, arm64, ppc64
+    0x0200000C,  # arm64_32
+}
+MACHO_SLICE_HEADER_PROBE_LIMIT = 1024 * 1024
 MIGRATION_POLICY = {
     "version": 1,
     "root_transient_paths": ["tmp/"],
@@ -113,16 +119,9 @@ def validate_zip(path: Path) -> dict[str, object]:
         entries = _classify_entries(zf, prefix, files)
         _require_importable_marker(entries)
         external = sorted({
-            PurePosixPath(
-                info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
-            ).parts[1]
-            for info in files
-            if len(PurePosixPath(
-                info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
-            ).parts) > 1
-            and PurePosixPath(
-                info.filename[len(prefix):] if prefix and info.filename.startswith(prefix) else info.filename
-            ).parts[0] == "_external"
+            rel.parts[1]
+            for _info, rel, external_entry, reason in entries
+            if external_entry and reason is None and len(rel.parts) > 1
         })
         return {
             "archive": str(path),
@@ -184,14 +183,24 @@ def _is_mach_o(zf: zipfile.ZipFile, info: zipfile.ZipInfo) -> bool:
                     f"{endian}IIQQII", architecture
                 )
             if (
-                slice_size < 8
+                cpu_type not in FAT_MACHO_CPU_TYPES
+                or slice_size < 8
                 or slice_offset < data_start
                 or slice_offset + slice_size > info.file_size
                 or alignment > 63
             ):
                 return False
             slices.append((slice_offset, slice_size, cpu_type))
+        slices.sort()
+        previous_end = data_start
+        for slice_offset, slice_size, _cpu_type in slices:
+            if slice_offset < previous_end:
+                return False
+            previous_end = slice_offset + slice_size
+        probe_limit = min(info.file_size, MACHO_SLICE_HEADER_PROBE_LIMIT)
         for slice_offset, _slice_size, cpu_type in slices:
+            if slice_offset + 8 > probe_limit:
+                break
             source.seek(slice_offset)
             slice_header = source.read(8)
             thin_endian = THIN_MACHO_MAGICS.get(slice_header[:4])
@@ -661,12 +670,20 @@ def cutover_check(manifest: Path, home: Path) -> dict[str, object]:
     if not isinstance(accounting, dict):
         accounting = {}
     manifest_format = data.get("format", 1)
+    has_v2_scope = "migration_policy" in data or any(
+        field in accounting
+        for field in (
+            "archive_bytes", "hermes_bytes", "external_bytes", "skipped_bytes",
+            "normalized_files", "normalized_bytes", "skipped_entries",
+            "skipped_by_reason",
+        )
+    )
     # Format 1 predates normalized byte/path accounting. Keep its established
     # archive-accounted gate while requiring the stronger invariant for v2+.
     migration_scope_accounted = (
         type(manifest_format) is int
         and (
-            manifest_format < 2
+            (manifest_format < 2 and not has_v2_scope)
             or _format2_scope_accounted(accounting)
         )
     )

@@ -52,6 +52,9 @@ with zipfile.ZipFile(root / "valid-no-external.zip", "w") as zf:
 with zipfile.ZipFile(root / "reserved-external.zip", "w") as zf:
     zf.writestr("config.yaml", "model: fixture\n")
     zf.writestr("_external/.ssh/config", "Host *\n")
+with zipfile.ZipFile(root / "skipped-external.zip", "w") as zf:
+    zf.writestr("config.yaml", "model: fixture\n")
+    zf.writestr("_external/.ghost/provider-tool", fat_mach_o)
 with zipfile.ZipFile(root / "external-only.zip", "w") as zf:
     zf.writestr("_external/.honcho/.env", "TOKEN=fixture\n")
 with zipfile.ZipFile(root / "traversal.zip", "w") as zf:
@@ -92,6 +95,16 @@ jq -e '.migration_scope.skipped_entries == [
   {"bytes": 30, "path": "bin/eventide-tool", "reason": "mach_o_binary"},
   {"bytes": 15, "path": "tmp/transient.log", "reason": "root_tmp"}
 ]' "$tmp/external-validation.json" >/dev/null
+"$ROOT/guest/hermes-state" validate-zip "$tmp/skipped-external.zip" >"$tmp/skipped-external-validation.json"
+jq -e '.external_top_level_entries == [] and .migration_scope.skipped_by_reason == {"mach_o_binary": 1}' \
+  "$tmp/skipped-external-validation.json" >/dev/null
+HOME="$tmp/skipped-external-home" "$ROOT/guest/hermes-state" import-zip "$tmp/skipped-external.zip" \
+  --home "$tmp/skipped-external-home/.hermes" >"$tmp/skipped-external-result.json" \
+  2>"$tmp/skipped-external-warning"
+grep -q 'warning: import completed with 1 intentionally skipped file(s)' "$tmp/skipped-external-warning"
+[[ ! -e "$tmp/skipped-external-home/.ghost" ]]
+jq -e '.external_state_imported == false and .external_approved == []' \
+  "$tmp/skipped-external-result.json" >/dev/null
 if "$ROOT/guest/hermes-state" validate-zip "$tmp/traversal.zip" >/dev/null 2>&1; then
   echo "path traversal ZIP passed validation" >&2; exit 1
 fi
@@ -225,6 +238,12 @@ jq '.accounting.hermes_bytes = 0 | .accounting.external_bytes = 0' \
 if HOME="$tmp/home" "$ROOT/guest/hermes-state" cutover-check \
   --manifest "$tmp/tampered-v2-categories.json" >/dev/null 2>&1; then
   echo "cutover passed a format-2 manifest with zeroed category bytes" >&2; exit 1
+fi
+jq '.format = 1 | del(.accounting.skipped_entries[0])' \
+  "$tmp/home/.config/hermes-box/import-manifest.json" >"$tmp/tampered-v2-downgrade.json"
+if HOME="$tmp/home" "$ROOT/guest/hermes-state" cutover-check \
+  --manifest "$tmp/tampered-v2-downgrade.json" >/dev/null 2>&1; then
+  echo "cutover passed a downgraded format-2 manifest with incomplete migration accounting" >&2; exit 1
 fi
 jq 'del(
   .status,
