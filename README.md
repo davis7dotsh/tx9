@@ -177,8 +177,20 @@ SHA and rebuilt for the guest architecture. Ubuntu, Claude, Codex, and Executor
 packages can still drift; the runtime manifest records their versions.
 
 Native `hermes backup` imports add ZIP traversal/symlink validation, staging and
-atomic swap, SQLite integrity and inventory baselines, and active-file-only path
+duplicate normalized-path rejection, atomic swap, SQLite integrity and inventory
+baselines, and active-file-only path
 rewrites. Historical sessions, memories, databases, and logs are not rewritten.
+Validation also requires an importable canonical root Hermes marker after all
+skip rules, so a transient-only archive cannot replace existing state with an
+empty home.
+The source ZIP is opened read-only and remains unchanged. Root-level
+`~/.hermes/tmp` content and otherwise importable files with thin Mach-O magic or
+a structurally valid universal Mach-O header are deterministically skipped
+before staging, including beneath approved external provider trees. The fat
+header validation distinguishes the shared `CAFEBABE` prefix from portable Java
+class files. A successful import with exclusions emits a warning and records
+exact skipped paths, byte counts, reasons, and normalized file/byte totals in
+the import manifest; it does not silently treat macOS binaries as portable.
 External provider state is previewed and rejected unless the operator explicitly
 approves every safe top-level destination with repeatable `--external NAME`
 flags; reserved destinations such as `.ssh`, `.config`, and shell startup files

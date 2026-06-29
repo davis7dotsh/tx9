@@ -776,7 +776,7 @@ cmd_load() {
 cmd_import_hermes() {
   local n="${1:?usage: box import-hermes <name> <hermes-backup.zip> [--external NAME]... [--map OLD=NEW]...}"
   local file="${2:?usage: box import-hermes <name> <hermes-backup.zip> [--external NAME]... [--map OLD=NEW]...}"
-  local guest_tmp map external already_paused=0 was_running=0 validation external_count archive_external
+  local guest_tmp map external already_paused=0 was_running=0 validation external_count archive_external planned_skips
   shift 2
   _validate_name "$n"
   [[ -f "$file" ]] || die "no such Hermes backup: $file"
@@ -811,6 +811,11 @@ cmd_import_hermes() {
   done
   validation="$(python3 "$ROOT/guest/hermes-state" validate-zip "$file")" || die "Hermes backup is invalid or unsafe"
   external_count="$(jq '.external_top_level_entries | length' <<<"$validation")"
+  planned_skips="$(jq '.migration_scope.skipped_files' <<<"$validation")"
+  if [[ "$planned_skips" != 0 ]]; then
+    warn "Native import will intentionally skip ${planned_skips} non-portable or transient file(s):"
+    jq -r '.migration_scope.skipped_by_reason | to_entries[] | "  \(.key): \(.value)"' <<<"$validation" >&2
+  fi
   if [[ "$external_count" != 0 ]]; then
     say "External provider destinations in archive:"
     jq -r '.external_top_level_entries[] | "  /data/home/agent/" + .' <<<"$validation"
@@ -863,7 +868,7 @@ cmd_import_hermes() {
     smolvm machine stop --name "$n"
     _clear_stop_after "$n"
   fi
-  say "Hermes import verified. Gateway remains disabled; inspect active paths, acknowledge them, then run the cutover gates."
+  say "Hermes import verified. Gateway remains disabled; intentional exclusions are recorded in the import manifest. Inspect active paths, acknowledge them, then run the cutover gates."
 }
 
 cmd_extract() {

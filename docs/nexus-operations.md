@@ -92,7 +92,8 @@ On Nexus:
 # Skip this line if the custom-runtime steps above already created the box.
 sudo -u tx9 /opt/tx9/box new hermes
 sudo -u tx9 python3 /opt/tx9/guest/hermes-state validate-zip \
-  /var/lib/tx9/hermes-backup.zip | jq '.external_top_level_entries'
+  /var/lib/tx9/hermes-backup.zip | \
+  jq '{external_top_level_entries, migration_scope}'
 sudo -u tx9 /opt/tx9/box import-hermes hermes /var/lib/tx9/hermes-backup.zip \
   --external .honcho \
   --map /Users/davis=/data/home/agent
@@ -105,11 +106,22 @@ provider. Import rejects any unapproved name and always rejects `.ssh`, broad
 `.config` or `workspace`, and shell startup files. Do not approve a name merely
 to make the command pass; confirm it belongs to the Eventide memory provider.
 
-Import validates all ZIP paths and rejects symlinks before guest mutation. It
+Import validates all ZIP paths and rejects symlinks and duplicate normalized
+member paths before guest mutation. After applying portability skips, it also
+requires an importable canonical root Hermes marker; a transient-only archive
+cannot replace existing state with an empty home. It
 extracts to a sibling staging directory, verifies every SQLite database, applies
 longest-first path rewrites only to active config, env, cron, hook, and script
 files, then atomically swaps `~/.hermes`. Historical sessions, memories,
-databases, and logs are never rewritten. The source ZIP is read-only.
+databases, and logs are never rewritten. The source ZIP is read-only and remains
+unchanged. Import deterministically skips root-level `~/.hermes/tmp` and any
+otherwise importable file with thin Mach-O magic or a structurally valid
+universal Mach-O header, even inside an approved external provider tree. Fat
+header parsing distinguishes the shared `CAFEBABE` prefix from Java class files.
+This skip contract keeps the native backup usable without
+landing Eventide binaries on Linux. Preflight and successful import warn when
+entries are excluded; the manifest's `accounting` object records exact paths,
+sizes, reasons, and normalized file/byte totals for inventory comparison.
 
 Review inside the box:
 
