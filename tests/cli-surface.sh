@@ -11,7 +11,8 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 # --- box ls (empty registry) -------------------------------------------
 ls_empty_repo="$tmp/ls-empty-repo"
 make_repo "$ls_empty_repo"
-out="$("$ls_empty_repo/box" ls)"
+out="$(PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$tmp/ls-empty.calls" \
+  SMOLVM_STATE_DIR="$tmp/ls-empty-state" "$ls_empty_repo/box" ls)"
 [[ "$out" == "No hermes-box-lite boxes yet. Create one: ./box new <name>" ]]
 
 # --- box ls (populated registry: one running, one missing from smolvm) -
