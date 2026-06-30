@@ -399,6 +399,7 @@ def _extract(
     # preview may refer to an archive replaced before import reopened it.
     _require_importable_marker(entries)
     accounting = _accounting(entries)
+    total_written = 0
     for info, rel, external, reason in entries:
         if reason is not None:
             continue
@@ -409,8 +410,22 @@ def _extract(
         else:
             target = stage.joinpath(*rel.parts)
         target.parent.mkdir(parents=True, exist_ok=True)
+        # Track actual decompressed bytes rather than trusting info.file_size
+        # (attacker-controlled central-directory metadata, gated only on the
+        # *declared* total in _zip_layout) — a crafted stream can produce far
+        # more output than it declares.
         with zf.open(info) as source, target.open("wb") as destination:
-            shutil.copyfileobj(source, destination, length=1024 * 1024)
+            while True:
+                chunk = source.read(1024 * 1024)
+                if not chunk:
+                    break
+                total_written += len(chunk)
+                if total_written > MAX_UNCOMPRESSED:
+                    raise ValueError(
+                        f"archive expands beyond the 100 GiB safety limit "
+                        f"(actual bytes exceeded the declared total at {info.filename})"
+                    )
+                destination.write(chunk)
         secret = target.name in SECRET_NAMES or target.suffix.lower() in EXTERNAL_SECRET_SUFFIXES
         archived_mode = (info.external_attr >> 16) & 0o777
         executable_path = any(part in {"hooks", "scripts"} for part in rel.parts[:-1])

@@ -350,7 +350,7 @@ was actually provisioned with beyond the free-text `runtime-manifest`
    versions after the fact — keep that, but it's not a substitute for being
    able to *reproduce* a box; the pin is what makes `box new` deterministic.
 
-### P1-5: decompression-bomb gate trusts declared size, not actual bytes
+### P1-5: decompression-bomb gate trusts declared size, not actual bytes — DONE
 
 **File:** `guest/hermes-state:33` (`MAX_UNCOMPRESSED = 100 * 1024**3`),
 gate at `:85-87` inside `_zip_layout`, extraction at `:389-413` (`_extract`,
