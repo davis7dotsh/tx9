@@ -322,7 +322,7 @@ if ! _start_gateway; then
 fi
 ```
 
-### P1-4: agent tooling versions are unpinned
+### P1-4: agent tooling versions are unpinned — DONE
 
 **Files:** `provision/provision.sh:68-69` (`npm install -g @anthropic-ai/claude-code`),
 `:74-75` (`@openai/codex`), `:163-165` (`executor`) — none specify a version.

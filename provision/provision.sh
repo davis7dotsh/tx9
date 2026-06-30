@@ -68,15 +68,17 @@ install_node_uv() {
 }
 
 install_claude() {
-  log "claude-code"
-  "$NODE_PREFIX/bin/npm" install -g @anthropic-ai/claude-code >/dev/null 2>&1 \
-    || npm install -g @anthropic-ai/claude-code >/dev/null
+  local pkg="@anthropic-ai/claude-code${CLAUDE_CODE_VERSION:+@$CLAUDE_CODE_VERSION}"
+  log "claude-code${CLAUDE_CODE_VERSION:+ ($CLAUDE_CODE_VERSION)}"
+  "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
+    || npm install -g "$pkg" >/dev/null
 }
 
 install_codex() {
-  log "codex"
-  "$NODE_PREFIX/bin/npm" install -g @openai/codex >/dev/null 2>&1 \
-    || npm install -g @openai/codex >/dev/null
+  local pkg="@openai/codex${CODEX_VERSION:+@$CODEX_VERSION}"
+  log "codex${CODEX_VERSION:+ ($CODEX_VERSION)}"
+  "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
+    || npm install -g "$pkg" >/dev/null
 }
 
 install_hermes() {
@@ -182,9 +184,10 @@ install_executor() {
   if [[ "${INSTALL_EXECUTOR:-0}" != "1" ]]; then
     log "executor: INSTALL_EXECUTOR != 1 — skipping"; return
   fi
-  log "executor (npm global)"
-  if "$NODE_PREFIX/bin/npm" install -g executor >/dev/null 2>&1 \
-       || npm install -g executor >/dev/null 2>&1; then
+  local pkg="executor${EXECUTOR_VERSION:+@$EXECUTOR_VERSION}"
+  log "executor (npm global)${EXECUTOR_VERSION:+ ($EXECUTOR_VERSION)}"
+  if "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
+       || npm install -g "$pkg" >/dev/null 2>&1; then
     log "executor installed -> $("$NODE_PREFIX/bin/npm" prefix -g 2>/dev/null)/bin/executor"
   else
     log "executor install FAILED"
