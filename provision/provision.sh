@@ -89,6 +89,13 @@ install_hermes() {
   local installer_sha="${HERMES_INSTALLER_SHA256:-}" installer
   [[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]] || { log "invalid HERMES_GIT_SHA: $sha"; return 1; }
   [[ "$installer_sha" =~ ^[0-9a-fA-F]{64}$ ]] || { log "invalid HERMES_INSTALLER_SHA256"; return 1; }
+  # Idempotent: skip the multi-minute reinstall if hermes is already on PATH
+  # and already checked out at the pinned commit (the same bar verify_required
+  # holds it to). Lets `assets` repair mode call this safely on every run.
+  if command -v hermes >/dev/null 2>&1 && [[ "$(git -C "$install_dir" rev-parse HEAD 2>/dev/null)" == "$sha" ]]; then
+    log "hermes already installed at pinned $sha — skipping reinstall"
+    return 0
+  fi
   log "hermes (official installer pinned to $sha)"
   # We run as root and pass an explicit --dir below, which makes the installer
   # skip its own root/FHS auto-detection (resolve_install_layout() returns
@@ -184,6 +191,12 @@ install_executor() {
   if [[ "${INSTALL_EXECUTOR:-0}" != "1" ]]; then
     log "executor: INSTALL_EXECUTOR != 1 — skipping"; return
   fi
+  # Idempotent: skip reinstall if already on PATH. Lets `assets` repair mode
+  # call this safely on every run instead of only on a full reinstall.
+  if command -v executor >/dev/null 2>&1; then
+    log "executor already installed — skipping reinstall"
+    return 0
+  fi
   local pkg="executor${EXECUTOR_VERSION:+@$EXECUTOR_VERSION}"
   log "executor (npm global)${EXECUTOR_VERSION:+ ($EXECUTOR_VERSION)}"
   if "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
@@ -250,9 +263,12 @@ verify_required() {
 
 assets_only() {
   make_agent
+  install_hermes
+  install_executor
   install_config
   place_assets
   seed_data
+  verify_required
   runuser -u agent -- env HOME=/data/home/agent "$OPT/bin/hb" write-manifest
   log "managed assets refreshed"
 }

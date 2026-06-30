@@ -397,7 +397,7 @@ while True:
 
 ## P2 — repair/coverage gaps (code reading; no live repro needed beyond running the commands described)
 
-### P2-1: `box repair` (assets mode) can't heal a failed Hermes/Executor install
+### P2-1: `box repair` (assets mode) can't heal a failed Hermes/Executor install — DONE
 
 **Files:** `provision/provision.sh:220-227` (`assets_only`). Note `cmd_repair`
 (`box:994-1012`) always calls `_provision_into "$n" full`, never `assets` —
