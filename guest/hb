@@ -168,7 +168,7 @@ resume() {
 
 down() { pause; }
 is_paused() { [[ -e "$QUIESCE_FILE" ]]; }
-gateway_is_disabled() { [[ -e "$GATEWAY_DISABLED" ]]; }
+gateway_is_disabled() { [[ -e "$GATEWAY_DISABLED" ]] && ! _gateway_running; }
 
 gateway_enable() {
   local flag="${1:-}" phrase="${2:-}"
@@ -181,6 +181,7 @@ gateway_enable() {
   if [[ -r "$STATE_DIR/import-manifest.json" ]]; then cutover_ready || return 1; fi
   rm -f "$GATEWAY_DISABLED"
   if ! _start_gateway; then
+    _stop_gateway || true
     touch "$GATEWAY_DISABLED"
     return 1
   fi

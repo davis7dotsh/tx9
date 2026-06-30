@@ -283,7 +283,7 @@ process-1-exits-VM-stops semantics plus a *systemd inside the guest* unit —
 the latter is more in keeping with the project's existing host-side systemd
 pattern (`ops/systemd/`), but the cheap fix is the restart loop.
 
-### P1-3: `gateway_is_disabled()` checks a marker file, not process state
+### P1-3: `gateway_is_disabled()` checks a marker file, not process state — DONE
 
 **Files:** `guest/hb:143` (`gateway_is_disabled() { [[ -e "$GATEWAY_DISABLED" ]]; }`),
 consumed by `box:980-989` (`cmd_doctor`'s "host Hermes API: intentionally
