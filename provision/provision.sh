@@ -10,7 +10,11 @@ source "$CTX/box.env"
 OPT=/opt/hermes-box
 NODE_PREFIX="$OPT/tooling/node-global"
 UV_DIR="$OPT/tooling/uv"
-export PATH="$NODE_PREFIX/bin:$UV_DIR:$PATH"
+# $OPT/bin holds repo-owned tools (hb, hb-workload, hermes-state) plus the
+# hermes launcher symlink installed below — must be on PATH here too, not
+# just for the agent user (guest/profile.sh), so verify_required's
+# `command -v` checks see what a real shell would see.
+export PATH="$OPT/bin:$NODE_PREFIX/bin:$UV_DIR:$PATH"
 export DEBIAN_FRONTEND=noninteractive
 
 log() { printf '\033[35m[provision]\033[0m %s\n' "$*"; }
@@ -84,9 +88,14 @@ install_hermes() {
   [[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]] || { log "invalid HERMES_GIT_SHA: $sha"; return 1; }
   [[ "$installer_sha" =~ ^[0-9a-fA-F]{64}$ ]] || { log "invalid HERMES_INSTALLER_SHA256"; return 1; }
   log "hermes (official installer pinned to $sha)"
-  # We run as root, so the installer uses the FHS layout: code -> /usr/local/lib,
-  # binary -> /usr/local/bin/hermes (both baked into the golden). HERMES_HOME pins
-  # the durable state (auth, sessions, skills, memory) onto /data.
+  # We run as root and pass an explicit --dir below, which makes the installer
+  # skip its own root/FHS auto-detection (resolve_install_layout() returns
+  # early whenever --dir is explicit) and link the `hermes` command into
+  # $HOME/.local/bin instead of /usr/local/bin. $HOME is root's home here
+  # since this whole script runs as root. Code still lands at $install_dir
+  # (/usr/local/lib/hermes-agent) since that part of --dir is honored either
+  # way. HERMES_HOME pins the durable state (auth, sessions, skills, memory)
+  # onto /data. See the symlink step below that puts `hermes` on agent's PATH.
   export HERMES_HOME=/data/home/agent/.hermes
   mkdir -p "$HERMES_HOME"
   if [[ -n "$bundle" ]]; then
@@ -140,8 +149,21 @@ install_hermes() {
       git -C "$install_dir" remote set-url origin \
         "${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
     fi
+    # Put the launcher on PATH for both this script (root) and the agent user
+    # (guest/profile.sh puts $OPT/bin first). $HOME is root's home since this
+    # whole script runs as root; that's where an explicit --dir install links
+    # the command (see the comment above this function). Fall back to the
+    # FHS location in case a future installer version goes back to it.
+    if [[ -x "$HOME/.local/bin/hermes" ]]; then
+      ln -sf "$HOME/.local/bin/hermes" "$OPT/bin/hermes"
+    elif [[ -x /usr/local/bin/hermes ]]; then
+      ln -sf /usr/local/bin/hermes "$OPT/bin/hermes"
+    else
+      log "hermes install FAILED: launcher not found in \$HOME/.local/bin or /usr/local/bin"
+      return 1
+    fi
     own_hermes_home
-    log "hermes installed -> $(command -v hermes || echo '/usr/local/bin/hermes')"
+    log "hermes installed -> $(command -v hermes || echo "$OPT/bin/hermes")"
   else
     rm -f "$installer"
     log "hermes install FAILED"
@@ -210,10 +232,16 @@ verify_required() {
   for cmd in node uv nvim claude codex; do
     command -v "$cmd" >/dev/null 2>&1 || { log "missing required tool: $cmd"; return 1; }
   done
-  if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then command -v hermes >/dev/null 2>&1; fi
-  if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then command -v executor >/dev/null 2>&1; fi
   if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then
-    [[ "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" == "${HERMES_GIT_SHA}" ]]
+    command -v hermes >/dev/null 2>&1 || { log "missing required tool: hermes"; return 1; }
+  fi
+  if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then
+    command -v executor >/dev/null 2>&1 || { log "missing required tool: executor"; return 1; }
+  fi
+  if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then
+    [[ "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" == "${HERMES_GIT_SHA}" ]] || {
+      log "Hermes checkout HEAD does not match pinned HERMES_GIT_SHA"; return 1;
+    }
   fi
 }
 

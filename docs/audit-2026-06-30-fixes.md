@@ -51,7 +51,7 @@ curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sha256sum
 
 ---
 
-### P0-2: `verify_required` silently kills provisioning via `set -e` (verified live, root-caused)
+### P0-2: `verify_required` silently kills provisioning via `set -e` (verified live, root-caused) — DONE
 
 **Symptom:** Even after fixing P0-1, `./box new` still fails. The last
 provisioning line printed is `verifying required tools`, then nothing — no
