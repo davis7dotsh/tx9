@@ -17,7 +17,7 @@ exercise most of P1–P3 if `box new` doesn't produce a working box.
 
 ## P0 — `./box new` is broken on a clean checkout (verified live, twice)
 
-### P0-1: `HERMES_INSTALLER_SHA256` no longer matches upstream
+### P0-1: `HERMES_INSTALLER_SHA256` no longer matches upstream — DONE
 
 **Symptom:** `./box new <name>` fails immediately with `Hermes installer
 checksum verification failed`, right after provisioning prints
