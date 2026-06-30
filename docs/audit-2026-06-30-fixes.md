@@ -454,7 +454,7 @@ archive-path rejection (`box:378-380`'s `safe_text()`), and true per-box
    generator in `tests/lifecycle-smoke.sh`, which already covers eleven other
    cases there).
 
-### P2-3: no CI
+### P2-3: no CI — DONE
 
 **Files:** `README.md:228` and `tests/static.sh:129` both assert
 `"intentionally no CI configuration yet"` (the latter as a literal grep

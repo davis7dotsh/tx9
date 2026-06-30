@@ -127,6 +127,8 @@ if grep -q 'guest_tmp="/root/hermes-import-' box; then
   exit 1
 fi
 grep -qi 'networking is always enabled' README.md
-grep -q 'intentionally no CI configuration yet' README.md
+grep -q 'check.yml. runs it on every push' README.md
+[[ -f .github/workflows/check.yml ]]
+grep -q 'make check' .github/workflows/check.yml
 
 echo "static checks passed"
