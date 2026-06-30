@@ -101,4 +101,47 @@ printf 'no-newline-passphrase' >"$tmp/passphrase-no-newline"
   [[ "$_BOX_PASS" == no-newline-passphrase ]]
 )
 
+# tx9-backup-prune keeps the newest TX9_BACKUP_RETAIN_COUNT backups, applies
+# an optional TX9_BACKUP_RETAIN_DAYS cap on top, leaves a missing NAS
+# directory alone, never touches another box's backups, and validates input.
+prune_dir="$tmp/prune-backups"
+mkdir -p "$prune_dir"
+for day in 10 9 8 7 6 5 4 3 2 1; do
+  stamp="$(date -u -d "-${day} days" +%Y%m%d-%H%M%SZ)"
+  : >"$prune_dir/hermes-${stamp}.tar.gz.gpg"
+  : >"$prune_dir/hermes-${stamp}.tar.gz.gpg.sha256"
+done
+: >"$prune_dir/other-$(date -u -d '-1 days' +%Y%m%d-%H%M%SZ).tar.gz.gpg"
+: >"$prune_dir/other-$(date -u -d '-1 days' +%Y%m%d-%H%M%SZ).tar.gz.gpg.sha256"
+
+TX9_BACKUP_DIR="$prune_dir" TX9_BACKUP_RETAIN_COUNT=3 \
+  "$PROJECT_ROOT/ops/tx9-backup-prune" hermes >/dev/null
+[[ "$(find "$prune_dir" -maxdepth 1 -name 'hermes-*.tar.gz.gpg' | wc -l)" == 3 ]]
+[[ "$(find "$prune_dir" -maxdepth 1 -name 'other-*.tar.gz.gpg' | wc -l)" == 1 ]]
+# The 3 survivors are the 3 newest (days 1-3 back); each kept .tar.gz.gpg
+# still has its matching .sha256 companion.
+for day in 1 2 3; do
+  stamp="$(date -u -d "-${day} days" +%Y%m%d-%H%M%SZ)"
+  [[ -e "$prune_dir/hermes-${stamp}.tar.gz.gpg" ]]
+  [[ -e "$prune_dir/hermes-${stamp}.tar.gz.gpg.sha256" ]]
+done
+
+TX9_BACKUP_DIR="$prune_dir" TX9_BACKUP_RETAIN_COUNT=3 TX9_BACKUP_RETAIN_DAYS=2 \
+  "$PROJECT_ROOT/ops/tx9-backup-prune" hermes >/dev/null
+[[ "$(find "$prune_dir" -maxdepth 1 -name 'hermes-*.tar.gz.gpg' | wc -l)" == 2 ]]
+
+missing_nas="$tmp/missing-nas"
+TX9_BACKUP_DIR="$prune_dir" TX9_NAS_DIR="$missing_nas" TX9_BACKUP_RETAIN_COUNT=2 \
+  "$PROJECT_ROOT/ops/tx9-backup-prune" hermes >/dev/null
+[[ ! -e "$missing_nas" ]]
+
+if "$PROJECT_ROOT/ops/tx9-backup-prune" '../escape' >/dev/null 2>&1; then
+  echo "tx9-backup-prune accepted an unsafe box name" >&2
+  exit 1
+fi
+if TX9_BACKUP_RETAIN_COUNT=not-a-number "$PROJECT_ROOT/ops/tx9-backup-prune" hermes >/dev/null 2>&1; then
+  echo "tx9-backup-prune accepted a non-numeric retain count" >&2
+  exit 1
+fi
+
 echo "tx9-host regression checks passed"

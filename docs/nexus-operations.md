@@ -68,9 +68,25 @@ TX9_NAS_DIR=/mnt/davis-vault/tx9
 
 The verified local encrypted backup is published first. When `TX9_NAS_DIR` is
 set, replication then fails unless that path is an actual mountpoint; the local
-backup remains available. Configure the CIFS mount separately as a systemd
-automount and make it writable by `tx9`. Partial replication files are cleaned
-on failure. Retention policy is intentionally left to the Nexus operator.
+backup remains available. Partial replication files are cleaned on failure.
+
+`ops/systemd/mnt-davis\x2dvault-tx9.{mount,automount}` is a starting-point CIFS
+automount template matching the `/mnt/davis-vault/tx9` example above. If your
+NAS lives elsewhere, copy both files to a name matching your real mount path
+(`systemd-escape --suffix=mount --path /your/mount/point` tells you the exact
+filename systemd expects) and edit `What=` plus the credentials file path:
+
+```bash
+sudo install -m 0600 /path/to/local/cifs-credentials /etc/tx9/cifs-credentials
+sudo install -m 0644 'ops/systemd/mnt-davis\x2dvault-tx9.mount' \
+  'ops/systemd/mnt-davis\x2dvault-tx9.automount' /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now 'mnt-davis\x2dvault-tx9.automount'
+```
+
+This mounts on first access and unmounts after 10 minutes idle
+(`TimeoutIdleSec`). Make sure the resulting mountpoint is writable by `tx9`
+(the unit's `uid=tx9,gid=tx9` mount options already do this for CIFS).
 
 `tx9-backup@.service` runs with `ProtectSystem=strict`, which makes the whole
 filesystem read-only except the paths listed in its `ReadWritePaths=`
@@ -89,6 +105,34 @@ ReadWritePaths=/mnt/davis-vault/tx9
 
 Without this, replication fails closed with a permission error even though
 the mount itself is healthy — the local backup still succeeds either way.
+
+### Backup retention
+
+Without it, both `/var/backups/tx9` and any configured `TX9_NAS_DIR` grow
+unbounded forever — neither `box save` nor `tx9-backup@.service` ever delete
+anything on their own. `ops/tx9-backup-prune <box>` prunes both locations,
+keeping the newest `TX9_BACKUP_RETAIN_COUNT` backups (default 14) and,
+if `TX9_BACKUP_RETAIN_DAYS` is also set, additionally never keeping anything
+older than that many days even if it's within the count. Set either in the
+same per-box conf as `TX9_BACKUP_DIR`/`TX9_NAS_DIR`:
+
+```bash
+TX9_BACKUP_RETAIN_COUNT=14
+TX9_BACKUP_RETAIN_DAYS=90
+```
+
+Install and enable the scheduled prune the same way as the other units —
+`ops/systemd/tx9-backup-prune@.{service,timer}` is already in
+`ops/systemd/*`, so the `sudo install -m 0644 ops/systemd/* ...` step above
+already staged it:
+
+```bash
+sudo systemctl enable --now tx9-backup-prune@hermes.timer
+```
+
+It runs daily at 04:00 (plus jitter), after the 03:15 backup timer. A missing
+`TX9_NAS_DIR` (e.g. the automount hasn't mounted yet) is skipped, not treated
+as an error.
 
 ## 3. Stage a native Hermes backup
 

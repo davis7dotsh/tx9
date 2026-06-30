@@ -548,7 +548,7 @@ tx9-box@<name>.service` against a real or disposable box) since `ProtectSystem=s
 in particular can break things that aren't covered by `ReadWritePaths` — KVM
 device access (`/dev/kvm`) in particular needs verifying it isn't blocked.
 
-### P3-3: NAS automount and backup retention are documentation only
+### P3-3: NAS automount and backup retention are documentation only — DONE
 
 **File:** `docs/nexus-operations.md:69-73` describes both; nothing in
 `ops/` implements either (confirmed: no `.mount`/`.automount` unit, no

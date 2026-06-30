@@ -17,6 +17,7 @@ files=(
   guest/agent-bash-profile.sh
   provision/provision.sh
   ops/tx9-host
+  ops/tx9-backup-prune
   tests/lib.sh
   tests/lifecycle-smoke.sh
   tests/hermes-state.sh
@@ -26,7 +27,7 @@ files=(
 )
 
 bash -n "${files[@]}"
-for file in box guest/hb guest/hb-workload guest/hermes-state provision/provision.sh ops/tx9-host tests/lifecycle-smoke.sh tests/hermes-state.sh tests/cli-surface.sh "${regression_files[@]}" tests/fixtures/smolvm; do
+for file in box guest/hb guest/hb-workload guest/hermes-state provision/provision.sh ops/tx9-host ops/tx9-backup-prune tests/lifecycle-smoke.sh tests/hermes-state.sh tests/cli-surface.sh "${regression_files[@]}" tests/fixtures/smolvm; do
   [[ -x "$file" ]] || { echo "not executable: $file" >&2; exit 1; }
 done
 
