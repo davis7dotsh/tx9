@@ -564,7 +564,7 @@ pruning script or `tmpfiles.d` rule anywhere in the repo).
    the existing `ops/systemd/` naming convention. Without this, both
    `/var/backups/tx9` and any configured NAS target grow unbounded forever.
 
-### P3-4: README and `docs/usage-guide.html` duplicate content with no single source of truth
+### P3-4: README and `docs/usage-guide.html` duplicate content with no single source of truth — DONE
 
 **Files:** `README.md` (10,919 bytes) and `docs/usage-guide.html` — spot-checked
 and currently consistent with actual `box` behavior, but the same command
