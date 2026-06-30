@@ -72,6 +72,24 @@ backup remains available. Configure the CIFS mount separately as a systemd
 automount and make it writable by `tx9`. Partial replication files are cleaned
 on failure. Retention policy is intentionally left to the Nexus operator.
 
+`tx9-backup@.service` runs with `ProtectSystem=strict`, which makes the whole
+filesystem read-only except the paths listed in its `ReadWritePaths=`
+(`/opt/tx9 /var/backups/tx9 /var/lib/tx9 /etc/tx9` by default). If you set
+`TX9_NAS_DIR` to anything outside those paths, add it via a drop-in instead of
+editing the shipped unit:
+
+```bash
+sudo systemctl edit tx9-backup@hermes.service
+```
+
+```ini
+[Service]
+ReadWritePaths=/mnt/davis-vault/tx9
+```
+
+Without this, replication fails closed with a permission error even though
+the mount itself is healthy — the local backup still succeeds either way.
+
 ## 3. Stage a native Hermes backup
 
 On Eventide, leave the gateway live for the first rehearsal and create a native

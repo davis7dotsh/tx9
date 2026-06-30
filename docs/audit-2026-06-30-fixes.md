@@ -523,7 +523,7 @@ per `box:786-787`, so a non-empty default isn't structurally required), or
 move this specific value into `docs/nexus-operations.md`'s migration runbook
 (where it's already referenced) and out of the generic `box.env` template.
 
-### P3-2: no systemd hardening directives on any of the four host units
+### P3-2: no systemd hardening directives on any of the four host units — DONE
 
 **Files:** `ops/systemd/tx9-box@.service`, `tx9-health@.service`,
 `tx9-backup@.service` (all reviewed in full).
