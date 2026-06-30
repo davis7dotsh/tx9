@@ -392,6 +392,10 @@ while True:
         raise ValueError(f"archive member exceeds the uncompressed safety limit: {info.filename}")
     destination.write(chunk)
 ```
+(This snippet is illustrative only — `written` must accumulate across the
+*whole archive*, not reset per member, or a bomb split across many small
+entries evades the cap. The actual fix declares the counter once, before the
+per-entry loop in `_extract`, and names it `total_written` for that reason.)
 
 ---
 

@@ -165,6 +165,11 @@ install_hermes() {
     # FHS location in case a future installer version goes back to it.
     if [[ -x "$HOME/.local/bin/hermes" ]]; then
       ln -sf "$HOME/.local/bin/hermes" "$OPT/bin/hermes"
+      # agent must traverse $HOME (root's home) to dereference that symlink.
+      # The base image happens to ship root's home at 755 today, but don't
+      # depend on that staying true upstream — grant +x explicitly on just
+      # the path components the launcher needs.
+      chmod o+x "$HOME" "$HOME/.local" "$HOME/.local/bin"
     elif [[ -x /usr/local/bin/hermes ]]; then
       ln -sf /usr/local/bin/hermes "$OPT/bin/hermes"
     else
