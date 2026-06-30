@@ -475,7 +475,7 @@ run `make check` locally before merging.
    CI is added (which is by design — don't quietly delete that assertion;
    update what it asserts).
 
-### P2-4: `tests/regressions.sh` structure and shared-helper duplication
+### P2-4: `tests/regressions.sh` structure and shared-helper duplication — DONE
 
 **File:** `tests/regressions.sh` (1131 lines, ~10 unrelated concern areas in
 one flat file — host-preflight checks, `tx9-host` supervise/backup behavior,

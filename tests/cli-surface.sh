@@ -5,16 +5,8 @@
 # tests/lifecycle-smoke.sh, alongside the rest of the archive-safety suite).
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
-
-make_repo() {
-  local dest="$1"
-  mkdir -p "$dest/backups"
-  cp "$PROJECT_ROOT/box" "$PROJECT_ROOT/box.env" "$dest/"
-  cp -R "$PROJECT_ROOT/guest" "$PROJECT_ROOT/provision" "$dest/"
-}
+# shellcheck source=tests/lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 # --- box ls (empty registry) -------------------------------------------
 ls_empty_repo="$tmp/ls-empty-repo"

@@ -1,6 +1,8 @@
 .PHONY: check syntax lint test check-hermes-pin
 
-SHELL_FILES := box guest/hb guest/hb-workload guest/profile.sh guest/agent-bash-profile.sh provision/provision.sh ops/tx9-host tests/static.sh tests/lifecycle-smoke.sh tests/hermes-state.sh tests/regressions.sh tests/cli-surface.sh tests/fixtures/smolvm
+# tests/regressions-*.sh is globbed so new split-out regression files don't
+# require touching this Makefile.
+SHELL_FILES := box guest/hb guest/hb-workload guest/profile.sh guest/agent-bash-profile.sh provision/provision.sh ops/tx9-host tests/lib.sh tests/static.sh tests/lifecycle-smoke.sh tests/hermes-state.sh tests/cli-surface.sh $(wildcard tests/regressions-*.sh) tests/fixtures/smolvm
 
 syntax:
 	bash -n $(SHELL_FILES)
@@ -16,8 +18,8 @@ test:
 	./tests/static.sh
 	./tests/lifecycle-smoke.sh
 	./tests/hermes-state.sh
-	./tests/regressions.sh
 	./tests/cli-surface.sh
+	for f in tests/regressions-*.sh; do ./"$$f"; done
 
 check: syntax lint test
 

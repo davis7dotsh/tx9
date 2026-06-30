@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp="$(mktemp -d)"
-trap 'rm -rf "$tmp"' EXIT HUP INT TERM
+# shellcheck source=tests/lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
+ROOT="$PROJECT_ROOT"
 
 python3 - "$tmp" <<'PY'
 import json, sqlite3, stat, struct, sys, zipfile

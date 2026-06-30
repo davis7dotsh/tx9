@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp="$(mktemp -d)"
-cleanup() { rm -rf "$tmp"; }
-trap cleanup EXIT HUP INT TERM
+# shellcheck source=tests/lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 mkdir -p "$tmp/valid/home/agent/workspace" "$tmp/invalid/not-home" "$tmp/gnupg" "$tmp/host-tmp"
 chmod 0700 "$tmp/gnupg"
@@ -236,9 +234,7 @@ fi
 [[ ! -e "$sentinel" ]] || { echo "VM command ran before archive validation" >&2; exit 1; }
 [[ -z "$(find "$tmp/host-tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
-mkdir -p "$tmp/repo"
-cp "$PROJECT_ROOT/box" "$PROJECT_ROOT/box.env" "$tmp/repo/"
-cp -R "$PROJECT_ROOT/guest" "$PROJECT_ROOT/provision" "$tmp/repo/"
+make_repo "$tmp/repo"
 if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$sentinel" \
   SMOLVM_STATE_DIR="$tmp/smolvm-state" "$tmp/repo/box" new rollback-probe >/dev/null 2>&1; then
   echo "mock provisioning failure unexpectedly succeeded" >&2

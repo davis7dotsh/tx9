@@ -5,6 +5,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# tests/regressions-*.sh is globbed so new split-out regression files are
+# picked up automatically.
+regression_files=(tests/regressions-*.sh)
+
 files=(
   box
   guest/hb
@@ -13,15 +17,16 @@ files=(
   guest/agent-bash-profile.sh
   provision/provision.sh
   ops/tx9-host
+  tests/lib.sh
   tests/lifecycle-smoke.sh
   tests/hermes-state.sh
-  tests/regressions.sh
   tests/cli-surface.sh
+  "${regression_files[@]}"
   tests/fixtures/smolvm
 )
 
 bash -n "${files[@]}"
-for file in box guest/hb guest/hb-workload guest/hermes-state provision/provision.sh ops/tx9-host tests/lifecycle-smoke.sh tests/hermes-state.sh tests/regressions.sh tests/cli-surface.sh tests/fixtures/smolvm; do
+for file in box guest/hb guest/hb-workload guest/hermes-state provision/provision.sh ops/tx9-host tests/lifecycle-smoke.sh tests/hermes-state.sh tests/cli-surface.sh "${regression_files[@]}" tests/fixtures/smolvm; do
   [[ -x "$file" ]] || { echo "not executable: $file" >&2; exit 1; }
 done
 
