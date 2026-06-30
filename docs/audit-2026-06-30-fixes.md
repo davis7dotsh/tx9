@@ -214,7 +214,7 @@ either real timing races or a real single-writer Discord setup to observe
 directly). Each entry says how to construct the race/condition if you want
 to confirm it before fixing.
 
-### P1-1: gateway can be double-spawned (race in `hb`/`hb-workload`)
+### P1-1: gateway can be double-spawned (race in `hb`/`hb-workload`) — DONE
 
 **Files:** `guest/hb:74-88` (`_start_gateway`), `guest/hb-workload:67-96`
 (`reconcile_once`, called every 20s by `guest/hb-workload:100-104`'s loop).

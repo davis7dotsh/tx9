@@ -13,6 +13,7 @@ LEGACY_QUIESCE_FILE="${HB_LEGACY_QUIESCE_FILE:-/tmp/hermes-box-executor-paused}"
 GATEWAY_DISABLED="$STATE_DIR/gateway-disabled"
 GATEWAY_POLICY="$STATE_DIR/gateway-policy-initialized"
 GATEWAY_PID="$STATE_DIR/gateway.pid"
+GATEWAY_LOCK="$STATE_DIR/gateway.lock"
 WIRE_VERSION=http-v1
 WIRED="$AGENT_HOME/.hermes-box-wired"
 TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
@@ -71,10 +72,37 @@ _gateway_running() {
   pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' >/dev/null 2>&1
 }
 
+# mkdir-based lock (same pattern as box's _try_acquire_lock) around the
+# check-then-spawn below. Without it, hb-workload's 20s reconcile loop and a
+# host-initiated `hb up` can both observe "not running" and both exec
+# `hermes gateway run --replace`, violating the single-writer guarantee.
+_acquire_gateway_lock() {
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  local attempt owner
+  for ((attempt = 0; attempt < 50; attempt++)); do
+    if mkdir "$GATEWAY_LOCK" 2>/dev/null; then
+      printf '%s\n' "$$" >"$GATEWAY_LOCK/pid"
+      return 0
+    fi
+    owner=""
+    [[ -r "$GATEWAY_LOCK/pid" ]] && owner="$(cat "$GATEWAY_LOCK/pid" 2>/dev/null)"
+    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+      rm -rf "$GATEWAY_LOCK"
+      continue
+    fi
+    sleep 0.1
+  done
+  return 1
+}
+
+_release_gateway_lock() { rm -rf "$GATEWAY_LOCK"; }
+
 _start_gateway() {
   [[ "${INSTALL_HERMES:-0}" == 1 ]] || return 0
   [[ ! -e "$QUIESCE_FILE" && ! -e "$GATEWAY_DISABLED" ]] || return 0
   command -v hermes >/dev/null 2>&1 || { echo "hermes not installed" >&2; return 1; }
+  _acquire_gateway_lock || { echo "could not acquire Hermes gateway lock" >&2; return 1; }
+  trap _release_gateway_lock RETURN
   if _gateway_running; then
     local count
     count="$(pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' | wc -l | tr -d ' ')"
