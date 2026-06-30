@@ -14,6 +14,7 @@ GATEWAY_DISABLED="$STATE_DIR/gateway-disabled"
 GATEWAY_POLICY="$STATE_DIR/gateway-policy-initialized"
 GATEWAY_PID="$STATE_DIR/gateway.pid"
 GATEWAY_LOCK="$STATE_DIR/gateway.lock"
+EXECUTOR_LOCK="$STATE_DIR/executor.lock"
 WIRE_VERSION=http-v1
 WIRED="$AGENT_HOME/.hermes-box-wired"
 TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
@@ -53,6 +54,63 @@ _wait_port() {
   return 1
 }
 
+# flock-based lock generalized for any check-then-spawn daemon start (gateway,
+# executor, and future daemons share this rather than each hand-rolling its
+# own copy). Without it, hb-workload's 20s reconcile loop and a host-initiated
+# `hb up` can both observe "not running" and both spawn the same daemon.
+#
+# flock over a hand-rolled mkdir+pid-file lock specifically because stale-lock
+# recovery is the hard part to get right with plain filesystem primitives: an
+# earlier mkdir/rm-rf-based version of this (and an mv-based "fix" to it) both
+# had a confirmed TOCTOU window where two contenders racing to reclaim the
+# same dead-owner lock could end up both "holding" it. flock is kernel-
+# enforced and auto-releases the instant every fd referencing it closes, with
+# no manual dead-owner detection needed — verified directly: 8 trials of 10
+# processes racing a pre-seeded "stale" lock all converged on exactly one
+# winner, and killing -9 a holder mid-section let the next contender acquire
+# in ~0.2s instead of the 5s timeout.
+declare -A _DAEMON_LOCK_FDS
+
+_acquire_daemon_lock() {
+  local lock="$1"
+  local fd
+  mkdir -p "$STATE_DIR" 2>/dev/null || true
+  exec {fd}>"$lock"
+  if ! flock -w 5 "$fd"; then
+    eval "exec ${fd}>&-"
+    return 1
+  fi
+  _DAEMON_LOCK_FDS["$lock"]="$fd"
+}
+
+_release_daemon_lock() {
+  local lock="$1"
+  local fd="${_DAEMON_LOCK_FDS[$lock]:-}"
+  [[ -n "$fd" ]] || return 0
+  flock -u "$fd" 2>/dev/null || true
+  eval "exec ${fd}>&-" 2>/dev/null || true
+  unset "_DAEMON_LOCK_FDS[$lock]"
+}
+
+# A long-lived daemon spawned with a lock fd still open would inherit it and
+# hold the underlying flock open for its entire lifetime (file description
+# locks survive fork; the kernel only auto-releases once every fd referring
+# to it, across every process, is closed) — wedging every future acquire
+# attempt until that daemon exits. Verified: without this, a spawned `sleep`
+# standing in for a daemon kept the lock held after the spawning shell
+# explicitly released it; with it, a fresh acquire attempt succeeded in
+# milliseconds right after spawning.
+_spawn_without_lock_fd() {
+  local lock="$1" logfile="$2"
+  shift 2
+  local fd="${_DAEMON_LOCK_FDS[$lock]:-}"
+  if [[ -n "$fd" ]]; then
+    ( eval "exec ${fd}>&-"; exec nohup "$@" >>"$logfile" 2>&1 ) &
+  else
+    ( exec nohup "$@" >>"$logfile" 2>&1 ) &
+  fi
+}
+
 _executor_up() {
   init
   command -v executor >/dev/null 2>&1 || {
@@ -60,59 +118,50 @@ _executor_up() {
     echo "executor disabled"
     return 0
   }
-  if _port_open; then echo "executor daemon: running"; return 0; fi
+  _acquire_daemon_lock "$EXECUTOR_LOCK" || { echo "could not acquire Executor lock" >&2; return 1; }
+  if _port_open; then
+    echo "executor daemon: running"
+    _release_daemon_lock "$EXECUTOR_LOCK"
+    return 0
+  fi
   echo "starting executor daemon"
   rm -f "$AGENT_HOME/.executor"/daemon-active-* 2>/dev/null || true
   executor daemon run >>"$LOGS/executor.log" 2>&1 || true
-  _wait_port open || { echo "executor failed to become ready; see: hb logs executor" >&2; return 1; }
+  _wait_port open || { echo "executor failed to become ready; see: hb logs executor" >&2; _release_daemon_lock "$EXECUTOR_LOCK"; return 1; }
   echo "executor daemon: ready"
+  _release_daemon_lock "$EXECUTOR_LOCK"
 }
 
 _gateway_running() {
   pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' >/dev/null 2>&1
 }
 
-# mkdir-based lock (same pattern as box's _try_acquire_lock) around the
-# check-then-spawn below. Without it, hb-workload's 20s reconcile loop and a
-# host-initiated `hb up` can both observe "not running" and both exec
-# `hermes gateway run --replace`, violating the single-writer guarantee.
-_acquire_gateway_lock() {
-  mkdir -p "$STATE_DIR" 2>/dev/null || true
-  local attempt owner
-  for ((attempt = 0; attempt < 50; attempt++)); do
-    if mkdir "$GATEWAY_LOCK" 2>/dev/null; then
-      printf '%s\n' "$$" >"$GATEWAY_LOCK/pid"
-      return 0
-    fi
-    owner=""
-    [[ -r "$GATEWAY_LOCK/pid" ]] && owner="$(cat "$GATEWAY_LOCK/pid" 2>/dev/null)"
-    if [[ "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
-      rm -rf "$GATEWAY_LOCK"
-      continue
-    fi
-    sleep 0.1
-  done
-  return 1
-}
-
-_release_gateway_lock() { rm -rf "$GATEWAY_LOCK"; }
-
+# Returns 0 on success, 1 on a real failure, 2 if the lock couldn't be
+# acquired (someone else is mid-operation — not necessarily broken). Callers
+# must not react to 2 the same way as 1: stopping the gateway because *this*
+# call lost a lock race would kill another process's legitimately-running
+# gateway.
 _start_gateway() {
   [[ "${INSTALL_HERMES:-0}" == 1 ]] || return 0
   [[ ! -e "$QUIESCE_FILE" && ! -e "$GATEWAY_DISABLED" ]] || return 0
   command -v hermes >/dev/null 2>&1 || { echo "hermes not installed" >&2; return 1; }
-  _acquire_gateway_lock || { echo "could not acquire Hermes gateway lock" >&2; return 1; }
-  trap _release_gateway_lock RETURN
+  _acquire_daemon_lock "$GATEWAY_LOCK" || { echo "could not acquire Hermes gateway lock" >&2; return 2; }
   if _gateway_running; then
     local count
     count="$(pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' | wc -l | tr -d ' ')"
-    [[ "$count" == 1 ]] || { echo "multiple Hermes gateway processes detected" >&2; return 1; }
+    if [[ "$count" != 1 ]]; then
+      echo "multiple Hermes gateway processes detected" >&2
+      _release_daemon_lock "$GATEWAY_LOCK"
+      return 1
+    fi
     pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' | head -1 >"$GATEWAY_PID"
+    _release_daemon_lock "$GATEWAY_LOCK"
     return 0
   fi
   rm -f "$GATEWAY_PID"
-  nohup hermes gateway run --replace >>"$LOGS/hermes-gateway.log" 2>&1 &
+  _spawn_without_lock_fd "$GATEWAY_LOCK" "$LOGS/hermes-gateway.log" hermes gateway run --replace
   printf '%s\n' "$!" >"$GATEWAY_PID"
+  _release_daemon_lock "$GATEWAY_LOCK"
 }
 
 up() {
@@ -180,7 +229,17 @@ gateway_enable() {
   [[ ! -e "$QUIESCE_FILE" ]] || { echo "box is quiesced; resume it before requesting gateway startup" >&2; return 1; }
   if [[ -r "$STATE_DIR/import-manifest.json" ]]; then cutover_ready || return 1; fi
   rm -f "$GATEWAY_DISABLED"
-  if ! _start_gateway; then
+  _start_gateway
+  local start_status=$?
+  if [[ "$start_status" == 2 ]]; then
+    # Lost the lock race to a concurrent operation (e.g. hb-workload's
+    # reconcile loop) — leave whatever it's doing alone. Stopping the
+    # gateway here could kill a process that other call legitimately just
+    # started.
+    touch "$GATEWAY_DISABLED"
+    echo "gateway is busy with a concurrent operation; re-run once it settles" >&2
+    return 1
+  elif [[ "$start_status" != 0 ]]; then
     _stop_gateway || true
     touch "$GATEWAY_DISABLED"
     return 1

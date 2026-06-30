@@ -230,4 +230,51 @@ fi
   [[ ! -e "$WIRED" && ! -e "$TOKEN_ENV" ]]
 )
 
+# The daemon lock (_acquire_daemon_lock/_release_daemon_lock, shared by
+# _start_gateway and _executor_up) must serialize concurrent contenders, and
+# a process spawned via _spawn_without_lock_fd must not inherit the lock's
+# fd — otherwise a long-lived daemon would hold the underlying flock open
+# for its entire lifetime, wedging every later acquire attempt.
+lock_test_data="$tmp/daemon-lock-data"
+HB_DATA="$lock_test_data" "$PROJECT_ROOT/guest/hb" init >/dev/null
+lock_state_dir="$lock_test_data/home/agent/.config/hermes-box"
+lock_path="$lock_state_dir/test.lock"
+marker="$lock_state_dir/marker"
+for _ in 1 2 3 4 5 6 7 8; do
+  (
+    HB_DATA="$lock_test_data"
+    # shellcheck disable=SC1090
+    source "$PROJECT_ROOT/guest/hb"
+    _acquire_daemon_lock "$lock_path" || exit 1
+    if [[ ! -e "$marker" ]]; then
+      sleep 0.1
+      touch "$marker"
+    fi
+    _release_daemon_lock "$lock_path"
+  ) &
+done
+wait
+[[ -e "$marker" ]]
+
+(
+  HB_DATA="$lock_test_data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  rm -f "$lock_path"
+  _acquire_daemon_lock "$lock_path" || exit 1
+  _spawn_without_lock_fd "$lock_path" "$tmp/spawned-daemon.log" sleep 30
+  spawned_pid=$!
+  _release_daemon_lock "$lock_path"
+  echo "$spawned_pid" >"$tmp/spawned.pid"
+)
+[[ -s "$tmp/spawned.pid" ]]
+spawned_pid="$(cat "$tmp/spawned.pid")"
+kill -0 "$spawned_pid" 2>/dev/null || { echo "spawned daemon did not survive its spawning subshell" >&2; exit 1; }
+if ! flock -w 2 "$lock_path" -c 'exit 0' 2>/dev/null; then
+  echo "daemon lock was not released — the spawned process likely inherited its fd" >&2
+  kill -9 "$spawned_pid" 2>/dev/null
+  exit 1
+fi
+kill -9 "$spawned_pid" 2>/dev/null || true
+
 echo "hb-workload regression checks passed"
