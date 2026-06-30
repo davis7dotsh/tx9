@@ -543,8 +543,13 @@ _create_base() {
   [[ -z "${BOX_STORAGE_GIB:-}" ]] || resources+=(--storage "$BOX_STORAGE_GIB")
   wl_port="${port:-4788}"
   _defer_signals
+  # No `exec` into hb-workload: if the loop process itself dies (OOM-killed, a
+  # bug not guarded by its `set -u`), nothing else in the VM restarts it, so
+  # this outer loop is the supervisor. hb-workload's own internals (gateway,
+  # socat bridges) are reconciled every 20s once it's running again.
   if smolvm machine create --net "${opts[@]}" "${resources[@]}" --name "$n" --image "$BASE_IMAGE" \
-    -- bash -c "while [ ! -x /opt/hermes-box/bin/hb-workload ]; do sleep 2; done; exec runuser -u agent -- env HOME=/data/home/agent /opt/hermes-box/bin/hb-workload ${wl_port} ${api_guest_port:-0}"; then
+    -- bash -c "while [ ! -x /opt/hermes-box/bin/hb-workload ]; do sleep 2; done
+      while true; do runuser -u agent -- env HOME=/data/home/agent /opt/hermes-box/bin/hb-workload ${wl_port} ${api_guest_port:-0}; sleep 2; done"; then
     create_status=0
   else
     create_status=$?

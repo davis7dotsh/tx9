@@ -252,7 +252,7 @@ local copy of `hb` to make the window reliably wide.)
    before it calls `hb reconcile`, or simply rely on (1) since `hb reconcile`
    already calls into `_start_gateway`.
 
-### P1-2: `hb-workload` itself is unsupervised
+### P1-2: `hb-workload` itself is unsupervised — DONE
 
 **File:** `guest/hb-workload:98-105` (`main`), invoked once at boot by
 `box:546-547`'s `smolvm machine create` command line.
