@@ -354,24 +354,26 @@ spec = importlib.util.spec_from_loader(loader.name, loader)
 module = importlib.util.module_from_spec(spec)
 loader.exec_module(module)
 
-d = Path(tempfile.mkdtemp())
-zpath = d / "t.zip"
-with zipfile.ZipFile(zpath, "w") as zf:
-    zf.writestr("config.yaml", "a: 1\n")
-    zf.writestr("state.db", b"x" * 5000)
+with tempfile.TemporaryDirectory() as d, \
+     tempfile.TemporaryDirectory() as stage_dir, \
+     tempfile.TemporaryDirectory() as external_stage_dir:
+    zpath = Path(d) / "t.zip"
+    with zipfile.ZipFile(zpath, "w") as zf:
+        zf.writestr("config.yaml", "a: 1\n")
+        zf.writestr("state.db", b"x" * 5000)
 
-with zipfile.ZipFile(zpath) as zf:
-    prefix, files = module._zip_layout(zf)
-    stage = Path(tempfile.mkdtemp())
-    external_stage = Path(tempfile.mkdtemp())
-    module.MAX_UNCOMPRESSED = 2000  # below the real 5005 decompressed bytes
-    try:
-        module._extract(zf, stage, external_stage, prefix, files, set())
-    except ValueError as error:
-        if "100 GiB safety limit" not in str(error):
-            raise SystemExit(f"unexpected extraction error: {error}")
-    else:
-        raise SystemExit("extraction exceeding the actual-bytes cap unexpectedly succeeded")
+    with zipfile.ZipFile(zpath) as zf:
+        prefix, files = module._zip_layout(zf)
+        stage = Path(stage_dir)
+        external_stage = Path(external_stage_dir)
+        module.MAX_UNCOMPRESSED = 2000  # below the real 5005 decompressed bytes
+        try:
+            module._extract(zf, stage, external_stage, prefix, files, set())
+        except ValueError as error:
+            if "100 GiB safety limit" not in str(error):
+                raise SystemExit(f"unexpected extraction error: {error}")
+        else:
+            raise SystemExit("extraction exceeding the actual-bytes cap unexpectedly succeeded")
 PY
 
 echo "Hermes state checks passed"

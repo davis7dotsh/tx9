@@ -34,7 +34,7 @@ check-hermes-pin:
 	pinned=$$(grep '^HERMES_INSTALLER_SHA256=' box.env | sed -E 's/^[A-Z0-9_]+="([^"]*)"/\1/'); \
 	tmp=$$(mktemp); \
 	trap 'rm -f "$$tmp"' EXIT; \
-	if ! curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o "$$tmp"; then \
+	if ! curl -fsSL --connect-timeout 10 --max-time 30 https://hermes-agent.nousresearch.com/install.sh -o "$$tmp"; then \
 		echo "failed to fetch live Hermes installer" >&2; exit 1; \
 	fi; \
 	live=$$($$hasher "$$tmp" | awk '{print $$1}'); \

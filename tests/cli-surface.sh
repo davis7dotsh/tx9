@@ -53,19 +53,25 @@ grep -q -- '--name force-box -f' "$rm_sentinel"
 # interactive shell). setsid genuinely detaches the terminal, so this
 # asserts the safety property that actually matters regardless of which
 # of the two failure modes fires: no confirmation reached, no deletion.
-rm_noforce_repo="$tmp/rm-noforce-repo"
-make_repo "$rm_noforce_repo"
-mkdir -p "$tmp/rm-noforce-state/no-force-box"
-printf 'no-force-box\t\t\t\n' >"$rm_noforce_repo/.boxes"
-noforce_sentinel="$tmp/rm-noforce.calls"
-if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$noforce_sentinel" \
-  SMOLVM_STATE_DIR="$tmp/rm-noforce-state" \
-  timeout 10 setsid "$rm_noforce_repo/box" rm no-force-box </dev/null >/dev/null 2>&1; then
-  echo "box rm without --force unexpectedly succeeded with no controlling terminal" >&2
-  exit 1
+# setsid/timeout are util-linux, not on stock macOS — skip rather than fail
+# the whole suite for a host the project otherwise supports.
+if ! command -v setsid >/dev/null 2>&1 || ! command -v timeout >/dev/null 2>&1; then
+  echo "setsid/timeout unavailable; skipping the no-controlling-terminal box rm regression" >&2
+else
+  rm_noforce_repo="$tmp/rm-noforce-repo"
+  make_repo "$rm_noforce_repo"
+  mkdir -p "$tmp/rm-noforce-state/no-force-box"
+  printf 'no-force-box\t\t\t\n' >"$rm_noforce_repo/.boxes"
+  noforce_sentinel="$tmp/rm-noforce.calls"
+  if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$noforce_sentinel" \
+    SMOLVM_STATE_DIR="$tmp/rm-noforce-state" \
+    timeout 10 setsid "$rm_noforce_repo/box" rm no-force-box </dev/null >/dev/null 2>&1; then
+    echo "box rm without --force unexpectedly succeeded with no controlling terminal" >&2
+    exit 1
+  fi
+  [[ ! -e "$noforce_sentinel" ]] || { echo "smolvm ran before rm confirmation" >&2; exit 1; }
+  grep -q '^no-force-box' "$rm_noforce_repo/.boxes"
 fi
-[[ ! -e "$noforce_sentinel" ]] || { echo "smolvm ran before rm confirmation" >&2; exit 1; }
-grep -q '^no-force-box' "$rm_noforce_repo/.boxes"
 
 # --- box rm <name>: typed-name confirmation, both mismatch and match ----
 # Exercises the real /dev/tty prompt path via a pty, since `--force` and the
