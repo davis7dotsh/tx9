@@ -196,11 +196,21 @@ install_executor() {
   if [[ "${INSTALL_EXECUTOR:-0}" != "1" ]]; then
     log "executor: INSTALL_EXECUTOR != 1 — skipping"; return
   fi
-  # Idempotent: skip reinstall if already on PATH. Lets `assets` repair mode
-  # call this safely on every run instead of only on a full reinstall.
+  # Idempotent: skip reinstall if already on PATH at the pinned version (any
+  # version, if EXECUTOR_VERSION is unset) — the same bar verify_required
+  # holds it to. Lets `assets` repair mode call this safely on every run
+  # instead of only on a full reinstall, without masking a version bump.
   if command -v executor >/dev/null 2>&1; then
-    log "executor already installed — skipping reinstall"
-    return 0
+    if [[ -z "${EXECUTOR_VERSION:-}" ]]; then
+      log "executor already installed — skipping reinstall"
+      return 0
+    fi
+    local installed_version
+    installed_version="$(executor --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    if [[ "$installed_version" == "$EXECUTOR_VERSION" ]]; then
+      log "executor already installed at pinned $EXECUTOR_VERSION — skipping reinstall"
+      return 0
+    fi
   fi
   local pkg="executor${EXECUTOR_VERSION:+@$EXECUTOR_VERSION}"
   log "executor (npm global)${EXECUTOR_VERSION:+ ($EXECUTOR_VERSION)}"
