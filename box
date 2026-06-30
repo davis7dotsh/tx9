@@ -611,6 +611,25 @@ _prepare_runtime() {
   _guest_hb "$n" doctor
 }
 
+# Best-effort: a failure saving the transcript (full disk, read-only checkout)
+# must never itself abort the caller's failure-handling path under set -e —
+# that would skip keep-on-failure's _clear_created and let the EXIT trap roll
+# the box back anyway, defeating the one thing the operator needed most.
+_save_failed_transcript() {
+  local n="$1" log_file="$2" failed_log
+  [[ -s "$log_file" ]] || return 0
+  if ! mkdir -p backups/.failed; then
+    warn "could not create backups/.failed; provisioning transcript was not saved"
+    return 0
+  fi
+  failed_log="backups/.failed/${n}-$(date -u +%Y%m%dT%H%M%SZ).log"
+  if cp "$log_file" "$failed_log"; then
+    warn "provisioning transcript saved to $failed_log"
+  else
+    warn "could not save provisioning transcript to $failed_log"
+  fi
+}
+
 _rollback_created() {
   local n="$1" registry_lock="$LOCK_ROOT/registry.lock" owns_lock=0
   warn "rolling back incomplete box '$n'"
@@ -644,7 +663,7 @@ _rollback_created() {
 }
 
 cmd_new() {
-  local n="${1:?usage: box new <name> [--keep-on-failure]}" keep_on_failure=0 stage="" log_file failed_log=""
+  local n="${1:?usage: box new <name> [--keep-on-failure]}" keep_on_failure=0 stage="" log_file
   [[ "${2:-}" != --keep-on-failure && "${BOX_KEEP_ON_FAILURE:-0}" != 1 ]] || keep_on_failure=1
   _validate_name "$n"
   _host_preflight provision
@@ -660,12 +679,7 @@ cmd_new() {
     stage="preparing the runtime (gateway start, MCP wiring, doctor)"
   fi
   if [[ -n "$stage" ]]; then
-    if [[ -s "$log_file" ]]; then
-      mkdir -p backups/.failed
-      failed_log="backups/.failed/${n}-$(date -u +%Y%m%dT%H%M%SZ).log"
-      cp "$log_file" "$failed_log"
-      warn "provisioning transcript saved to $failed_log"
-    fi
+    _save_failed_transcript "$n" "$log_file"
     if [[ "$keep_on_failure" == 1 ]]; then
       _clear_created "$n"
       warn "leaving '$n' in place for inspection (--keep-on-failure / BOX_KEEP_ON_FAILURE=1)"
@@ -738,9 +752,9 @@ cmd_save() {
 }
 
 cmd_load() {
-  local file="${1:?usage: box load <archive.tar.gz.gpg> [name]}" n="${2:-restored}" raw guest_tmp
-  local keep_on_failure=0 log_file failed_log=""
-  [[ "${BOX_KEEP_ON_FAILURE:-0}" != 1 ]] || keep_on_failure=1
+  local file="${1:?usage: box load <archive.tar.gz.gpg> [name] [--keep-on-failure]}" n="${2:-restored}" raw guest_tmp
+  local keep_on_failure=0 log_file
+  [[ "${3:-}" != --keep-on-failure && "${BOX_KEEP_ON_FAILURE:-0}" != 1 ]] || keep_on_failure=1
   [[ -f "$file" ]] || die "no such archive: $file"
   _validate_name "$n"
   _host_preflight full
@@ -755,15 +769,10 @@ cmd_load() {
   log_file="$(mktemp)"
   _track_temp "$log_file"
   if ! _create_base "$n" || ! _provision_into "$n" full "$log_file"; then
-    if [[ -s "$log_file" ]]; then
-      mkdir -p backups/.failed
-      failed_log="backups/.failed/${n}-$(date -u +%Y%m%dT%H%M%SZ).log"
-      cp "$log_file" "$failed_log"
-      warn "provisioning transcript saved to $failed_log"
-    fi
+    _save_failed_transcript "$n" "$log_file"
     if [[ "$keep_on_failure" == 1 ]]; then
       _clear_created "$n"
-      warn "leaving '$n' in place for inspection (BOX_KEEP_ON_FAILURE=1)"
+      warn "leaving '$n' in place for inspection (--keep-on-failure / BOX_KEEP_ON_FAILURE=1)"
       warn "remove when done with: ./box rm '$n' --force"
     fi
     die "destination provisioning failed"
@@ -812,12 +821,14 @@ cmd_load() {
        trap '\''if [[ "$restore_failed" == 1 ]]; then find /data -mindepth 1 -maxdepth 1 ! -path "$rollback" -exec rm -rf -- {} +; mv "$rollback"/* /data/ 2>/dev/null || true; fi; rm -rf "$stage" "$rollback"; rm -f -- "$archive"'\'' EXIT HUP INT TERM
        mv "$stage"/* /data/
        restore_failed=0' bash "$guest_tmp" ||
-    ! _provision_into "$n" assets || ! _guest_hb "$n" gateway-disable ||
+    ! _provision_into "$n" assets "$log_file" || ! _guest_hb "$n" gateway-disable ||
     ! _guest_hb "$n" verify-state >/dev/null || ! _resume_box "$n" || ! _prepare_runtime "$n"; then
+    _save_failed_transcript "$n" "$log_file"
     if [[ "$keep_on_failure" == 1 ]]; then
       _clear_created "$n"
-      warn "leaving '$n' in place for inspection (BOX_KEEP_ON_FAILURE=1)"
+      warn "leaving '$n' in place for inspection (--keep-on-failure / BOX_KEEP_ON_FAILURE=1)"
       warn "remove when done with: ./box rm '$n' --force"
+      die "restore failed; left incomplete destination '$n' for inspection"
     fi
     die "restore failed; attempting cleanup of the incomplete destination"
   fi
@@ -1113,15 +1124,16 @@ hermes-box-lite — isolated, portable agent boxes (claude / codex / hermes / ex
   ./box repair <name>          Re-run provisioning and repair managed guest assets
   ./box stop|start <name>      Stop or start an instance
   ./box save <name> [out]      Quiesce, validate, encrypt, and verify /data
-  ./box load <file> [name]     Validate first, then build and restore a fresh box
+  ./box load <file> [name] [--keep-on-failure]
+                               Validate first, then build and restore a fresh box
   ./box import-hermes <name> <hermes-backup.zip> [--external NAME]... [--map OLD=NEW]...
                                Transactionally import native Hermes state; gateway stays disabled
   ./box extract <file> [dir]   Validate and extract a backup without a VM
   ./box rm <name> [--force]    Delete after confirmation (or explicit --force)
 
   Set BOX_PASSPHRASE to skip the GPG prompt. Configuration: box.env
-  Set BOX_KEEP_ON_FAILURE=1 (or pass --keep-on-failure to `new`) to skip
-  rollback on a failed `new`/`load` and leave the VM up for inspection.
+  Set BOX_KEEP_ON_FAILURE=1 (or pass --keep-on-failure to `new`/`load`) to
+  skip rollback on a failed `new`/`load` and leave the VM up for inspection.
   A failed `new`/`load` also saves its provisioning transcript under
   backups/.failed/ before any rollback runs.
 EOF
