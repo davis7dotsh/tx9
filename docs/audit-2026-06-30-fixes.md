@@ -173,7 +173,7 @@ then `./box doctor tx9probe` passes, then `./box rm tx9probe --force`.
 
 ---
 
-### P0-3: a failed `box new` destroys the only evidence of why
+### P0-3: a failed `box new` destroys the only evidence of why — DONE
 
 **Symptom:** Both live failures above produced exactly one line of
 explanation (`error: box creation failed`) before `_rollback_created`

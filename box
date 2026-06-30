@@ -571,7 +571,7 @@ _create_base() {
 }
 
 _provision_into() {
-  local n="$1" mode="${2:-full}" contexts=(provision guest box.env)
+  local n="$1" mode="${2:-full}" log_file="${3:-}" contexts=(provision guest box.env) cmd
   if [[ "$mode" == full ]]; then
     _validate_bundle
     [[ -z "${HERMES_GIT_BUNDLE:-}" ]] || contexts+=("$HERMES_GIT_BUNDLE")
@@ -586,11 +586,17 @@ _provision_into() {
   else
     say "Provisioning node/uv, claude, codex, hermes, executor (a few minutes)…"
   fi
-  smolvm machine exec --name "$n" -- bash -lc "
-    set -e
+  cmd="set -e
     rm -rf /tmp/ctx && mkdir -p /tmp/ctx
     tar xzf /tmp/ctx.tgz -C /tmp/ctx
     bash /tmp/ctx/provision/provision.sh '$mode'"
+  # Optionally tee the transcript to a host-side file so a caller can persist
+  # it as failure evidence before rollback deletes the only other copy.
+  if [[ -n "$log_file" ]]; then
+    smolvm machine exec --name "$n" -- bash -lc "$cmd" 2>&1 | tee "$log_file"
+  else
+    smolvm machine exec --name "$n" -- bash -lc "$cmd"
+  fi
 }
 
 _prepare_runtime() {
@@ -633,13 +639,35 @@ _rollback_created() {
 }
 
 cmd_new() {
-  local n="${1:?usage: box new <name>}"
+  local n="${1:?usage: box new <name> [--keep-on-failure]}" keep_on_failure=0 stage="" log_file failed_log=""
+  [[ "${2:-}" != --keep-on-failure && "${BOX_KEEP_ON_FAILURE:-0}" != 1 ]] || keep_on_failure=1
   _validate_name "$n"
   _host_preflight provision
   _acquire_lock "$n"
   say "Creating instance '$n' from $BASE_IMAGE"
-  if ! _create_base "$n" || ! _provision_into "$n" full || ! _prepare_runtime "$n"; then
-    die "box creation failed"
+  log_file="$(mktemp)"
+  _track_temp "$log_file"
+  if ! _create_base "$n"; then
+    stage="creating the base VM"
+  elif ! _provision_into "$n" full "$log_file"; then
+    stage="provisioning"
+  elif ! _prepare_runtime "$n"; then
+    stage="preparing the runtime (gateway start, MCP wiring, doctor)"
+  fi
+  if [[ -n "$stage" ]]; then
+    if [[ -s "$log_file" ]]; then
+      mkdir -p backups/.failed
+      failed_log="backups/.failed/${n}-$(date -u +%Y%m%dT%H%M%SZ).log"
+      cp "$log_file" "$failed_log"
+      warn "provisioning transcript saved to $failed_log"
+    fi
+    if [[ "$keep_on_failure" == 1 ]]; then
+      _clear_created "$n"
+      warn "leaving '$n' in place for inspection (--keep-on-failure / BOX_KEEP_ON_FAILURE=1)"
+      warn "inspect with: smolvm machine exec --name '$n' -- bash"
+      warn "remove when done with: ./box rm '$n' --force"
+    fi
+    die "box creation failed while $stage"
   fi
   _clear_created "$n"
   local port
@@ -706,6 +734,8 @@ cmd_save() {
 
 cmd_load() {
   local file="${1:?usage: box load <archive.tar.gz.gpg> [name]}" n="${2:-restored}" raw guest_tmp
+  local keep_on_failure=0 log_file failed_log=""
+  [[ "${BOX_KEEP_ON_FAILURE:-0}" != 1 ]] || keep_on_failure=1
   [[ -f "$file" ]] || die "no such archive: $file"
   _validate_name "$n"
   _host_preflight full
@@ -717,7 +747,20 @@ cmd_load() {
   _validate_archive "$raw" || die "archive is invalid or unsafe"
 
   say "Creating and provisioning fresh instance '$n'"
-  if ! _create_base "$n" || ! _provision_into "$n" full; then
+  log_file="$(mktemp)"
+  _track_temp "$log_file"
+  if ! _create_base "$n" || ! _provision_into "$n" full "$log_file"; then
+    if [[ -s "$log_file" ]]; then
+      mkdir -p backups/.failed
+      failed_log="backups/.failed/${n}-$(date -u +%Y%m%dT%H%M%SZ).log"
+      cp "$log_file" "$failed_log"
+      warn "provisioning transcript saved to $failed_log"
+    fi
+    if [[ "$keep_on_failure" == 1 ]]; then
+      _clear_created "$n"
+      warn "leaving '$n' in place for inspection (BOX_KEEP_ON_FAILURE=1)"
+      warn "remove when done with: ./box rm '$n' --force"
+    fi
     die "destination provisioning failed"
   fi
 
@@ -766,6 +809,11 @@ cmd_load() {
        restore_failed=0' bash "$guest_tmp" ||
     ! _provision_into "$n" assets || ! _guest_hb "$n" gateway-disable ||
     ! _guest_hb "$n" verify-state >/dev/null || ! _resume_box "$n" || ! _prepare_runtime "$n"; then
+    if [[ "$keep_on_failure" == 1 ]]; then
+      _clear_created "$n"
+      warn "leaving '$n' in place for inspection (BOX_KEEP_ON_FAILURE=1)"
+      warn "remove when done with: ./box rm '$n' --force"
+    fi
     die "restore failed; attempting cleanup of the incomplete destination"
   fi
   _untrack_guest_temp "$n" "$guest_tmp"
@@ -1051,7 +1099,8 @@ usage() {
   cat <<'EOF'
 hermes-box-lite — isolated, portable agent boxes (claude / codex / hermes / executor)
 
-  ./box new <name>             Create, provision, and health-check a fresh box
+  ./box new <name> [--keep-on-failure]
+                               Create, provision, and health-check a fresh box
   ./box enter <name>           Log in as agent and attach tmux 'main'
   ./box ls [--all]             List managed boxes (or every smolvm VM)
   ./box open <name>            Open the authenticated Executor web UI
@@ -1066,6 +1115,10 @@ hermes-box-lite — isolated, portable agent boxes (claude / codex / hermes / ex
   ./box rm <name> [--force]    Delete after confirmation (or explicit --force)
 
   Set BOX_PASSPHRASE to skip the GPG prompt. Configuration: box.env
+  Set BOX_KEEP_ON_FAILURE=1 (or pass --keep-on-failure to `new`) to skip
+  rollback on a failed `new`/`load` and leave the VM up for inspection.
+  A failed `new`/`load` also saves its provisioning transcript under
+  backups/.failed/ before any rollback runs.
 EOF
 }
 
