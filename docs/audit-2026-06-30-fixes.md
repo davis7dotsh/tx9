@@ -421,7 +421,7 @@ reinstall if already present and `git rev-parse HEAD` matches, like
 `assets_only`, immediately after `make_agent`. This makes `assets` mode a
 true "fix what's missing" repair instead of "config files only."
 
-### P2-2: zero test coverage for five of thirteen `box` subcommands
+### P2-2: zero test coverage for five of thirteen `box` subcommands — DONE
 
 **Files:** `box:889-1052` (`cmd_ls`, `cmd_open` partially, `cmd_rm`,
 `cmd_stop`, `cmd_start`, `cmd_enter`) vs. `tests/{static,lifecycle-smoke,hermes-state,regressions}.sh`.

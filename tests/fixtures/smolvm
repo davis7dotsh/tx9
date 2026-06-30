@@ -19,6 +19,13 @@ name_from_args() {
 
 [[ "${1:-}" == machine ]] || exit 2
 case "${2:-}" in
+  ls)
+    printf 'NAME\tSTATUS\n'
+    for entry in "$state"/*/; do
+      [[ -d "$entry" ]] || continue
+      printf '%s\trunning\n' "$(basename "$entry")"
+    done
+    ;;
   status)
     name="$(name_from_args "$@")"
     [[ "$behavior" != delete-status-fail ]] || exit 42

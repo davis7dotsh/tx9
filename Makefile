@@ -1,6 +1,6 @@
 .PHONY: check syntax lint test check-hermes-pin
 
-SHELL_FILES := box guest/hb guest/hb-workload guest/profile.sh guest/agent-bash-profile.sh provision/provision.sh ops/tx9-host tests/static.sh tests/lifecycle-smoke.sh tests/hermes-state.sh tests/regressions.sh tests/fixtures/smolvm
+SHELL_FILES := box guest/hb guest/hb-workload guest/profile.sh guest/agent-bash-profile.sh provision/provision.sh ops/tx9-host tests/static.sh tests/lifecycle-smoke.sh tests/hermes-state.sh tests/regressions.sh tests/cli-surface.sh tests/fixtures/smolvm
 
 syntax:
 	bash -n $(SHELL_FILES)
@@ -17,6 +17,7 @@ test:
 	./tests/lifecycle-smoke.sh
 	./tests/hermes-state.sh
 	./tests/regressions.sh
+	./tests/cli-surface.sh
 
 check: syntax lint test
 
