@@ -506,7 +506,7 @@ mapping) — with no shared file all four source. `make_repo()`
 
 ## P3 — polish and drift prevention
 
-### P3-1: `box.env:36` hardcodes a personal path as the committed default
+### P3-1: `box.env:36` hardcodes a personal path as the committed default — DONE
 
 ```
 HERMES_IMPORT_PATH_MAP="/Users/davis=/data/home/agent"
