@@ -252,6 +252,18 @@ local copy of `hb` to make the window reliably wide.)
    before it calls `hb reconcile`, or simply rely on (1) since `hb reconcile`
    already calls into `_start_gateway`.
 
+**Superseded during code review:** the `mkdir`-based lock above shipped first
+and was verified live, but a later multi-angle review (local + bots) found a
+real TOCTOU window in its stale-lock reclaim — two contenders racing to
+reclaim the same dead-owner lock could both end up "holding" it, confirmed
+empirically (5-8 of 10 racing processes "winning" in repeated trials). It was
+replaced with an `flock`-based lock (kernel-enforced, no manual dead-owner
+detection needed), generalized to also cover Executor's identical unlocked
+race that this entry didn't originally catch. See the
+`fix(review): replace guest/hb's daemon lock with flock` commit for the full
+writeup, including a second bug (lock-fd inheritance into spawned daemons)
+found and fixed while building the replacement.
+
 ### P1-2: `hb-workload` itself is unsupervised — DONE
 
 **File:** `guest/hb-workload:98-105` (`main`), invoked once at boot by
