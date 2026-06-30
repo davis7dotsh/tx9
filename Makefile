@@ -19,7 +19,7 @@ test:
 	./tests/lifecycle-smoke.sh
 	./tests/hermes-state.sh
 	./tests/cli-surface.sh
-	for f in tests/regressions-*.sh; do ./"$$f"; done
+	for f in tests/regressions-*.sh; do ./"$$f" || exit 1; done
 
 check: syntax lint test
 
@@ -28,9 +28,16 @@ check: syntax lint test
 # `box new` failure for a real user.
 check-hermes-pin:
 	@command -v curl >/dev/null || { echo "curl is required for check-hermes-pin" >&2; exit 1; }
-	@pinned=$$(grep '^HERMES_INSTALLER_SHA256=' box.env | sed -E 's/^[A-Z0-9_]+="([^"]*)"/\1/'); \
-	live=$$(curl -fsSL https://hermes-agent.nousresearch.com/install.sh | sha256sum | awk '{print $$1}'); \
-	if [ -z "$$live" ]; then echo "failed to fetch live Hermes installer" >&2; exit 1; fi; \
+	@if command -v sha256sum >/dev/null; then hasher="sha256sum"; \
+	elif command -v shasum >/dev/null; then hasher="shasum -a 256"; \
+	else echo "sha256sum or shasum (macOS) is required for check-hermes-pin" >&2; exit 1; fi; \
+	pinned=$$(grep '^HERMES_INSTALLER_SHA256=' box.env | sed -E 's/^[A-Z0-9_]+="([^"]*)"/\1/'); \
+	tmp=$$(mktemp); \
+	trap 'rm -f "$$tmp"' EXIT; \
+	if ! curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o "$$tmp"; then \
+		echo "failed to fetch live Hermes installer" >&2; exit 1; \
+	fi; \
+	live=$$($$hasher "$$tmp" | awk '{print $$1}'); \
 	if [ "$$pinned" = "$$live" ]; then \
 		echo "HERMES_INSTALLER_SHA256 matches upstream ($$live)"; \
 	else \
