@@ -692,7 +692,7 @@ cmd_save() {
 
 cmd_load() {
   local file="${1:?usage: box load <archive.tar.gz.gpg> [name] [--keep-on-failure]}" n="${2:-restored}" raw guest_tmp
-  local keep_on_failure=0 log_file
+  local keep_on_failure=0 log_file stage=""
   [[ "${3:-}" != --keep-on-failure && "${BOX_KEEP_ON_FAILURE:-0}" != 1 ]] || keep_on_failure=1
   [[ -f "$file" ]] || die "no such archive: $file"
   _validate_name "$n"
@@ -707,14 +707,19 @@ cmd_load() {
   say "Creating and provisioning fresh instance '$n'"
   log_file="$(mktemp)"
   _track_temp "$log_file"
-  if ! _create_base "$n" || ! _provision_into "$n" full "$log_file"; then
+  if ! _create_base "$n"; then
+    stage="creating the base VM"
+  elif ! _provision_into "$n" full "$log_file"; then
+    stage="provisioning"
+  fi
+  if [[ -n "$stage" ]]; then
     _save_failed_transcript "$n" "$log_file"
     if [[ "$keep_on_failure" == 1 ]]; then
       _clear_created "$n"
       warn "leaving '$n' in place for inspection (--keep-on-failure / BOX_KEEP_ON_FAILURE=1)"
       warn "remove when done with: ./box rm '$n' --force"
     fi
-    die "destination provisioning failed"
+    die "box load failed while $stage"
   fi
 
   guest_tmp="/root/hb-restore-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}.tgz"
