@@ -13,6 +13,7 @@ files=(
   box
   guest/hb
   guest/hb-workload
+  guest/lib-mcp.sh
   guest/profile.sh
   guest/agent-bash-profile.sh
   provision/provision.sh
@@ -50,8 +51,9 @@ if grep -q '\blsof\b' box; then
   echo "lsof dependency remains" >&2
   exit 1
 fi
-grep -q 'protocolVersion.*2025-03-26' box
-grep -q 'protocolVersion.*2025-03-26' guest/hb
+grep -q 'protocolVersion.*2025-03-26' guest/lib-mcp.sh
+grep -q 'source .*guest/lib-mcp\.sh' box
+grep -q 'lib-mcp\.sh' guest/hb
 grep -q 'ca-certificates curl git jq tmux' provision/provision.sh
 grep -q 'runuser -u agent.*hb.*write-manifest' provision/provision.sh
 grep -q -- '--commit.*sha' provision/provision.sh

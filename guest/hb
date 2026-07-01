@@ -3,6 +3,8 @@
 set -uo pipefail
 # shellcheck disable=SC1091
 [ -f /etc/profile.d/hermes-box.sh ] && . /etc/profile.d/hermes-box.sh
+# shellcheck source=guest/lib-mcp.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-mcp.sh"
 
 DATA="${HB_DATA:-/data}"
 AGENT_HOME="$DATA/home/agent"
@@ -408,65 +410,9 @@ _claude_http_config() {
 }
 
 _mcp_auth_works() {
-  local token headers body code session content_type initialized_code initialized_ok=0 url="http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp"
+  local token
   token="$(executor_token)" || return 1
-  headers="$(mktemp)" || return 1
-  body="$(mktemp)" || { rm -f -- "$headers"; return 1; }
-  if ! code="$(curl -sS --connect-timeout 2 --max-time 5 -D "$headers" -o "$body" -w '%{http_code}' \
-    -X POST \
-    -H "Authorization: Bearer $token" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json,text/event-stream' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"hermes-box-doctor","version":"1"}}}' \
-    "$url")"; then
-    rm -f -- "$headers" "$body"
-    return 1
-  fi
-  session="$(awk 'tolower($1) == "mcp-session-id:" { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$headers")"
-  content_type="$(awk 'tolower($1) == "content-type:" { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print tolower($0); exit }' "$headers")"
-  if [[ "$code" != 200 || -z "$session" ]] || ! _mcp_response_valid "$body" "$content_type"; then
-    rm -f -- "$headers" "$body"
-    [[ -n "$session" ]] && _mcp_delete_session "$url" "$token" "$session"
-    return 1
-  fi
-  if initialized_code="$(curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' \
-    -X POST \
-    -H "Authorization: Bearer $token" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json,text/event-stream' \
-    -H "Mcp-Session-Id: $session" \
-    --data '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$url")" &&
-    [[ "$initialized_code" == 202 ]]; then
-    initialized_ok=1
-  fi
-  rm -f -- "$headers" "$body"
-  _mcp_delete_session "$url" "$token" "$session"
-  [[ "$initialized_ok" == 1 ]]
-}
-
-_mcp_delete_session() {
-  local url="$1" token="$2" session="$3"
-  curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -X DELETE \
-    -H "Authorization: Bearer $token" \
-    -H 'Accept: application/json,text/event-stream' \
-    -H "Mcp-Session-Id: $session" "$url" >/dev/null 2>&1 || true
-}
-
-_mcp_response_valid() {
-  local body="$1" content_type="$2" filter
-  filter='type == "object" and .jsonrpc == "2.0" and .id == 1 and
-    has("result") and (has("error") | not) and
-    (.result | type == "object") and
-    .result.protocolVersion == "2025-03-26" and
-    (.result.serverInfo | type == "object") and
-    (.result.serverInfo.name | type == "string" and length > 0) and
-    (.result.serverInfo.version | type == "string") and
-    (.result.capabilities | type == "object")'
-  case "$content_type" in
-    application/json*) jq -e "$filter" "$body" >/dev/null 2>&1 ;;
-    text/event-stream*) sed -n 's/^data:[[:space:]]*//p' "$body" | jq -e "$filter" >/dev/null 2>&1 ;;
-    *) return 1 ;;
-  esac
+  _mcp_initialize "http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp" "$token"
 }
 
 doctor() {

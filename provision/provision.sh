@@ -232,6 +232,7 @@ place_assets() {
   log "profile, tmux config, hb helper"
   install -m 0644 "$CTX/guest/profile.sh"  /etc/profile.d/hermes-box.sh
   install -m 0644 "$CTX/guest/tmux.conf"    "$OPT/tmux.conf"
+  install -m 0644 "$CTX/guest/lib-mcp.sh"   "$OPT/bin/lib-mcp.sh"
   install -m 0755 "$CTX/guest/hb"           "$OPT/bin/hb"
   install -m 0755 "$CTX/guest/hb-workload"  "$OPT/bin/hb-workload"
   install -m 0755 "$CTX/guest/hermes-state" "$OPT/bin/hermes-state"
