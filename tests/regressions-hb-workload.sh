@@ -81,6 +81,43 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
   chmod 0700 "$migration_failure"
 )
 
+# The bridge-presence checks must match on "socat TCP-LISTEN:<port>,", not a
+# bare "TCP-LISTEN:<port>," substring — otherwise an unrelated process whose
+# argv happens to contain that text is mistaken for the real socat bridge,
+# and reconcile_once silently and permanently skips (re-)starting host access
+# on that port. This intentionally runs pgrep for real (no stub) against a
+# decoy process to prove the pattern discriminates on the "socat " prefix,
+# the same way _stop_bridge already does.
+(
+  HOME="$tmp/workload-decoy-home"
+  mkdir -p "$HOME/.config/hermes-box" "$tmp/workload-decoy-logs"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb-workload"
+  PORT=4799
+  HERMES_BRIDGE_PORT=0
+  LOGS="$tmp/workload-decoy-logs"
+  BOX_ENV="$tmp/workload-decoy-box.env"
+  LEGACY_QUIESCE_FILE="$tmp/workload-decoy-legacy-paused"
+  printf 'EXECUTOR_PORT=4788\nHERMES_API_PORT=8642\n' >"$BOX_ENV"
+  _exec_up() { return 0; }
+  hb() { return 0; }
+  socat() { printf 'started %s\n' "$*" >>"$tmp/decoy-bridge.events"; }
+  ( exec -a "TCP-LISTEN:4799,decoy" sleep 5 ) &
+  decoy_pid=$!
+  trap 'kill "$decoy_pid" 2>/dev/null || true' EXIT
+  for _ in 1 2 3 4 5 6 7 8 9 10; do
+    pgrep -f "TCP-LISTEN:4799," >/dev/null 2>&1 && break
+    sleep 0.1
+  done
+  reconcile_once
+  kill "$decoy_pid" 2>/dev/null || true
+  wait
+  if ! grep -q 'started.*TCP-LISTEN:4799,' "$tmp/decoy-bridge.events" 2>/dev/null; then
+    echo "a decoy process matching a bare TCP-LISTEN pattern blocked the real socat bridge from starting" >&2
+    exit 1
+  fi
+)
+
 # Active-path acknowledgement reports success only when persistence succeeds.
 (
   # shellcheck disable=SC1090
