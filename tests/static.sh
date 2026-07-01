@@ -136,7 +136,11 @@ if grep -q 'guest_tmp="/root/hermes-import-' box; then
 fi
 grep -qi 'networking is always enabled' README.md
 grep -q 'check.yml. runs it on every push' README.md
-[[ -f .github/workflows/check.yml ]]
-grep -q 'make check' .github/workflows/check.yml
+[[ -f .depot/workflows/check.yml ]]
+grep -q 'make check' .depot/workflows/check.yml
+if [[ -e .github/workflows ]]; then
+  echo "stale .github/workflows/ remains alongside Depot CI" >&2
+  exit 1
+fi
 
 echo "static checks passed"
