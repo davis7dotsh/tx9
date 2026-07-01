@@ -669,6 +669,8 @@ cmd_save() {
     'set -euo pipefail; umask 077; archive=$1; sync
      tar czf "$archive" -C /data \
        --exclude="./home/agent/.config/hermes-box/quiesced" \
+       --exclude="./home/agent/.codex/tmp" \
+       --exclude="./home/agent/.hermes/tmp" \
        --exclude="*/node_modules" --exclude="*/.venv" --exclude="*/venv" \
        --exclude="*/__pycache__" --exclude="*/.cache" \
        --exclude="*.pyc" --exclude="*.pyo" \
