@@ -37,6 +37,10 @@ init() {
   if [[ ! -e "$GATEWAY_POLICY" ]]; then
     touch "$GATEWAY_DISABLED" "$GATEWAY_POLICY"
   fi
+  # Provisioning runs init as root, which would leave the policy markers
+  # root-owned; later agent-run gateway_disable/gateway_enable must be able
+  # to recreate and remove them.
+  id agent >/dev/null 2>&1 && chown agent:agent "$GATEWAY_DISABLED" "$GATEWAY_POLICY" 2>/dev/null || true
 }
 
 _port_open() {
@@ -251,7 +255,11 @@ gateway_enable() {
 
 gateway_disable() {
   init
-  touch "$GATEWAY_DISABLED"
+  # The marker may be root-owned from provisioning; touch then fails to update
+  # its mtime, which is fine — but "disabled" must never be claimed unless the
+  # durable marker actually exists.
+  touch "$GATEWAY_DISABLED" 2>/dev/null || true
+  [[ -e "$GATEWAY_DISABLED" ]] || { echo "could not persist gateway-disabled marker at $GATEWAY_DISABLED" >&2; return 1; }
   _stop_gateway || return 1
   echo "Hermes gateway: disabled"
 }

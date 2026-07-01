@@ -260,6 +260,25 @@ HB_DATA="$legacy_data" HB_LEGACY_QUIESCE_FILE="$legacy_pause" "$PROJECT_ROOT/gue
   fi
 )
 
+# gateway_disable must fail loudly when it cannot persist the durable marker,
+# and succeed when an existing (possibly unwritable) marker is already there —
+# provisioning creates it as root, and touch on a root-owned file fails for
+# the agent user even though the disabled state itself is correct.
+(
+  HB_DATA="$tmp/gateway-disable-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  _stop_gateway() { return 0; }
+  touch() { return 1; }  # simulate a marker touch denied by ownership
+  gateway_disable >/dev/null || { echo "gateway_disable failed though the marker exists" >&2; exit 1; }
+  command rm -f "$GATEWAY_DISABLED"
+  if gateway_disable >/dev/null 2>&1; then
+    echo "gateway_disable claimed success without a persisted disabled marker" >&2
+    exit 1
+  fi
+)
+
 # Explicit MCP wiring refuses to clear durable quiesce.
 wire_quiesced="$tmp/wire-quiesced"
 HB_DATA="$wire_quiesced" "$PROJECT_ROOT/guest/hb" init
