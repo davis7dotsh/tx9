@@ -161,11 +161,17 @@ hb cutover-ready</code></pre>
 ./box repair alpha</code></pre>
       <p>Inside the box, inspect <code>hb status</code> and <code>hb logs executor</code>. Run <code>hb wire-mcp</code> to replace stale legacy stdio wiring with the authenticated HTTP configuration.</p>
 
+      <h3><code>box open</code> reports success but no browser appears</h3>
+      <p>This is expected on a headless host reached over SSH or Tailscale rather than at its console — see <a href="../README.md#executor-and-mcp">README's Executor and MCP section</a> for how to reach the UI from a separate client machine instead.</p>
+
       <h3>An operation says the box is locked</h3>
       <p>Another mutation may be running. Locks contain an owning PID and stale locks are recovered automatically after that process exits. Do not manually remove a lock while a save, load, repair, or delete is active.</p>
 
       <h3>A restore fails before VM creation</h3>
       <p>The passphrase may be incorrect, or the decrypted archive may be corrupt or unsafe. This failure intentionally occurs before provisioning so it does not leave an orphan VM.</p>
+
+      <h3><code>box new</code> fails with a Hermes installer checksum error</h3>
+      <p>Upstream has rotated <code>install.sh</code> since <code>HERMES_INSTALLER_SHA256</code> in <code>box.env</code> was last pinned. Run <code>make check-hermes-pin</code> to confirm the drift and see the current upstream hash, review the new installer, then update <code>box.env</code> yourself.</p>
 
       <h3>Validate the repository</h3>
       <pre><code>make check</code></pre>

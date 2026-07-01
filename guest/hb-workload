@@ -80,13 +80,13 @@ reconcile_once() {
   if hb reconcile >>"$LOGS/workload.log" 2>&1; then reconciled=1; fi
   # socat bridge for host access (only when a distinct port was assigned)
   if [ "$PORT" != "4788" ] && command -v socat >/dev/null 2>&1 && _exec_up \
-     && ! pgrep -f "TCP-LISTEN:$PORT," >/dev/null 2>&1; then
+     && ! pgrep -f "socat TCP-LISTEN:$PORT," >/dev/null 2>&1; then
     socat "TCP-LISTEN:$PORT,bind=0.0.0.0,fork,reuseaddr" "TCP:127.0.0.1:$EXECUTOR_TARGET_PORT" \
       >>"$LOGS/socat.log" 2>&1 &
   fi
   if [ "$HERMES_BRIDGE_PORT" != 0 ] && [ "$reconciled" = 1 ] && [ ! -e "$GATEWAY_DISABLED" ] \
      && command -v socat >/dev/null 2>&1 && _wait_api_ready; then
-    if ! pgrep -f "TCP-LISTEN:$HERMES_BRIDGE_PORT," >/dev/null 2>&1; then
+    if ! pgrep -f "socat TCP-LISTEN:$HERMES_BRIDGE_PORT," >/dev/null 2>&1; then
       socat "TCP-LISTEN:$HERMES_BRIDGE_PORT,bind=0.0.0.0,fork,reuseaddr" \
         "TCP:127.0.0.1:$HERMES_TARGET_PORT" >>"$LOGS/hermes-api-socat.log" 2>&1 &
     fi

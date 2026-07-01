@@ -102,6 +102,18 @@ enabled, smolvm forwards a unique host-loopback port in the configured
 `4790–4999` range. `box open` reads Executor's stable local token and hands the
 authenticated URL directly to the browser without printing the credential.
 
+`box open` launches a browser on the machine running `./box` itself (via
+`BOX_BROWSER`, `xdg-open`, or `gio open`). On a headless host reached over SSH
+or Tailscale rather than at its console, that handoff can report success
+without any browser becoming visible to you — these openers consider the job
+done once they hand the URL to a desktop session or portal, not once a human
+sees a window. To reach the UI from a separate client machine instead, forward
+the host-loopback port yourself, e.g. `ssh -L <port>:127.0.0.1:<port> <host>`,
+read the live token from inside the box with `./box enter` then `hb
+executor-token` (so it never touches host logs, shell history, or `box`'s own
+output), and open `http://localhost:<port>/?_token=<token>` in a browser on
+that client machine.
+
 The workload keeps one Executor daemon alive. Claude and Codex connect to that
 daemon's authenticated Streamable HTTP endpoint; they do not launch `executor
 mcp` as a second process. The bearer token remains under `/data` in Executor's
@@ -227,3 +239,9 @@ contract checks, protocol-health regressions, and local archive/lifecycle smoke
 tests. It does not create a VM or contact upstream installers. `make check` is
 fully hermetic, so `.depot/workflows/check.yml` runs it on every push and
 pull request to `main` via Depot CI.
+
+If `./box new` fails immediately with "Hermes installer checksum verification
+failed", upstream has rotated `install.sh` since `HERMES_INSTALLER_SHA256` was
+last pinned. Run `make check-hermes-pin` (needs network access, so it's not
+part of `make check`) to confirm the drift, review the new installer, then
+update `box.env` yourself — this check does not auto-update the pin.
