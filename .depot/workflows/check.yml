@@ -1,14 +1,18 @@
-name: check
+# Depot CI Migration
+# Source: .github/workflows/check.yml
+#
+# Changes made:
+# - Changed GitHub runs-on labels to their Depot equivalents
 
+name: check
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
 jobs:
   make-check:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest # was: ubuntu-latest. Mapped standard GitHub runner to Depot equivalent.
     steps:
       - uses: actions/checkout@v4
       - name: Install jq
