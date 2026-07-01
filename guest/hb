@@ -196,7 +196,7 @@ _stop_gateway() {
   done
   pkill -KILL -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true
   rm -f "$GATEWAY_PID"
-  _gateway_running && { echo "Hermes gateway failed to stop" >&2; return 1; }
+  ! _gateway_running || { echo "Hermes gateway failed to stop" >&2; return 1; }
 }
 
 pause() {

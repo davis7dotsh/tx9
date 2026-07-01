@@ -243,6 +243,23 @@ HB_DATA="$legacy_data" HB_LEGACY_QUIESCE_FILE="$legacy_pause" "$PROJECT_ROOT/gue
 [[ -e "$legacy_data/home/agent/.config/hermes-box/quiesced" ]]
 [[ ! -e "$legacy_pause" ]]
 
+# Stopping an already-stopped gateway is success, not failure: pause (and so
+# every box save) must not fail just because the gateway was never running.
+(
+  HB_DATA="$tmp/stop-gateway-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  _gateway_running() { return 1; }
+  pkill() { :; }
+  sleep() { :; }
+  _stop_gateway || { echo "stop_gateway failed with no gateway running" >&2; exit 1; }
+  _gateway_running() { return 0; }
+  if _stop_gateway 2>/dev/null; then
+    echo "stop_gateway claimed success while the gateway survived" >&2
+    exit 1
+  fi
+)
+
 # Explicit MCP wiring refuses to clear durable quiesce.
 wire_quiesced="$tmp/wire-quiesced"
 HB_DATA="$wire_quiesced" "$PROJECT_ROOT/guest/hb" init
