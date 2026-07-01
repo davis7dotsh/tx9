@@ -1,0 +1,10 @@
+[Unit]
+Description=Scheduled backup retention prune for tx9 agent box %i
+
+[Timer]
+OnCalendar=*-*-* 04:00:00
+RandomizedDelaySec=30min
+Persistent=true
+
+[Install]
+WantedBy=timers.target

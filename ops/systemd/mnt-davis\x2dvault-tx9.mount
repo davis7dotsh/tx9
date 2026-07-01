@@ -1,0 +1,10 @@
+[Unit]
+Description=CIFS backup vault for tx9
+
+[Mount]
+# Replace with the real CIFS share. The credentials file should contain
+# `username=...` / `password=...` lines, mode 0600, owned by root.
+What=//nas.example.invalid/share
+Where=/mnt/davis-vault/tx9
+Type=cifs
+Options=credentials=/etc/tx9/cifs-credentials,uid=tx9,gid=tx9,file_mode=0600,dir_mode=0700,vers=3.0,_netdev

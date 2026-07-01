@@ -1,10 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-tmp="$(mktemp -d)"
-cleanup() { rm -rf "$tmp"; }
-trap cleanup EXIT HUP INT TERM
+# shellcheck source=tests/lib.sh
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 mkdir -p "$tmp/valid/home/agent/workspace" "$tmp/invalid/not-home" "$tmp/gnupg" "$tmp/host-tmp"
 chmod 0700 "$tmp/gnupg"
@@ -18,7 +16,8 @@ python3 - "$tmp/absolute-symlink.tgz" "$tmp/traversal-symlink.tgz" \
   "$tmp/invalid-hardlink.tgz" "$tmp/special-file.tgz" "$tmp/home-link.tgz" \
   "$tmp/cycle-link.tgz" "$tmp/pivot-link.tgz" "$tmp/root-symlink.tgz" \
   "$tmp/root-hardlink.tgz" "$tmp/linked-parent-alias.tgz" \
-  "$tmp/linked-parent-regular.tgz" <<'PY'
+  "$tmp/linked-parent-regular.tgz" "$tmp/control-char-name.tgz" \
+  "$tmp/control-char-link.tgz" <<'PY'
 import io
 import sys
 import tarfile
@@ -137,6 +136,22 @@ with tarfile.open(sys.argv[11], "w:gz") as archive:
     child = tarfile.TarInfo("home/agent/up/owned")
     child.size = len(payload)
     archive.addfile(child, io.BytesIO(payload))
+
+with tarfile.open(sys.argv[12], "w:gz") as archive:
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+    bad = tarfile.TarInfo("home/agent/bad\x01name")
+    payload = b"control character in member name\n"
+    bad.size = len(payload)
+    archive.addfile(bad, io.BytesIO(payload))
+
+with tarfile.open(sys.argv[13], "w:gz") as archive:
+    archive.addfile(directory("home"))
+    archive.addfile(directory("home/agent"))
+    link = tarfile.TarInfo("home/agent/bad-link")
+    link.type = tarfile.SYMTYPE
+    link.linkname = "bad\x01target"
+    archive.addfile(link)
 PY
 
 (
@@ -152,7 +167,8 @@ PY
     "$tmp/invalid-hardlink.tgz" "$tmp/special-file.tgz" "$tmp/home-link.tgz" \
     "$tmp/cycle-link.tgz" "$tmp/pivot-link.tgz" "$tmp/root-symlink.tgz" \
     "$tmp/root-hardlink.tgz" "$tmp/linked-parent-alias.tgz" \
-    "$tmp/linked-parent-regular.tgz"; do
+    "$tmp/linked-parent-regular.tgz" "$tmp/control-char-name.tgz" \
+    "$tmp/control-char-link.tgz"; do
     if _validate_archive "$unsafe"; then
       echo "linked archive passed validation: $unsafe" >&2
       exit 1
@@ -176,7 +192,8 @@ gpg --batch --yes --pinentry-mode loopback --passphrase "$BOX_PASSPHRASE" \
 gpg --batch --yes --pinentry-mode loopback --passphrase "$BOX_PASSPHRASE" \
   --symmetric --cipher-algo AES256 -o "$tmp/invalid.tar.gz.gpg" "$tmp/invalid.tgz"
 for unsafe in absolute-symlink traversal-symlink invalid-hardlink special-file home-link cycle-link \
-  pivot-link root-symlink root-hardlink linked-parent-alias linked-parent-regular; do
+  pivot-link root-symlink root-hardlink linked-parent-alias linked-parent-regular \
+  control-char-name control-char-link; do
   gpg --batch --yes --pinentry-mode loopback --passphrase "$BOX_PASSPHRASE" \
     --symmetric --cipher-algo AES256 -o "$tmp/${unsafe}.tar.gz.gpg" "$tmp/${unsafe}.tgz"
 done
@@ -195,7 +212,8 @@ PY
 [[ -z "$(find "$tmp/host-tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
 for unsafe in absolute-symlink traversal-symlink invalid-hardlink special-file home-link cycle-link \
-  pivot-link root-symlink root-hardlink linked-parent-alias linked-parent-regular; do
+  pivot-link root-symlink root-hardlink linked-parent-alias linked-parent-regular \
+  control-char-name control-char-link; do
   unsafe_sentinel="$tmp/${unsafe}-smolvm-called"
   if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$unsafe_sentinel" \
     SMOLVM_STATE_DIR="$tmp/smolvm-state" TMPDIR="$tmp/host-tmp" \
@@ -216,9 +234,7 @@ fi
 [[ ! -e "$sentinel" ]] || { echo "VM command ran before archive validation" >&2; exit 1; }
 [[ -z "$(find "$tmp/host-tmp" -mindepth 1 -maxdepth 1 -print -quit)" ]]
 
-mkdir -p "$tmp/repo"
-cp "$PROJECT_ROOT/box" "$PROJECT_ROOT/box.env" "$tmp/repo/"
-cp -R "$PROJECT_ROOT/guest" "$PROJECT_ROOT/provision" "$tmp/repo/"
+make_repo "$tmp/repo"
 if PATH="$PROJECT_ROOT/tests/fixtures:$PATH" SMOLVM_CALLED="$sentinel" \
   SMOLVM_STATE_DIR="$tmp/smolvm-state" "$tmp/repo/box" new rollback-probe >/dev/null 2>&1; then
   echo "mock provisioning failure unexpectedly succeeded" >&2

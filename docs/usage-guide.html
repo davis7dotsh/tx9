@@ -55,23 +55,9 @@ codex</code></pre>
 
     <section id="daily-use">
       <h2>Daily use</h2>
-      <div class="table-wrap" role="region" aria-label="Common Hermes Box Lite commands" tabindex="0">
-        <table>
-          <caption>Common commands</caption>
-          <thead>
-            <tr><th scope="col">Command</th><th scope="col">Purpose</th></tr>
-          </thead>
-          <tbody>
-            <tr><th scope="row"><code>./box ls</code></th><td>List managed boxes, their state, and Executor URLs.</td></tr>
-            <tr><th scope="row"><code>./box enter alpha</code></th><td>Start the box and attach its persistent tmux session.</td></tr>
-            <tr><th scope="row"><code>./box open alpha</code></th><td>Open the authenticated Executor UI.</td></tr>
-            <tr><th scope="row"><code>./box stop alpha</code></th><td>Stop the VM without deleting its state.</td></tr>
-            <tr><th scope="row"><code>./box start alpha</code></th><td>Start a stopped VM.</td></tr>
-            <tr><th scope="row"><code>./box doctor alpha</code></th><td>Check tools, durable state, guest MCP, and the forwarded host MCP endpoint when one is exposed.</td></tr>
-            <tr><th scope="row"><code>./box import-hermes alpha backup.zip</code></th><td>Validate and atomically import a native Hermes backup with its gateway disabled.</td></tr>
-          </tbody>
-        </table>
-      </div>
+      <p>The full command reference (every <code>box</code> subcommand and what it does) lives in
+        <a href="../README.md#commands">the README's Commands table</a> — kept there as the single
+        source of truth so it can't drift out of sync with this page.</p>
 
       <h3>Inside the box</h3>
       <pre><code>hb status
@@ -87,19 +73,26 @@ hb cutover-ready</code></pre>
 
     <section id="backup-restore">
       <h2>Backup and restore</h2>
+      <p>The exact guarantees each of these commands makes — what gets quiesced, validated,
+        excluded, and verified, step by step — are documented once, in
+        <a href="../README.md#backup-and-restore-guarantees">README's Backup and restore guarantees</a>,
+        so they can't quietly drift out of sync with this walkthrough. What follows here is the
+        practical "what do I actually type" version.</p>
+
       <h3>Create a backup</h3>
       <pre><code>./box save alpha</code></pre>
-      <p>By default, this creates <code>backups/alpha-&lt;timestamp&gt;.tar.gz.gpg</code>. The command refuses to overwrite an existing destination. Set a passphrase in the environment for unattended use:</p>
+      <p>By default, this creates <code>backups/alpha-&lt;timestamp&gt;.tar.gz.gpg</code> and refuses to overwrite an existing destination. Set a passphrase in the environment for unattended use:</p>
       <pre><code>BOX_PASSPHRASE='your-local-secret' ./box save alpha</code></pre>
-      <p>The mode-0600 runtime manifest is atomically published at <code>~/.config/hermes-box/runtime-manifest</code>. Hermes and Executor are stopped, every Hermes SQLite checkpoint is confirmed non-busy and integrity-checked, and transient caches, native dependency trees, Hermes sidecars, PIDs, and locks are excluded. Unrelated database sidecars elsewhere under <code>/data</code> are preserved.</p>
 
       <h3>Restore into a new box</h3>
       <pre><code>./box load backups/alpha-20260625-120000.tar.gz.gpg beta</code></pre>
-      <p>The archive is decrypted and validated before a VM is created. The destination is provisioned, extracted into staging while services are quiesced, SQLite-verified before the state swap, refreshed, rewired, and health-checked. The Hermes gateway remains disabled so restore rehearsals cannot claim a live messaging identity.</p>
+      <p>The archive is decrypted and validated before a VM is even created. The Hermes gateway stays disabled afterward, so a restore rehearsal can never accidentally claim a live messaging identity.</p>
 
       <h3>Import from Eventide or another Hermes host</h3>
       <pre><code>./box import-hermes alpha hermes-backup.zip --map /Users/davis=/data/home/agent</code></pre>
-      <p>Native import rejects traversal, symlink entries, duplicate normalized member paths, and archives without an importable canonical root Hermes marker before guest mutation, so transient-only content cannot replace existing state with an empty home. It stages and atomically swaps <code>~/.hermes</code>, rewrites only active config, env, cron, hook, and script files, and leaves historical sessions, memories, databases, and logs byte-for-byte unchanged. The source ZIP remains unchanged. Root-level <code>~/.hermes/tmp</code> and files identified by thin Mach-O magic or a structurally valid universal Mach-O header anywhere in the otherwise imported tree are skipped before staging; fat-header validation distinguishes the shared <code>CAFEBABE</code> prefix from Java class files. Successful imports warn when exclusions occur, and the manifest records each skipped path, size, reason, and normalized file/byte totals. Every external provider destination is previewed and requires a matching repeatable <code>--external NAME</code> approval; reserved destinations are rejected. Review the manifest, run <code>hb acknowledge-active-paths</code>, then require <code>hb cutover-ready</code> before enabling the gateway.</p>
+      <p>Validates and atomically imports native Hermes state with the gateway left disabled. Review the
+        import manifest, run <code>hb acknowledge-active-paths</code>, then require <code>hb cutover-ready</code>
+        before enabling the gateway — see the README link above for exactly what the import does and skips.</p>
 
       <h3>Inspect a backup without a VM</h3>
       <pre><code>./box extract backups/alpha-20260625-120000.tar.gz.gpg</code></pre>
@@ -134,21 +127,13 @@ hb cutover-ready</code></pre>
       <p>Edit <code>box.env</code> before creating or repairing a box.</p>
       <div class="table-wrap" role="region" aria-label="Hermes Box Lite configuration" tabindex="0">
         <table>
-          <caption>Important settings</caption>
+          <caption>Where each setting lives</caption>
           <thead>
-            <tr><th scope="col">Setting</th><th scope="col">Effect</th></tr>
+            <tr><th scope="col">Topic</th><th scope="col">See</th></tr>
           </thead>
           <tbody>
-            <tr><th scope="row"><code>BASE_IMAGE</code></th><td>OCI image used for new boxes.</td></tr>
-            <tr><th scope="row"><code>NODE_MAJOR</code></th><td>NodeSource major line installed during provisioning.</td></tr>
-            <tr><th scope="row"><code>INSTALL_HERMES</code></th><td>Enable or disable Hermes installation.</td></tr>
-            <tr><th scope="row"><code>HERMES_GIT_SHA</code> / <code>HERMES_GIT_BUNDLE</code></th><td>Pin the exact checkout and optionally seed a custom commit from ignored <code>artifacts/</code>.</td></tr>
-            <tr><th scope="row"><code>BOX_CPUS</code> / <code>BOX_MEM_MIB</code> / <code>BOX_OVERLAY_GIB</code></th><td>Validated smolvm capacity; overlay defaults to 64 GiB.</td></tr>
-            <tr><th scope="row"><code>EXPOSE_HERMES_API</code></th><td>Optionally assign collision-checked loopback host and guest bridge ports.</td></tr>
-            <tr><th scope="row"><code>INSTALL_EXECUTOR</code></th><td>Enable or disable Executor installation.</td></tr>
-            <tr><th scope="row"><code>EXPOSE_EXECUTOR_WEB</code></th><td>Forward Executor to a unique loopback-only host port.</td></tr>
-            <tr><th scope="row"><code>EXECUTOR_PORT_LO</code> / <code>HI</code></th><td>Range used for unique host ports.</td></tr>
-            <tr><th scope="row"><code>WIRE_EXECUTOR_MCP</code></th><td>Register Executor's authenticated HTTP MCP endpoint with Claude and Codex.</td></tr>
+            <tr><th scope="row">Every setting and its effect</th><td><code>box.env</code> itself — each key has an inline comment, and it's the literal source of truth this page would otherwise just be restating.</td></tr>
+            <tr><th scope="row">Tool installation paths and durable state</th><td><a href="../README.md#tool-installation-and-state">README's Tool installation and state table</a>.</td></tr>
           </tbody>
         </table>
       </div>

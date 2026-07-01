@@ -224,5 +224,6 @@ make check
 
 This requires ShellCheck, Python 3, and jq, and runs Bash syntax checks, static
 contract checks, protocol-health regressions, and local archive/lifecycle smoke
-tests. It does not create a VM or contact upstream installers. There is
-intentionally no CI configuration yet.
+tests. It does not create a VM or contact upstream installers. `make check` is
+fully hermetic, so `.github/workflows/check.yml` runs it on every push and
+pull request to `main`.

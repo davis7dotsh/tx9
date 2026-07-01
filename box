@@ -7,6 +7,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
 # shellcheck source=box.env
 source "$ROOT/box.env"
+# shellcheck source=guest/lib-mcp.sh
+source "$ROOT/guest/lib-mcp.sh"
 
 REG="$ROOT/.boxes"
 LOCK_ROOT="$ROOT/.box-locks"
@@ -215,69 +217,6 @@ _port_free() {
   _tcp_port_open 127.0.0.1 "$1" && return 1
   _tcp_port_open ::1 "$1" && return 1
   return 0
-}
-
-_mcp_initialize() {
-  local url="$1" token="$2" headers body code session content_type initialized_code initialized_ok=0
-  headers="$(mktemp)" || return 1
-  body="$(mktemp)" || { rm -f -- "$headers"; return 1; }
-  _track_temp "$headers"
-  _track_temp "$body"
-  if ! code="$(curl -sS --connect-timeout 2 --max-time 5 -D "$headers" -o "$body" -w '%{http_code}' \
-    -X POST \
-    -H "Authorization: Bearer $token" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json,text/event-stream' \
-    --data '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"hermes-box-doctor","version":"1"}}}' \
-    "$url")"; then
-    rm -f -- "$headers" "$body"
-    return 1
-  fi
-  session="$(awk 'tolower($1) == "mcp-session-id:" { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$headers")"
-  content_type="$(awk 'tolower($1) == "content-type:" { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print tolower($0); exit }' "$headers")"
-  if [[ "$code" != 200 || -z "$session" ]] || ! _mcp_response_valid "$body" "$content_type"; then
-    rm -f -- "$headers" "$body"
-    [[ -n "$session" ]] && _mcp_delete_session "$url" "$token" "$session"
-    return 1
-  fi
-  if initialized_code="$(curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -w '%{http_code}' \
-    -X POST \
-    -H "Authorization: Bearer $token" \
-    -H 'Content-Type: application/json' \
-    -H 'Accept: application/json,text/event-stream' \
-    -H "Mcp-Session-Id: $session" \
-    --data '{"jsonrpc":"2.0","method":"notifications/initialized"}' "$url")" &&
-    [[ "$initialized_code" == 202 ]]; then
-    initialized_ok=1
-  fi
-  rm -f -- "$headers" "$body"
-  _mcp_delete_session "$url" "$token" "$session"
-  [[ "$initialized_ok" == 1 ]]
-}
-
-_mcp_delete_session() {
-  local url="$1" token="$2" session="$3"
-  curl -sS --connect-timeout 2 --max-time 5 -o /dev/null -X DELETE \
-    -H "Authorization: Bearer $token" \
-    -H 'Accept: application/json,text/event-stream' \
-    -H "Mcp-Session-Id: $session" "$url" >/dev/null 2>&1 || true
-}
-
-_mcp_response_valid() {
-  local body="$1" content_type="$2" filter
-  filter='type == "object" and .jsonrpc == "2.0" and .id == 1 and
-    has("result") and (has("error") | not) and
-    (.result | type == "object") and
-    .result.protocolVersion == "2025-03-26" and
-    (.result.serverInfo | type == "object") and
-    (.result.serverInfo.name | type == "string" and length > 0) and
-    (.result.serverInfo.version | type == "string") and
-    (.result.capabilities | type == "object")'
-  case "$content_type" in
-    application/json*) jq -e "$filter" "$body" >/dev/null 2>&1 ;;
-    text/event-stream*) sed -n 's/^data:[[:space:]]*//p' "$body" | jq -e "$filter" >/dev/null 2>&1 ;;
-    *) return 1 ;;
-  esac
 }
 
 _wait_mcp_ready() {
@@ -543,8 +482,13 @@ _create_base() {
   [[ -z "${BOX_STORAGE_GIB:-}" ]] || resources+=(--storage "$BOX_STORAGE_GIB")
   wl_port="${port:-4788}"
   _defer_signals
+  # No `exec` into hb-workload: if the loop process itself dies (OOM-killed, a
+  # bug not guarded by its `set -u`), nothing else in the VM restarts it, so
+  # this outer loop is the supervisor. hb-workload's own internals (gateway,
+  # socat bridges) are reconciled every 20s once it's running again.
   if smolvm machine create --net "${opts[@]}" "${resources[@]}" --name "$n" --image "$BASE_IMAGE" \
-    -- bash -c "while [ ! -x /opt/hermes-box/bin/hb-workload ]; do sleep 2; done; exec runuser -u agent -- env HOME=/data/home/agent /opt/hermes-box/bin/hb-workload ${wl_port} ${api_guest_port:-0}"; then
+    -- bash -c "while [ ! -x /opt/hermes-box/bin/hb-workload ]; do sleep 2; done
+      while true; do runuser -u agent -- env HOME=/data/home/agent /opt/hermes-box/bin/hb-workload ${wl_port} ${api_guest_port:-0}; sleep 2; done"; then
     create_status=0
   else
     create_status=$?
@@ -571,7 +515,7 @@ _create_base() {
 }
 
 _provision_into() {
-  local n="$1" mode="${2:-full}" contexts=(provision guest box.env)
+  local n="$1" mode="${2:-full}" log_file="${3:-}" contexts=(provision guest box.env) cmd
   if [[ "$mode" == full ]]; then
     _validate_bundle
     [[ -z "${HERMES_GIT_BUNDLE:-}" ]] || contexts+=("$HERMES_GIT_BUNDLE")
@@ -586,11 +530,17 @@ _provision_into() {
   else
     say "Provisioning node/uv, claude, codex, hermes, executor (a few minutes)…"
   fi
-  smolvm machine exec --name "$n" -- bash -lc "
-    set -e
+  cmd="set -e
     rm -rf /tmp/ctx && mkdir -p /tmp/ctx
     tar xzf /tmp/ctx.tgz -C /tmp/ctx
     bash /tmp/ctx/provision/provision.sh '$mode'"
+  # Optionally tee the transcript to a host-side file so a caller can persist
+  # it as failure evidence before rollback deletes the only other copy.
+  if [[ -n "$log_file" ]]; then
+    smolvm machine exec --name "$n" -- bash -lc "$cmd" 2>&1 | tee "$log_file"
+  else
+    smolvm machine exec --name "$n" -- bash -lc "$cmd"
+  fi
 }
 
 _prepare_runtime() {
@@ -598,6 +548,25 @@ _prepare_runtime() {
   _guest_hb "$n" up || return 1
   _guest_hb "$n" wire-once || return 1
   _guest_hb "$n" doctor
+}
+
+# Best-effort: a failure saving the transcript (full disk, read-only checkout)
+# must never itself abort the caller's failure-handling path under set -e —
+# that would skip keep-on-failure's _clear_created and let the EXIT trap roll
+# the box back anyway, defeating the one thing the operator needed most.
+_save_failed_transcript() {
+  local n="$1" log_file="$2" failed_log
+  [[ -s "$log_file" ]] || return 0
+  if ! mkdir -p backups/.failed; then
+    warn "could not create backups/.failed; provisioning transcript was not saved"
+    return 0
+  fi
+  failed_log="backups/.failed/${n}-$(date -u +%Y%m%dT%H%M%SZ).log"
+  if cp "$log_file" "$failed_log"; then
+    warn "provisioning transcript saved to $failed_log"
+  else
+    warn "could not save provisioning transcript to $failed_log"
+  fi
 }
 
 _rollback_created() {
@@ -633,13 +602,30 @@ _rollback_created() {
 }
 
 cmd_new() {
-  local n="${1:?usage: box new <name>}"
+  local n="${1:?usage: box new <name> [--keep-on-failure]}" keep_on_failure=0 stage="" log_file
+  [[ "${2:-}" != --keep-on-failure && "${BOX_KEEP_ON_FAILURE:-0}" != 1 ]] || keep_on_failure=1
   _validate_name "$n"
   _host_preflight provision
   _acquire_lock "$n"
   say "Creating instance '$n' from $BASE_IMAGE"
-  if ! _create_base "$n" || ! _provision_into "$n" full || ! _prepare_runtime "$n"; then
-    die "box creation failed"
+  log_file="$(mktemp)"
+  _track_temp "$log_file"
+  if ! _create_base "$n"; then
+    stage="creating the base VM"
+  elif ! _provision_into "$n" full "$log_file"; then
+    stage="provisioning"
+  elif ! _prepare_runtime "$n"; then
+    stage="preparing the runtime (gateway start, MCP wiring, doctor)"
+  fi
+  if [[ -n "$stage" ]]; then
+    _save_failed_transcript "$n" "$log_file"
+    if [[ "$keep_on_failure" == 1 ]]; then
+      _clear_created "$n"
+      warn "leaving '$n' in place for inspection (--keep-on-failure / BOX_KEEP_ON_FAILURE=1)"
+      warn "inspect with: smolvm machine exec --name '$n' -- bash"
+      warn "remove when done with: ./box rm '$n' --force"
+    fi
+    die "box creation failed while $stage"
   fi
   _clear_created "$n"
   local port
@@ -705,7 +691,9 @@ cmd_save() {
 }
 
 cmd_load() {
-  local file="${1:?usage: box load <archive.tar.gz.gpg> [name]}" n="${2:-restored}" raw guest_tmp
+  local file="${1:?usage: box load <archive.tar.gz.gpg> [name] [--keep-on-failure]}" n="${2:-restored}" raw guest_tmp
+  local keep_on_failure=0 log_file stage=""
+  [[ "${3:-}" != --keep-on-failure && "${BOX_KEEP_ON_FAILURE:-0}" != 1 ]] || keep_on_failure=1
   [[ -f "$file" ]] || die "no such archive: $file"
   _validate_name "$n"
   _host_preflight full
@@ -717,8 +705,21 @@ cmd_load() {
   _validate_archive "$raw" || die "archive is invalid or unsafe"
 
   say "Creating and provisioning fresh instance '$n'"
-  if ! _create_base "$n" || ! _provision_into "$n" full; then
-    die "destination provisioning failed"
+  log_file="$(mktemp)"
+  _track_temp "$log_file"
+  if ! _create_base "$n"; then
+    stage="creating the base VM"
+  elif ! _provision_into "$n" full "$log_file"; then
+    stage="provisioning"
+  fi
+  if [[ -n "$stage" ]]; then
+    _save_failed_transcript "$n" "$log_file"
+    if [[ "$keep_on_failure" == 1 ]]; then
+      _clear_created "$n"
+      warn "leaving '$n' in place for inspection (--keep-on-failure / BOX_KEEP_ON_FAILURE=1)"
+      warn "remove when done with: ./box rm '$n' --force"
+    fi
+    die "box load failed while $stage"
   fi
 
   guest_tmp="/root/hb-restore-$(date +%Y%m%d-%H%M%S)-$$-${RANDOM}.tgz"
@@ -764,8 +765,15 @@ cmd_load() {
        trap '\''if [[ "$restore_failed" == 1 ]]; then find /data -mindepth 1 -maxdepth 1 ! -path "$rollback" -exec rm -rf -- {} +; mv "$rollback"/* /data/ 2>/dev/null || true; fi; rm -rf "$stage" "$rollback"; rm -f -- "$archive"'\'' EXIT HUP INT TERM
        mv "$stage"/* /data/
        restore_failed=0' bash "$guest_tmp" ||
-    ! _provision_into "$n" assets || ! _guest_hb "$n" gateway-disable ||
+    ! _provision_into "$n" assets "$log_file" || ! _guest_hb "$n" gateway-disable ||
     ! _guest_hb "$n" verify-state >/dev/null || ! _resume_box "$n" || ! _prepare_runtime "$n"; then
+    _save_failed_transcript "$n" "$log_file"
+    if [[ "$keep_on_failure" == 1 ]]; then
+      _clear_created "$n"
+      warn "leaving '$n' in place for inspection (--keep-on-failure / BOX_KEEP_ON_FAILURE=1)"
+      warn "remove when done with: ./box rm '$n' --force"
+      die "restore failed; left incomplete destination '$n' for inspection"
+    fi
     die "restore failed; attempting cleanup of the incomplete destination"
   fi
   _untrack_guest_temp "$n" "$guest_tmp"
@@ -1051,7 +1059,8 @@ usage() {
   cat <<'EOF'
 hermes-box-lite — isolated, portable agent boxes (claude / codex / hermes / executor)
 
-  ./box new <name>             Create, provision, and health-check a fresh box
+  ./box new <name> [--keep-on-failure]
+                               Create, provision, and health-check a fresh box
   ./box enter <name>           Log in as agent and attach tmux 'main'
   ./box ls [--all]             List managed boxes (or every smolvm VM)
   ./box open <name>            Open the authenticated Executor web UI
@@ -1059,13 +1068,18 @@ hermes-box-lite — isolated, portable agent boxes (claude / codex / hermes / ex
   ./box repair <name>          Re-run provisioning and repair managed guest assets
   ./box stop|start <name>      Stop or start an instance
   ./box save <name> [out]      Quiesce, validate, encrypt, and verify /data
-  ./box load <file> [name]     Validate first, then build and restore a fresh box
+  ./box load <file> [name] [--keep-on-failure]
+                               Validate first, then build and restore a fresh box
   ./box import-hermes <name> <hermes-backup.zip> [--external NAME]... [--map OLD=NEW]...
                                Transactionally import native Hermes state; gateway stays disabled
   ./box extract <file> [dir]   Validate and extract a backup without a VM
   ./box rm <name> [--force]    Delete after confirmation (or explicit --force)
 
   Set BOX_PASSPHRASE to skip the GPG prompt. Configuration: box.env
+  Set BOX_KEEP_ON_FAILURE=1 (or pass --keep-on-failure to `new`/`load`) to
+  skip rollback on a failed `new`/`load` and leave the VM up for inspection.
+  A failed `new`/`load` also saves its provisioning transcript under
+  backups/.failed/ before any rollback runs.
 EOF
 }
 

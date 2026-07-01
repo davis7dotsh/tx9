@@ -5,22 +5,30 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+# tests/regressions-*.sh is globbed so new split-out regression files are
+# picked up automatically.
+regression_files=(tests/regressions-*.sh)
+
 files=(
   box
   guest/hb
   guest/hb-workload
+  guest/lib-mcp.sh
   guest/profile.sh
   guest/agent-bash-profile.sh
   provision/provision.sh
   ops/tx9-host
+  ops/tx9-backup-prune
+  tests/lib.sh
   tests/lifecycle-smoke.sh
   tests/hermes-state.sh
-  tests/regressions.sh
+  tests/cli-surface.sh
+  "${regression_files[@]}"
   tests/fixtures/smolvm
 )
 
 bash -n "${files[@]}"
-for file in box guest/hb guest/hb-workload guest/hermes-state provision/provision.sh ops/tx9-host tests/lifecycle-smoke.sh tests/hermes-state.sh tests/regressions.sh tests/fixtures/smolvm; do
+for file in box guest/hb guest/hb-workload guest/hermes-state provision/provision.sh ops/tx9-host ops/tx9-backup-prune tests/lifecycle-smoke.sh tests/hermes-state.sh tests/cli-surface.sh "${regression_files[@]}" tests/fixtures/smolvm; do
   [[ -x "$file" ]] || { echo "not executable: $file" >&2; exit 1; }
 done
 
@@ -43,8 +51,9 @@ if grep -q '\blsof\b' box; then
   echo "lsof dependency remains" >&2
   exit 1
 fi
-grep -q 'protocolVersion.*2025-03-26' box
-grep -q 'protocolVersion.*2025-03-26' guest/hb
+grep -q 'protocolVersion.*2025-03-26' guest/lib-mcp.sh
+grep -q 'source .*guest/lib-mcp\.sh' box
+grep -q 'lib-mcp\.sh' guest/hb
 grep -q 'ca-certificates curl git jq tmux' provision/provision.sh
 grep -q 'runuser -u agent.*hb.*write-manifest' provision/provision.sh
 grep -q -- '--commit.*sha' provision/provision.sh
@@ -126,6 +135,8 @@ if grep -q 'guest_tmp="/root/hermes-import-' box; then
   exit 1
 fi
 grep -qi 'networking is always enabled' README.md
-grep -q 'intentionally no CI configuration yet' README.md
+grep -q 'check.yml. runs it on every push' README.md
+[[ -f .github/workflows/check.yml ]]
+grep -q 'make check' .github/workflows/check.yml
 
 echo "static checks passed"

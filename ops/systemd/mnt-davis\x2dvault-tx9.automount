@@ -1,0 +1,9 @@
+[Unit]
+Description=Automount CIFS backup vault for tx9
+
+[Automount]
+Where=/mnt/davis-vault/tx9
+TimeoutIdleSec=600
+
+[Install]
+WantedBy=multi-user.target

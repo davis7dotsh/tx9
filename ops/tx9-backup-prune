@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Bounds backup growth: without this, /var/backups/tx9 and any configured
+# TX9_NAS_DIR grow unbounded forever (retention is otherwise left entirely to
+# the operator, per docs/nexus-operations.md).
+set -euo pipefail
+
+requested_name="${1:-}"
+[[ "$requested_name" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] || {
+  echo "usage: tx9-backup-prune <box>" >&2
+  exit 2
+}
+readonly requested_name
+
+TX9_CONFIG="${TX9_CONFIG:-/etc/tx9/tx9.conf}"
+[[ ! -r "$TX9_CONFIG" ]] || { # shellcheck disable=SC1090
+  source "$TX9_CONFIG"
+}
+box_config="${TX9_BOX_CONFIG_DIR:-/etc/tx9/boxes}/${requested_name}.conf"
+[[ ! -r "$box_config" ]] || { # shellcheck disable=SC1090
+  source "$box_config"
+}
+name="$requested_name"
+
+destination="${TX9_BACKUP_DIR:-/var/backups/tx9}"
+# Always keep at least this many of the newest backups, regardless of age.
+keep_count="${TX9_BACKUP_RETAIN_COUNT:-14}"
+# Optional: additionally never keep a backup older than this many days, even
+# if it's within the most recent TX9_BACKUP_RETAIN_COUNT. Empty = no cap.
+keep_days="${TX9_BACKUP_RETAIN_DAYS:-}"
+
+[[ "$keep_count" =~ ^[0-9]+$ ]] || {
+  echo "TX9_BACKUP_RETAIN_COUNT must be a non-negative integer" >&2; exit 2;
+}
+[[ -z "$keep_days" || "$keep_days" =~ ^[0-9]+$ ]] || {
+  echo "TX9_BACKUP_RETAIN_DAYS must be empty or a non-negative integer" >&2; exit 2;
+}
+
+prune_dir() {
+  local dir="$1" cutoff="" entries=() total index=0 base stamp keep
+  if [[ ! -d "$dir" ]]; then
+    echo "skipping prune for missing directory: $dir" >&2
+    return 0
+  fi
+  # Backup filenames are "<name>-<YYYYMMDD-HHMMSS>Z.tar.gz.gpg"; the fixed-
+  # width zero-padded timestamp sorts lexicographically in chronological
+  # order, so plain `sort` is enough — no date parsing needed for ordering.
+  mapfile -t entries < <(
+    find "$dir" -maxdepth 1 -type f -name "${name}-*.tar.gz.gpg" -printf '%f\n' 2>/dev/null | sort
+  )
+  total="${#entries[@]}"
+  [[ "$total" -gt 0 ]] || return 0
+  [[ -z "$keep_days" ]] || cutoff="$(date -u -d "-${keep_days} days" +%Y%m%d-%H%M%SZ)"
+  for base in "${entries[@]}"; do
+    index=$((index + 1))
+    keep=1
+    [[ "$((total - index))" -lt "$keep_count" ]] || keep=0
+    if [[ "$keep" == 1 && -n "$cutoff" ]]; then
+      stamp="${base#"${name}"-}"
+      stamp="${stamp%.tar.gz.gpg}"
+      [[ "$stamp" > "$cutoff" || "$stamp" == "$cutoff" ]] || keep=0
+    fi
+    [[ "$keep" == 1 ]] || {
+      echo "pruning $dir/$base"
+      rm -f -- "$dir/$base" "$dir/${base}.sha256"
+    }
+  done
+}
+
+prune_dir "$destination"
+[[ -z "${TX9_NAS_DIR:-}" ]] || prune_dir "$TX9_NAS_DIR"

@@ -12,3 +12,5 @@
 # Optional private/custom Hermes Git bundles used for exact-SHA provisioning.
 /artifacts/*
 !/artifacts/.gitkeep
+
+__pycache__/

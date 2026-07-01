@@ -10,7 +10,11 @@ source "$CTX/box.env"
 OPT=/opt/hermes-box
 NODE_PREFIX="$OPT/tooling/node-global"
 UV_DIR="$OPT/tooling/uv"
-export PATH="$NODE_PREFIX/bin:$UV_DIR:$PATH"
+# $OPT/bin holds repo-owned tools (hb, hb-workload, hermes-state) plus the
+# hermes launcher symlink installed below — must be on PATH here too, not
+# just for the agent user (guest/profile.sh), so verify_required's
+# `command -v` checks see what a real shell would see.
+export PATH="$OPT/bin:$NODE_PREFIX/bin:$UV_DIR:$PATH"
 export DEBIAN_FRONTEND=noninteractive
 
 log() { printf '\033[35m[provision]\033[0m %s\n' "$*"; }
@@ -64,15 +68,17 @@ install_node_uv() {
 }
 
 install_claude() {
-  log "claude-code"
-  "$NODE_PREFIX/bin/npm" install -g @anthropic-ai/claude-code >/dev/null 2>&1 \
-    || npm install -g @anthropic-ai/claude-code >/dev/null
+  local pkg="@anthropic-ai/claude-code${CLAUDE_CODE_VERSION:+@$CLAUDE_CODE_VERSION}"
+  log "claude-code${CLAUDE_CODE_VERSION:+ ($CLAUDE_CODE_VERSION)}"
+  "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
+    || npm install -g "$pkg" >/dev/null
 }
 
 install_codex() {
-  log "codex"
-  "$NODE_PREFIX/bin/npm" install -g @openai/codex >/dev/null 2>&1 \
-    || npm install -g @openai/codex >/dev/null
+  local pkg="@openai/codex${CODEX_VERSION:+@$CODEX_VERSION}"
+  log "codex${CODEX_VERSION:+ ($CODEX_VERSION)}"
+  "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
+    || npm install -g "$pkg" >/dev/null
 }
 
 install_hermes() {
@@ -83,10 +89,22 @@ install_hermes() {
   local installer_sha="${HERMES_INSTALLER_SHA256:-}" installer
   [[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]] || { log "invalid HERMES_GIT_SHA: $sha"; return 1; }
   [[ "$installer_sha" =~ ^[0-9a-fA-F]{64}$ ]] || { log "invalid HERMES_INSTALLER_SHA256"; return 1; }
+  # Idempotent: skip the multi-minute reinstall if hermes is already on PATH
+  # and already checked out at the pinned commit (the same bar verify_required
+  # holds it to). Lets `assets` repair mode call this safely on every run.
+  if command -v hermes >/dev/null 2>&1 && [[ "$(git -C "$install_dir" rev-parse HEAD 2>/dev/null)" == "$sha" ]]; then
+    log "hermes already installed at pinned $sha — skipping reinstall"
+    return 0
+  fi
   log "hermes (official installer pinned to $sha)"
-  # We run as root, so the installer uses the FHS layout: code -> /usr/local/lib,
-  # binary -> /usr/local/bin/hermes (both baked into the golden). HERMES_HOME pins
-  # the durable state (auth, sessions, skills, memory) onto /data.
+  # We run as root and pass an explicit --dir below, which makes the installer
+  # skip its own root/FHS auto-detection (resolve_install_layout() returns
+  # early whenever --dir is explicit) and link the `hermes` command into
+  # $HOME/.local/bin instead of /usr/local/bin. $HOME is root's home here
+  # since this whole script runs as root. Code still lands at $install_dir
+  # (/usr/local/lib/hermes-agent) since that part of --dir is honored either
+  # way. HERMES_HOME pins the durable state (auth, sessions, skills, memory)
+  # onto /data. See the symlink step below that puts `hermes` on agent's PATH.
   export HERMES_HOME=/data/home/agent/.hermes
   mkdir -p "$HERMES_HOME"
   if [[ -n "$bundle" ]]; then
@@ -140,8 +158,26 @@ install_hermes() {
       git -C "$install_dir" remote set-url origin \
         "${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
     fi
+    # Put the launcher on PATH for both this script (root) and the agent user
+    # (guest/profile.sh puts $OPT/bin first). $HOME is root's home since this
+    # whole script runs as root; that's where an explicit --dir install links
+    # the command (see the comment above this function). Fall back to the
+    # FHS location in case a future installer version goes back to it.
+    if [[ -x "$HOME/.local/bin/hermes" ]]; then
+      ln -sf "$HOME/.local/bin/hermes" "$OPT/bin/hermes"
+      # agent must traverse $HOME (root's home) to dereference that symlink.
+      # The base image happens to ship root's home at 755 today, but don't
+      # depend on that staying true upstream — grant +x explicitly on just
+      # the path components the launcher needs.
+      chmod o+x "$HOME" "$HOME/.local" "$HOME/.local/bin"
+    elif [[ -x /usr/local/bin/hermes ]]; then
+      ln -sf /usr/local/bin/hermes "$OPT/bin/hermes"
+    else
+      log "hermes install FAILED: launcher not found in \$HOME/.local/bin or /usr/local/bin"
+      return 1
+    fi
     own_hermes_home
-    log "hermes installed -> $(command -v hermes || echo '/usr/local/bin/hermes')"
+    log "hermes installed -> $(command -v hermes || echo "$OPT/bin/hermes")"
   else
     rm -f "$installer"
     log "hermes install FAILED"
@@ -160,9 +196,26 @@ install_executor() {
   if [[ "${INSTALL_EXECUTOR:-0}" != "1" ]]; then
     log "executor: INSTALL_EXECUTOR != 1 — skipping"; return
   fi
-  log "executor (npm global)"
-  if "$NODE_PREFIX/bin/npm" install -g executor >/dev/null 2>&1 \
-       || npm install -g executor >/dev/null 2>&1; then
+  # Idempotent: skip reinstall if already on PATH at the pinned version (any
+  # version, if EXECUTOR_VERSION is unset) — the same bar verify_required
+  # holds it to. Lets `assets` repair mode call this safely on every run
+  # instead of only on a full reinstall, without masking a version bump.
+  if command -v executor >/dev/null 2>&1; then
+    if [[ -z "${EXECUTOR_VERSION:-}" ]]; then
+      log "executor already installed — skipping reinstall"
+      return 0
+    fi
+    local installed_version
+    installed_version="$(executor --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
+    if [[ "$installed_version" == "$EXECUTOR_VERSION" ]]; then
+      log "executor already installed at pinned $EXECUTOR_VERSION — skipping reinstall"
+      return 0
+    fi
+  fi
+  local pkg="executor${EXECUTOR_VERSION:+@$EXECUTOR_VERSION}"
+  log "executor (npm global)${EXECUTOR_VERSION:+ ($EXECUTOR_VERSION)}"
+  if "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
+       || npm install -g "$pkg" >/dev/null 2>&1; then
     log "executor installed -> $("$NODE_PREFIX/bin/npm" prefix -g 2>/dev/null)/bin/executor"
   else
     log "executor install FAILED"
@@ -179,6 +232,7 @@ place_assets() {
   log "profile, tmux config, hb helper"
   install -m 0644 "$CTX/guest/profile.sh"  /etc/profile.d/hermes-box.sh
   install -m 0644 "$CTX/guest/tmux.conf"    "$OPT/tmux.conf"
+  install -m 0644 "$CTX/guest/lib-mcp.sh"   "$OPT/bin/lib-mcp.sh"
   install -m 0755 "$CTX/guest/hb"           "$OPT/bin/hb"
   install -m 0755 "$CTX/guest/hb-workload"  "$OPT/bin/hb-workload"
   install -m 0755 "$CTX/guest/hermes-state" "$OPT/bin/hermes-state"
@@ -210,18 +264,27 @@ verify_required() {
   for cmd in node uv nvim claude codex; do
     command -v "$cmd" >/dev/null 2>&1 || { log "missing required tool: $cmd"; return 1; }
   done
-  if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then command -v hermes >/dev/null 2>&1; fi
-  if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then command -v executor >/dev/null 2>&1; fi
   if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then
-    [[ "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" == "${HERMES_GIT_SHA}" ]]
+    command -v hermes >/dev/null 2>&1 || { log "missing required tool: hermes"; return 1; }
+  fi
+  if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then
+    command -v executor >/dev/null 2>&1 || { log "missing required tool: executor"; return 1; }
+  fi
+  if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then
+    [[ "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" == "${HERMES_GIT_SHA}" ]] || {
+      log "Hermes checkout HEAD does not match pinned HERMES_GIT_SHA"; return 1;
+    }
   fi
 }
 
 assets_only() {
   make_agent
+  install_hermes
+  install_executor
   install_config
   place_assets
   seed_data
+  verify_required
   runuser -u agent -- env HOME=/data/home/agent "$OPT/bin/hb" write-manifest
   log "managed assets refreshed"
 }
