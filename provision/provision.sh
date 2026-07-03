@@ -94,6 +94,7 @@ install_hermes() {
   # holds it to). Lets `assets` repair mode call this safely on every run.
   if command -v hermes >/dev/null 2>&1 && [[ "$(git -C "$install_dir" rev-parse HEAD 2>/dev/null)" == "$sha" ]]; then
     log "hermes already installed at pinned $sha — skipping reinstall"
+    install_hermes_messaging_deps "$install_dir" || return 1
     return 0
   fi
   log "hermes (official installer pinned to $sha)"
@@ -176,6 +177,7 @@ install_hermes() {
       log "hermes install FAILED: launcher not found in \$HOME/.local/bin or /usr/local/bin"
       return 1
     fi
+    install_hermes_messaging_deps "$install_dir" || return 1
     own_hermes_home
     log "hermes installed -> $(command -v hermes || echo "$OPT/bin/hermes")"
   else
@@ -183,6 +185,29 @@ install_hermes() {
     log "hermes install FAILED"
     return 1
   fi
+}
+
+# The official installer's curated dependency set does not include the
+# [messaging] extra, so a freshly provisioned gateway starts but every chat
+# platform adapter fails with "Platform 'Discord' requirements not met
+# (pip install 'hermes-agent[messaging]')" — the box's whole purpose.
+# Verified live during the Eventide migration. Idempotent: uv resolves
+# already-satisfied pins in seconds.
+install_hermes_messaging_deps() {
+  local install_dir="$1"
+  [[ -x "$install_dir/venv/bin/python" ]] || {
+    log "hermes messaging deps: venv missing at $install_dir/venv"
+    return 1
+  }
+  log "hermes messaging platform deps ([messaging] extra)"
+  (cd "$install_dir" && "$UV_DIR/uv" pip install --python venv/bin/python ".[messaging]") || {
+    log "hermes messaging deps install FAILED"
+    return 1
+  }
+  "$install_dir/venv/bin/python" -c 'import discord' || {
+    log "hermes messaging deps verification FAILED (import discord)"
+    return 1
+  }
 }
 
 own_hermes_home() {
