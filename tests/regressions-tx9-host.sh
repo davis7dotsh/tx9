@@ -104,6 +104,16 @@ printf 'no-newline-passphrase' >"$tmp/passphrase-no-newline"
 # tx9-backup-prune keeps the newest TX9_BACKUP_RETAIN_COUNT backups, applies
 # an optional TX9_BACKUP_RETAIN_DAYS cap on top, leaves a missing NAS
 # directory alone, never touches another box's backups, and validates input.
+#
+# CRITICAL ISOLATION: the script sources /etc/tx9/tx9.conf and the per-box
+# conf AFTER the environment, so a real host config overrides the test's
+# TX9_BACKUP_DIR — on a production host, an unisolated run points the prune
+# at the REAL backup directory and (given permissions) deletes real backups.
+# Observed live on nexus: /etc/tx9/boxes/hermes.conf redirected this test to
+# /var/backups/tx9; only a permission error stopped it. Point both config
+# knobs at test-owned paths for every invocation below.
+export TX9_CONFIG="/dev/null"
+export TX9_BOX_CONFIG_DIR="$tmp/prune-no-box-config"
 prune_dir="$tmp/prune-backups"
 mkdir -p "$prune_dir"
 for day in 10 9 8 7 6 5 4 3 2 1; do
