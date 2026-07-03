@@ -233,7 +233,15 @@ gateway_enable() {
     return 1
   }
   [[ ! -e "$QUIESCE_FILE" ]] || { echo "box is quiesced; resume it before requesting gateway startup" >&2; return 1; }
-  if [[ -r "$STATE_DIR/import-manifest.json" ]]; then cutover_ready || return 1; fi
+  # The cutover gates compare live state against the import baselines, so they
+  # can only pass before the gateway's first run — after that, legitimate new
+  # messages diverge the database from the manifest forever. Gate only the
+  # FIRST enable after each import: a successful enable records
+  # gateway_enabled=true in the manifest, and every new import resets it.
+  if [[ -r "$STATE_DIR/import-manifest.json" ]] &&
+    [[ "$(jq -r '.gateway_enabled // false' "$STATE_DIR/import-manifest.json" 2>/dev/null)" != true ]]; then
+    cutover_ready || return 1
+  fi
   rm -f "$GATEWAY_DISABLED"
   _start_gateway
   local start_status=$?
@@ -249,6 +257,16 @@ gateway_enable() {
     _stop_gateway || true
     touch "$GATEWAY_DISABLED"
     return 1
+  fi
+  if [[ -r "$STATE_DIR/import-manifest.json" ]]; then
+    local manifest_tmp
+    if ! { manifest_tmp="$(mktemp "$STATE_DIR/import-manifest.json.tmp.XXXXXX")" &&
+      jq '.gateway_enabled = true' "$STATE_DIR/import-manifest.json" >"$manifest_tmp" &&
+      chmod 600 "$manifest_tmp" &&
+      mv "$manifest_tmp" "$STATE_DIR/import-manifest.json"; }; then
+      rm -f "$manifest_tmp"
+      echo "warning: could not record gateway_enabled in the import manifest; the next gateway-enable will re-run cutover gates against stale baselines" >&2
+    fi
   fi
   echo "Hermes gateway startup requested; run 'hb doctor' and require deep health before declaring cutover complete"
 }

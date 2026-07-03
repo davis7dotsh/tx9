@@ -152,6 +152,34 @@ HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" gateway-enable \
   --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY >/dev/null
 [[ ! -e "$gateway_data/home/agent/.config/hermes-box/gateway-disabled" ]]
 
+# Cutover gates fire only on the FIRST enable after an import: a successful
+# enable records gateway_enabled=true in the manifest, so a later restart
+# (disable → enable) must not re-run gates that can no longer pass once live
+# traffic has diverged the database from the import baselines. A fresh import
+# (gateway_enabled=false again) must re-gate.
+(
+  HB_DATA="$tmp/gateway-regate-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  _start_gateway() { return 0; }
+  _stop_gateway() { return 0; }
+  gates_run=0
+  cutover_ready() { gates_run=$((gates_run + 1)); return 0; }
+  printf '{"status":"completed","gateway_enabled":false}\n' >"$STATE_DIR/import-manifest.json"
+  gateway_enable --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY >/dev/null
+  [[ "$gates_run" == 1 ]] || { echo "first enable did not run cutover gates" >&2; exit 1; }
+  [[ "$(jq -r .gateway_enabled "$STATE_DIR/import-manifest.json")" == true ]] ||
+    { echo "successful enable did not persist gateway_enabled" >&2; exit 1; }
+  gateway_disable >/dev/null
+  gateway_enable --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY >/dev/null
+  [[ "$gates_run" == 1 ]] || { echo "restart re-ran cutover gates after a successful enable" >&2; exit 1; }
+  printf '{"status":"completed","gateway_enabled":false}\n' >"$STATE_DIR/import-manifest.json"
+  gateway_disable >/dev/null
+  gateway_enable --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY >/dev/null
+  [[ "$gates_run" == 2 ]] || { echo "fresh import did not re-run cutover gates" >&2; exit 1; }
+)
+
 # A failed gateway start restores the durable disabled policy marker.
 (
   HB_DATA="$tmp/gateway-failure-data"
