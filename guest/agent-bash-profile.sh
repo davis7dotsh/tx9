@@ -12,6 +12,12 @@ if [ -r "$XDG_CONFIG_HOME/hermes-box/executor-mcp.env" ]; then
   . "$XDG_CONFIG_HOME/hermes-box/executor-mcp.env"
 fi
 
+# smolvm's exec channel does not forward the client's TERM, so login shells
+# arrive with TERM=dumb (or unset) and tmux refuses to attach: "open terminal
+# failed: terminal does not support clear". Any real client that reaches this
+# profile can render xterm-256color, so substitute it for the degenerate case.
+case "${TERM:-}" in "" | dumb) export TERM=xterm-256color ;; esac
+
 # Attach (or create) the persistent 'main' session — skip if already inside tmux.
 if [ -z "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
   exec tmux -f /opt/hermes-box/tmux.conf new-session -A -s main
