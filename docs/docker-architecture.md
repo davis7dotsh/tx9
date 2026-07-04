@@ -1,7 +1,11 @@
 # Proposed architecture: hermes-box-lite on Docker
 
-Status: first draft, 2026-07-03. Companion to the working prototype in
-`docker/` (`Dockerfile`, `entrypoint.sh`, `boxd`).
+Status: architecture record, 2026-07-03. The `boxd` bash prototype referenced
+throughout was verified against this design and then **deleted** (2026-07-04)
+in favor of the Go CLI specified in [tx9-cli-design.md](tx9-cli-design.md);
+recover it from git history (`6f1ced3` and earlier) when porting logic. The
+runtime topology, contracts, and verification results below remain the
+authoritative description of what the Go CLI must create.
 
 ## Why move off smolvm
 

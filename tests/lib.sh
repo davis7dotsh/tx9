@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Shared test harness: a fresh $tmp per file, cleaned up on exit or signal
-# using the same signal-to-exit-code mapping box itself uses (129/130/143),
-# plus make_repo() and the wait_for_* polling helpers used across the suite.
+# (129/130/143), plus make_repo() and the wait_for_* polling helpers used
+# across the suite.
 # Source this after `set -euo pipefail`; do not execute it directly.
 
 PROJECT_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -57,6 +57,6 @@ wait_for_pattern() {
 make_repo() {
   local dest="$1"
   mkdir -p "$dest/backups"
-  cp "$PROJECT_ROOT/box" "$PROJECT_ROOT/box.env" "$dest/"
+  cp "$PROJECT_ROOT/box.env" "$dest/"
   cp -R "$PROJECT_ROOT/guest" "$PROJECT_ROOT/provision" "$dest/"
 }

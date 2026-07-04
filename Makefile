@@ -2,7 +2,7 @@
 
 # tests/regressions-*.sh is globbed so new split-out regression files don't
 # require touching this Makefile.
-SHELL_FILES := box guest/hb guest/hb-workload guest/lib-mcp.sh guest/profile.sh guest/agent-bash-profile.sh provision/provision.sh ops/tx9-host ops/tx9-backup-prune tests/lib.sh tests/static.sh tests/lifecycle-smoke.sh tests/hermes-state.sh tests/cli-surface.sh $(wildcard tests/regressions-*.sh) tests/fixtures/smolvm
+SHELL_FILES := guest/hb guest/hb-workload guest/lib-mcp.sh guest/profile.sh guest/agent-bash-profile.sh provision/provision.sh docker/entrypoint.sh docker/executor-entrypoint.sh tests/lib.sh tests/static.sh tests/hermes-state.sh $(wildcard tests/regressions-*.sh)
 
 syntax:
 	bash -n $(SHELL_FILES)
@@ -16,9 +16,7 @@ test:
 	command -v python3 >/dev/null || { echo "python3 is required for local regression tests" >&2; exit 1; }
 	command -v jq >/dev/null || { echo "jq is required for local regression tests" >&2; exit 1; }
 	./tests/static.sh
-	./tests/lifecycle-smoke.sh
 	./tests/hermes-state.sh
-	./tests/cli-surface.sh
 	for f in tests/regressions-*.sh; do ./"$$f" || exit 1; done
 
 check: syntax lint test

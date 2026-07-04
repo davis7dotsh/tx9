@@ -14,6 +14,7 @@ set -euo pipefail
 mkdir -p /data/home/agent /data/logs
 chown agent:agent /data/home/agent /data/logs
 
+# shellcheck disable=SC2016 # $EXECUTOR_MCP_TOKEN expands in the inner shell
 exec runuser -u agent -- env HOME=/data/home/agent \
   bash --noprofile --norc -c '. /etc/profile.d/hermes-box.sh
     exec executor daemon run --foreground --hostname 0.0.0.0 --port 4788 \
