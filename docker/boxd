@@ -357,6 +357,40 @@ cmd_doctor() {
 cmd_stop()  { _validate_name "${1:?usage: boxd stop <name>}";  _lock "$1"; _compose "$1" stop --timeout 20 >/dev/null; say "stopped '$1'"; }
 cmd_start() { _validate_name "${1:?usage: boxd start <name>}"; _lock "$1"; _compose "$1" start >/dev/null; say "started '$1'"; }
 
+cmd_open() {
+  local n="${1:?usage: boxd open <name>}" ep url
+  _validate_name "$n"
+  _box_exists "$n" || die "box '$n' does not exist"
+  _agent_running "$n" || die "box '$n' is not running; run: ./docker/boxd start $n"
+  ep="$(_exec_host_port "$n")"
+  [[ -n "$ep" ]] || die "no published executor port for '$n'"
+  curl -sf --connect-timeout 3 -o /dev/null "http://127.0.0.1:${ep}/" ||
+    die "executor dashboard is not answering on port $ep"
+  url="http://${BOXD_URL_HOST:-siva.davis7.space}:${ep}/?_token=$(_token "$n")"
+  if [[ -n "${BOX_BROWSER:-}" ]] && command -v "$BOX_BROWSER" >/dev/null 2>&1; then
+    "$BOX_BROWSER" "$url" >/dev/null 2>&1 && { say "opened Executor UI for '$n'"; return; }
+  fi
+  # Headless server: print the authenticated URL for use from another device.
+  say "Executor UI (authenticated URL — treat as a secret):"
+  printf '%s\n' "$url"
+}
+
+# Recreate both containers on the current image; volumes (and therefore the
+# box) are untouched. This is the whole upgrade story: managed tooling is
+# image layers, so "upgrade" = rebuild image + recreate containers.
+cmd_upgrade() {
+  local n="${1:?usage: boxd upgrade <name>}"
+  _validate_name "$n"
+  _require_image
+  _lock "$n"
+  _box_exists "$n" || die "box '$n' does not exist"
+  say "Recreating '$n' containers on $IMAGE (volumes preserved)"
+  _compose "$n" up -d --force-recreate >/dev/null 2>&1 || die "compose up failed for '$n'"
+  say "Preparing runtime (executor reachability, MCP wiring, doctor)"
+  _prepare_runtime "$n" || die "post-upgrade doctor failed for '$n' — inspect with: ./docker/boxd enter $n"
+  say "upgraded '$n'"
+}
+
 cmd_save() {
   local n="${1:?usage: boxd save <name> [out.tar.gz.gpg]}" ts out raw encrypted
   _validate_name "$n"
@@ -488,8 +522,11 @@ boxd — hermes-box-lite on Docker Compose (agent + executor per box)
   ./docker/boxd new <name>       Create a box: 2 containers + 2 volumes + network
   ./docker/boxd enter <name>     Shell into the agent container (tmux 'main')
   ./docker/boxd ls               List boxes and executor dashboard URLs
+  ./docker/boxd open <name>      Print (or BOX_BROWSER-open) the authenticated Executor UI URL
   ./docker/boxd doctor <name>    In-box doctor + host executor endpoint check
   ./docker/boxd stop|start <n>   Stop / start both containers (volumes persist)
+  ./docker/boxd upgrade <name>   Recreate containers on the current image (after build);
+                                 volumes and box state are untouched
   ./docker/boxd save <n> [out]   Quiesce gateway + archive agent /data (encrypted;
                                  same format as ./box save — archives interchange)
   ./docker/boxd load <file> [n]  Restore an archive into a fresh box (gateway disabled)
@@ -510,9 +547,11 @@ main() {
     new)    shift; cmd_new "$@" ;;
     enter)  shift; cmd_enter "$@" ;;
     ls)     shift; cmd_ls "$@" ;;
+    open)   shift; cmd_open "$@" ;;
     doctor) shift; cmd_doctor "$@" ;;
     stop)   shift; cmd_stop "$@" ;;
     start)  shift; cmd_start "$@" ;;
+    upgrade) shift; cmd_upgrade "$@" ;;
     save)   shift; cmd_save "$@" ;;
     load)   shift; cmd_load "$@" ;;
     rm)     shift; cmd_rm "$@" ;;
