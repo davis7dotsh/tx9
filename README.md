@@ -7,11 +7,12 @@ with all durable state on a named volume that travels as an encrypted,
 validated backup archive.
 
 **Status: experiment, mid-transition.** The bash prototypes (smolvm `./box`
-and the compose `./docker/boxd`) have been retired; the next step is a Go CLI
-(`tx9`) that embeds this repository's provisioning and guest assets. See
-[docs/tx9-cli-design.md](docs/tx9-cli-design.md) for the full design and
-[docs/docker-architecture.md](docs/docker-architecture.md) for the runtime
-architecture and its verification history.
+and the compose `./docker/boxd`) have been retired in favor of a Go CLI
+(`tx9`, this repo, embedding its provisioning and guest assets) that is now
+implemented and under active development — still experimental, not yet
+released. See [docs/tx9-cli-design.md](docs/tx9-cli-design.md) for the full
+design and [docs/docker-architecture.md](docs/docker-architecture.md) for
+the runtime architecture and its verification history.
 
 ## Model
 

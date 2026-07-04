@@ -16,3 +16,8 @@
 __pycache__/
 /.boxd-locks/
 /.boxd/
+
+# Go build output.
+/bin/
+/tx9
+/dist/
