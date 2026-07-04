@@ -1,0 +1,512 @@
+#!/usr/bin/env bash
+# boxd — hermes-box-lite on Docker. First draft.
+#
+# Model: one box = one container (hbl-<name>) + one named volume (hbl-<name>-data
+# mounted at /data). Everything managed (/opt/hermes-box, /usr/local, node, uv,
+# claude, codex, hermes, executor) is baked into the image at build time by the
+# same provision/provision.sh the smolvm path streams into a live VM. Durable
+# state is exactly what it was before: /data. Backups are the same encrypted
+# tar-of-/data archives `./box save` produces, so archives are interchangeable
+# between the two runtimes.
+#
+# Deliberately lean vs ./box: no port registry (Docker assigns host ports), no
+# provisioning rollback machinery (image builds are atomic), no mkdir-based
+# lock forest (one flock per box). ~1/3 the code for the same lifecycle.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck source=../box.env
+source "$ROOT/box.env"
+IMAGE="${BOXD_IMAGE:-hermes-box-lite:latest}"
+LABEL=hermes-box-lite
+LOCK_DIR="$ROOT/.boxd-locks"
+EXEC_BRIDGE=14788   # in-container 0.0.0.0 bridge -> executor 127.0.0.1:4788
+API_BRIDGE=18642    # in-container 0.0.0.0 bridge -> hermes API 127.0.0.1:8642
+_BOX_PASS=""
+_TEMP_PATHS=()
+_RESUME_BOX=""      # box paused by us; resumed by the EXIT trap on any failure
+
+die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+say()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
+warn() { printf '\033[33mwarning:\033[0m %s\n' "$*" >&2; }
+
+_cleanup() {
+  local status=$? path
+  set +e
+  if [[ -n "$_RESUME_BOX" ]]; then
+    _guest_hb "$_RESUME_BOX" resume >/dev/null 2>&1 || true
+  fi
+  for path in "${_TEMP_PATHS[@]:-}"; do [[ -n "$path" ]] && rm -f -- "$path"; done
+  exit "$status"
+}
+trap _cleanup EXIT
+trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
+
+_tmp() { local t; t="$(mktemp)"; _TEMP_PATHS+=("$t"); printf '%s' "$t"; }
+
+# Per-box serialization. flock on fd 9; the lock lives for the process, which
+# is exactly the critical section for every multi-step command here.
+_lock() {
+  mkdir -p "$LOCK_DIR"
+  exec 9>"$LOCK_DIR/$1.lock"
+  flock -n 9 || die "another boxd operation holds the '$1' lock"
+}
+
+_validate_name() {
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] ||
+    die "invalid box name '$1' (1-63 letters, numbers, dots, underscores, dashes)"
+}
+
+cname() { printf 'hbl-%s' "$1"; }
+vname() { printf 'hbl-%s-data' "$1"; }
+
+_container_exists() { docker container inspect "$(cname "$1")" >/dev/null 2>&1; }
+_container_running() {
+  [[ "$(docker container inspect -f '{{.State.Running}}' "$(cname "$1")" 2>/dev/null)" == true ]]
+}
+_volume_exists() { docker volume inspect "$(vname "$1")" >/dev/null 2>&1; }
+
+_require_image() {
+  docker image inspect "$IMAGE" >/dev/null 2>&1 ||
+    die "image '$IMAGE' not found — run: ./docker/boxd build"
+}
+
+# Run hb inside the box as the agent user (mirrors ./box's _guest_hb).
+_guest_hb() {
+  local n="$1"; shift
+  docker exec "$(cname "$n")" \
+    runuser -u agent -- env HOME=/data/home/agent bash --noprofile --norc -c \
+    '. /etc/profile.d/hermes-box.sh; exec hb "$@"' hb "$@"
+}
+
+_host_port() {  # box name, internal port -> published host port ('' if none)
+  # `docker port` exits non-zero for unpublished ports; that's an empty
+  # result here, not an error (callers run under set -e).
+  { docker port "$(cname "$1")" "$2/tcp" 2>/dev/null || true; } | head -1 | awk -F: '{print $NF}'
+}
+
+# ---------------------------------------------------------------- passphrase
+_resolve_passphrase() {
+  local confirm="${1:-}" p1 p2
+  [[ -n "$_BOX_PASS" ]] && return
+  if [[ -n "${BOX_PASSPHRASE_FILE:-}" ]]; then
+    [[ -r "$BOX_PASSPHRASE_FILE" ]] || die "BOX_PASSPHRASE_FILE is not readable"
+    IFS= read -r _BOX_PASS <"$BOX_PASSPHRASE_FILE" || true
+    [[ -n "$_BOX_PASS" ]] || die "BOX_PASSPHRASE_FILE is empty"
+    return
+  fi
+  if [[ -n "${BOX_PASSPHRASE:-}" ]]; then _BOX_PASS="$BOX_PASSPHRASE"; return; fi
+  [[ -r /dev/tty ]] || die "no BOX_PASSPHRASE set and no terminal to prompt on"
+  printf 'Passphrase: ' >/dev/tty; read -rs p1 </dev/tty; printf '\n' >/dev/tty
+  if [[ "$confirm" == confirm ]]; then
+    printf 'Confirm passphrase: ' >/dev/tty; read -rs p2 </dev/tty; printf '\n' >/dev/tty
+    [[ "$p1" == "$p2" ]] || die "passphrases do not match"
+  fi
+  [[ -n "$p1" ]] || die "empty passphrase"
+  _BOX_PASS="$p1"
+}
+gpg_enc() {
+  _resolve_passphrase confirm
+  gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 \
+    --symmetric --cipher-algo AES256 -o "$1" 3<<<"$_BOX_PASS"
+}
+gpg_dec() {
+  _resolve_passphrase
+  gpg --batch --yes --pinentry-mode loopback --passphrase-fd 3 -d "$1" 3<<<"$_BOX_PASS"
+}
+
+# Archive safety validator — the production implementation from ./box
+# (_validate_archive), lifted verbatim: rejects absolute paths, traversal,
+# special files, duplicates, unsafe symlink/hardlink targets, link cycles,
+# and paths resolving through links, and requires a real home/agent tree.
+_validate_archive() {
+  python3 - "$1" <<'PY'
+import sys
+import tarfile
+from pathlib import PurePosixPath
+
+def safe_text(value, label):
+    if "\x00" in value or any(ord(char) < 32 or ord(char) == 127 for char in value):
+        raise ValueError(f"{label} contains control characters")
+
+def link_parts(value):
+    safe_text(value, "archive link target")
+    path = PurePosixPath(value)
+    if path.is_absolute():
+        raise ValueError("archive link target is absolute")
+    return [part for part in path.parts if part not in {"", "."}]
+
+def validate_link_target(member, key):
+    parts = link_parts(member.linkname)
+    if not parts:
+        raise ValueError("archive link target is empty")
+    resolved = key.split("/")[:-1] if member.issym() else []
+    for part in parts:
+        if part == "..":
+            if not resolved:
+                raise ValueError("archive link target lexically escapes extraction root")
+            resolved.pop()
+        else:
+            resolved.append(part)
+
+try:
+    with tarfile.open(sys.argv[1], "r:gz") as archive:
+        members = archive.getmembers()
+        if not members:
+            raise ValueError("archive is empty")
+        by_name = {}
+        for member in members:
+            name = member.name
+            safe_text(name, "archive path")
+            path = PurePosixPath(name)
+            if path.is_absolute() or any(part == ".." for part in path.parts):
+                raise ValueError("archive path escapes its extraction root")
+            parts = tuple(part for part in path.parts if part not in {"", "."})
+            key = "/".join(parts)
+            if key in by_name:
+                raise ValueError(f"archive contains duplicate path: {key or '.'}")
+            if not (member.isfile() or member.isdir() or member.issym() or member.islnk()):
+                raise ValueError("archive contains a device, FIFO, socket, or unknown special file")
+            if not key and not member.isdir():
+                raise ValueError("archive root member must be a real directory")
+            if member.issym() or member.islnk():
+                validate_link_target(member, key)
+            by_name[key] = member
+
+        for key in by_name:
+            parts = key.split("/") if key else []
+            for length in range(1, len(parts)):
+                parent = by_name.get("/".join(parts[:length]))
+                if parent is not None and (parent.issym() or parent.islnk()):
+                    raise ValueError(f"archive member is nested beneath a link: {key}")
+
+        for required in ("home", "home/agent"):
+            entry = by_name.get(required)
+            if entry is None or not entry.isdir() or entry.issym() or entry.islnk():
+                raise ValueError(f"{required} must be a real directory")
+
+        def resolve(key):
+            pending = key.split("/") if key else []
+            resolved = []
+            seen_states = set()
+            steps = 0
+            while pending:
+                steps += 1
+                if steps > len(by_name) * 8 + 32:
+                    raise ValueError("archive link chain exceeds safety bound")
+                state = (tuple(resolved), tuple(pending))
+                if state in seen_states:
+                    raise ValueError("archive link cycle detected")
+                seen_states.add(state)
+                part = pending.pop(0)
+                if part in {"", "."}:
+                    continue
+                if part == "..":
+                    if not resolved:
+                        raise ValueError("archive link target escapes extraction root")
+                    resolved.pop()
+                    continue
+                candidate = "/".join((*resolved, part))
+                entry = by_name.get(candidate)
+                if entry is not None and (entry.issym() or entry.islnk()):
+                    base = candidate.split("/")[:-1] if entry.issym() else []
+                    pending = base + link_parts(entry.linkname) + pending
+                    resolved = []
+                    continue
+                if pending and (entry is None or not entry.isdir()):
+                    raise ValueError(f"archive path resolves through missing or non-directory member: {candidate}")
+                resolved.append(part)
+            final = "/".join(resolved)
+            entry = by_name.get(final)
+            if entry is None:
+                raise ValueError(f"archive link resolves to missing member: {final or '.'}")
+            return entry
+
+        for key, member in by_name.items():
+            if not key:
+                continue
+            parent = key.rpartition("/")[0]
+            if parent and not resolve(parent).isdir():
+                raise ValueError(f"archive member parent is not a directory: {key}")
+            if member.issym() or member.islnk():
+                target = resolve(key)
+                if member.islnk() and not target.isfile():
+                    raise ValueError("archive hardlink does not resolve to a regular file")
+except (OSError, tarfile.TarError, ValueError) as error:
+    print(f"unsafe archive: {error}", file=sys.stderr)
+    raise SystemExit(1)
+PY
+}
+
+# ------------------------------------------------------------------ commands
+cmd_build() {
+  say "Building $IMAGE from $ROOT (provision runs at build time)"
+  docker build -t "$IMAGE" -f "$ROOT/docker/Dockerfile" "$ROOT"
+  say "Built $IMAGE"
+}
+
+_run_container() {  # $1=name; publishes only what box.env exposure flags allow
+  local n="$1" ports=()
+  if [[ "${INSTALL_EXECUTOR:-0}" == 1 && "${EXPOSE_EXECUTOR_WEB:-0}" == 1 ]]; then
+    ports+=(-p "0.0.0.0::$EXEC_BRIDGE")
+  fi
+  if [[ "${INSTALL_HERMES:-0}" == 1 && "${EXPOSE_HERMES_API:-0}" == 1 ]]; then
+    ports+=(-p "0.0.0.0::$API_BRIDGE")
+  fi
+  docker run -d --init \
+    --name "$(cname "$n")" \
+    --label "$LABEL=1" \
+    --restart unless-stopped \
+    --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+    --cpus "${BOX_CPUS:-4}" \
+    --memory "${BOX_MEM_MIB:-8192}m" \
+    -v "$(vname "$n"):/data" \
+    "${ports[@]}" \
+    -e "BOX_EXECUTOR_BRIDGE_PORT=$EXEC_BRIDGE" \
+    -e "BOX_HERMES_BRIDGE_PORT=$API_BRIDGE" \
+    "$IMAGE" >/dev/null
+}
+
+_prepare_runtime() {  # same post-create guarantee as ./box: up, wire, doctor
+  local n="$1" attempt
+  # The in-container hb-workload reconcile loop may hold the executor/gateway
+  # daemon locks while it brings services up right after boot; `hb up` uses a
+  # 5s flock wait, so give the box up to ~90s to converge instead of failing
+  # on first contention.
+  for attempt in 1 2 3 4 5 6; do
+    _guest_hb "$n" up >/dev/null 2>&1 && break
+    [[ "$attempt" == 6 ]] && { _guest_hb "$n" up >/dev/null; return 1; }
+    sleep 15
+  done
+  _guest_hb "$n" wire-once >/dev/null || return 1
+  _guest_hb "$n" doctor
+}
+
+_destroy() {  # rollback helper: container + volume, best-effort
+  docker rm -f "$(cname "$1")" >/dev/null 2>&1 || true
+  docker volume rm "$(vname "$1")" >/dev/null 2>&1 || true
+}
+
+cmd_new() {
+  local n="${1:?usage: boxd new <name>}"
+  _validate_name "$n"
+  _require_image
+  _lock "$n"
+  ! _container_exists "$n" || die "box '$n' already exists"
+  ! _volume_exists "$n" || die "volume $(vname "$n") already exists (old state?) — remove it or pick another name"
+  say "Creating box '$n' (volume $(vname "$n"))"
+  docker volume create --label "$LABEL=1" "$(vname "$n")" >/dev/null
+  # First mount of the empty named volume copies the image's seeded /data
+  # skeleton into it automatically.
+  if ! _run_container "$n"; then
+    _destroy "$n"; die "container creation failed; volume removed"
+  fi
+  say "Preparing runtime (executor up, MCP wiring, doctor)"
+  if ! _prepare_runtime "$n"; then
+    warn "runtime preparation failed; leaving '$n' in place for inspection"
+    die "box '$n' created but unhealthy — inspect with: ./docker/boxd enter $n (or rm it)"
+  fi
+  say "Ready. Enter with: ./docker/boxd enter $n"
+  local ep; ep="$(_host_port "$n" "$EXEC_BRIDGE")"
+  [[ -n "$ep" ]] && say "Executor web: http://localhost:${ep}"
+  say "Authenticate inside, then ./docker/boxd save $n to capture the state."
+}
+
+cmd_enter() {
+  local n="${1:?usage: boxd enter <name>}"
+  _validate_name "$n"
+  _container_exists "$n" || die "box '$n' does not exist"
+  _container_running "$n" || docker start "$(cname "$n")" >/dev/null
+  # bash -l as agent sources /etc/profile + ~/.bash_profile -> hb up + tmux,
+  # same experience as `box enter` on smolvm.
+  exec docker exec -it -u agent \
+    -e HOME=/data/home/agent -e USER=agent -e LOGNAME=agent -e SHELL=/bin/bash \
+    -w /data/home/agent "$(cname "$n")" bash -l
+}
+
+cmd_ls() {
+  local rows n state ep ap
+  rows="$(docker ps -a --filter "label=$LABEL" --format $'{{.Names}}\t{{.State}}')" ||
+    die "could not query the Docker daemon"
+  printf '%-16s %-10s %-28s %s\n' BOX STATE EXECUTOR HERMES_API
+  while IFS=$'\t' read -r n state; do
+    [[ -n "$n" ]] || continue
+    n="${n#hbl-}"
+    ep="$(_host_port "$n" "$EXEC_BRIDGE")"; ap="$(_host_port "$n" "$API_BRIDGE")"
+    printf '%-16s %-10s %-28s %s\n' "$n" "$state" \
+      "${ep:+http://localhost:$ep}" "${ap:+http://localhost:$ap}"
+  done <<<"$rows"
+}
+
+cmd_doctor() {
+  local n="${1:?usage: boxd doctor <name>}"
+  _validate_name "$n"
+  _container_exists "$n" || die "box '$n' does not exist"
+  _container_running "$n" || die "box '$n' is not running"
+  _guest_hb "$n" doctor || die "guest doctor failed for '$n'"
+  say "doctor passed for '$n'"
+}
+
+cmd_stop()  { _validate_name "${1:?usage: boxd stop <name>}";  _lock "$1"; docker stop "$(cname "$1")" >/dev/null; say "stopped '$1'"; }
+cmd_start() { _validate_name "${1:?usage: boxd start <name>}"; _lock "$1"; docker start "$(cname "$1")" >/dev/null; say "started '$1'"; }
+
+cmd_save() {
+  local n="${1:?usage: boxd save <name> [out.tar.gz.gpg]}" ts out raw encrypted
+  _validate_name "$n"
+  _lock "$n"
+  _container_running "$n" || die "box '$n' is not running"
+  ts="$(date +%Y%m%d-%H%M%S)"
+  out="${2:-backups/${n}-${ts}.tar.gz.gpg}"
+  [[ ! -e "$out" ]] || die "refusing to overwrite existing backup: $out"
+  mkdir -p "$(dirname "$out")"
+  raw="$(_tmp)"
+  encrypted="$(mktemp "${out}.tmp.XXXXXX")"
+  _TEMP_PATHS+=("$encrypted")
+
+  say "Quiescing Hermes and Executor inside '$n'"
+  if ! _guest_hb "$n" is-paused >/dev/null 2>&1; then
+    _RESUME_BOX="$n"   # EXIT trap resumes on any failure past this point
+    _guest_hb "$n" pause
+  fi
+  _guest_hb "$n" verify-state --checkpoint >/dev/null
+  _guest_hb "$n" write-manifest
+  say "Archiving /data"
+  docker exec "$(cname "$n")" bash -c \
+    'set -euo pipefail; umask 077; sync
+     tar czf - -C /data \
+       --exclude="./home/agent/.config/hermes-box/quiesced" \
+       --exclude="./home/agent/.codex/tmp" \
+       --exclude="./home/agent/.hermes/tmp" \
+       --exclude="*/node_modules" --exclude="*/.venv" --exclude="*/venv" \
+       --exclude="*/__pycache__" --exclude="*/.cache" \
+       --exclude="*.pyc" --exclude="*.pyo" \
+       --exclude="*/.hermes/*.db-wal" --exclude="*/.hermes/*.db-shm" \
+       --exclude="*/.hermes/*.db-journal" \
+       --exclude="*/gateway.pid" --exclude="*/cron.pid" --exclude="*/gateway.lock" \
+       --exclude="*/processes.json" .' >"$raw"
+  _validate_archive "$raw" || die "generated archive failed validation"
+  if [[ "$_RESUME_BOX" == "$n" ]]; then
+    _guest_hb "$n" resume
+    _RESUME_BOX=""
+  fi
+
+  say "Encrypting and verifying backup"
+  rm -f "$encrypted"
+  gpg_enc "$encrypted" <"$raw"
+  gpg_dec "$encrypted" | tar tzf - >/dev/null || die "encrypted backup verification failed"
+  ln "$encrypted" "$out" 2>/dev/null || die "backup destination appeared during save: $out"
+  rm -f "$encrypted"
+  say "Saved and verified $(du -h "$out" | cut -f1) -> $out"
+}
+
+cmd_load() {
+  local file="${1:?usage: boxd load <archive.tar.gz.gpg> [name]}" n="${2:-restored}" raw
+  [[ -f "$file" ]] || die "no such archive: $file"
+  _validate_name "$n"
+  _require_image
+  _lock "$n"
+  ! _container_exists "$n" || die "box '$n' already exists"
+  ! _volume_exists "$n" || die "volume $(vname "$n") already exists"
+  raw="$(_tmp)"
+  say "Decrypting and validating archive before creating anything"
+  gpg_dec "$file" >"$raw"
+  _validate_archive "$raw" || die "archive is invalid or unsafe"
+
+  say "Creating volume and restoring /data"
+  docker volume create --label "$LABEL=1" "$(vname "$n")" >/dev/null
+  # Throwaway container extracts into a staging dir on the fresh (empty)
+  # volume, asserts the permission topology, verifies Hermes state, then
+  # promotes. Freshness of the volume stands in for smolvm's rollback dir.
+  # Restore-safety markers re-arm quiesce + gateway-disable (single-writer).
+  if ! docker run --rm -i -v "$(vname "$n"):/data" --entrypoint bash "$IMAGE" -c '
+    set -euo pipefail
+    find /data -mindepth 1 -delete
+    stage=/data/.hb-restore-stage
+    mkdir -m 0700 "$stage"
+    tar xzf - --no-same-owner -C "$stage"
+    test -d "$stage/home/agent"
+    chown root:root "$stage" "$stage/home"
+    chmod 0711 "$stage" "$stage/home"
+    chown -R agent:agent "$stage/home/agent" "$stage/logs" 2>/dev/null || true
+    mkdir -p "$stage/home/agent/.config/hermes-box"
+    touch "$stage/home/agent/.config/hermes-box/quiesced" \
+          "$stage/home/agent/.config/hermes-box/gateway-disabled" \
+          "$stage/home/agent/.config/hermes-box/gateway-policy-initialized"
+    chown -R agent:agent "$stage/home/agent/.config/hermes-box"
+    runuser -u agent -- env HOME=/data/home/agent \
+      /opt/hermes-box/bin/hermes-state verify --home "$stage/home/agent/.hermes" >/dev/null
+    shopt -s dotglob
+    mv "$stage"/* /data/
+    rmdir "$stage"
+    chown root:root /data && chmod 0711 /data
+  ' <"$raw"; then
+    docker volume rm "$(vname "$n")" >/dev/null 2>&1 || true
+    die "restore failed; volume removed"
+  fi
+
+  say "Starting restored box '$n' (quiesced, gateway disabled)"
+  if ! _run_container "$n"; then
+    _destroy "$n"; die "container creation failed after restore; volume removed"
+  fi
+  _guest_hb "$n" verify-state >/dev/null || warn "post-start verify-state failed — inspect before resuming"
+  say "Restored. Enter with: ./docker/boxd enter $n — then 'hb resume' and the gateway-enable gates."
+}
+
+cmd_rm() {
+  local n="${1:?usage: boxd rm <name> [--force]}" force="${2:-}" answer latest
+  _validate_name "$n"
+  latest="$(find backups -maxdepth 1 -type f -name "${n}-*.tar.gz.gpg" -print 2>/dev/null | sort | tail -1)"
+  if [[ -n "$latest" ]]; then say "latest backup: $latest"; else warn "no backup found for '$n'"; fi
+  if [[ "$force" != --force ]]; then
+    [[ -r /dev/tty ]] || die "refusing non-interactive deletion without --force"
+    printf "Type the box name '%s' to delete it AND its data volume permanently: " "$n" >/dev/tty
+    read -r answer </dev/tty
+    [[ "$answer" == "$n" ]] || die "deletion cancelled"
+  fi
+  _lock "$n"
+  docker rm -f "$(cname "$n")" >/dev/null 2>&1 || true
+  if _volume_exists "$n"; then
+    docker volume rm "$(vname "$n")" >/dev/null || die "volume $(vname "$n") could not be removed (in use?)"
+  fi
+  say "deleted '$n'"
+}
+
+usage() {
+  cat <<'EOF'
+boxd — hermes-box-lite on Docker (first draft)
+
+  ./docker/boxd build            Build the box image (runs provision.sh once)
+  ./docker/boxd new <name>       Create a box: named volume + container (seconds)
+  ./docker/boxd enter <name>     Shell in as agent (tmux 'main', same as box enter)
+  ./docker/boxd ls               List boxes with their published host ports
+  ./docker/boxd doctor <name>    In-box health check (hb doctor)
+  ./docker/boxd stop|start <n>   Stop / start the container (volume persists)
+  ./docker/boxd save <n> [out]   Quiesce + archive /data -> encrypted backup
+                                 (same format as ./box save; archives interchange)
+  ./docker/boxd load <file> [n]  Restore an archive into a fresh box (gateway disabled)
+  ./docker/boxd rm <name>        Delete container AND volume (confirmation required)
+
+  BOX_PASSPHRASE / BOX_PASSPHRASE_FILE as before. BOXD_IMAGE overrides the image.
+  Exposure of Executor/Hermes ports follows box.env (EXPOSE_EXECUTOR_WEB,
+  EXPOSE_HERMES_API); published ports bind 0.0.0.0 and are auto-assigned.
+EOF
+}
+
+main() {
+  command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+  case "${1:-help}" in
+    build)  shift; cmd_build "$@" ;;
+    new)    shift; cmd_new "$@" ;;
+    enter)  shift; cmd_enter "$@" ;;
+    ls)     shift; cmd_ls "$@" ;;
+    doctor) shift; cmd_doctor "$@" ;;
+    stop)   shift; cmd_stop "$@" ;;
+    start)  shift; cmd_start "$@" ;;
+    save)   shift; cmd_save "$@" ;;
+    load)   shift; cmd_load "$@" ;;
+    rm)     shift; cmd_rm "$@" ;;
+    help|-h|--help) usage ;;
+    *) usage; return 1 ;;
+  esac
+}
+main "$@"
