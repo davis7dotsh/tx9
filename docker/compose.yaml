@@ -1,0 +1,65 @@
+# One box = one compose project (-p hbl-<name>) instantiated from this
+# template. Two containers, two volumes, one private network:
+#
+#   agent     — "linux land": claude/codex/hermes + the gateway, free rein,
+#               owns the durable /data volume that box backups archive.
+#               NO published ports. Its only route to Executor is HTTP across
+#               the private compose network, gated by the bearer token.
+#   executor  — runs ONLY the Executor daemon on its own /data volume.
+#               Publishes 4788 to the host on 0.0.0.0 (LAN/Tailscale): the
+#               same port serves the dashboard (/) and MCP (/mcp), with the
+#               bearer token as the gate on every request.
+#
+# Both services run the same image with different entrypoints — one build.
+# Interpolated variables come from boxd's per-box env file (.boxd/<name>.env):
+# BOX_NAME, EXECUTOR_MCP_TOKEN, and optional BOXD_IMAGE/BOX_CPUS/BOX_MEM_MIB.
+
+services:
+  agent:
+    image: ${BOXD_IMAGE:-hermes-box-lite:latest}
+    container_name: hbl-${BOX_NAME}-agent
+    entrypoint: /opt/hermes-box/bin/entrypoint
+    init: true
+    restart: unless-stopped
+    cpus: ${BOX_CPUS:-4}
+    mem_limit: ${BOX_MEM_MIB:-8192}m
+    labels: [hermes-box-lite=1]
+    sysctls:
+      # localhost must resolve to 127.0.0.1, not ::1 (hermes gateway and all
+      # health probes are v4); matches the smolvm guest environment.
+      net.ipv6.conf.all.disable_ipv6: 1
+    environment:
+      EXECUTOR_HOST: executor          # hb wires MCP against http://executor:4788
+      # BOXD_ prefix: survives /etc/profile.d sourcing a restored (stale)
+      # executor-mcp.env, which overwrites EXECUTOR_MCP_TOKEN.
+      BOXD_EXECUTOR_TOKEN: ${EXECUTOR_MCP_TOKEN}
+      BOX_EXECUTOR_BRIDGE_PORT: "4788" # equal to the target port -> no socat bridge
+      BOX_HERMES_BRIDGE_PORT: "0"      # agent publishes nothing; no API bridge
+    volumes:
+      - agent-data:/data
+    depends_on:
+      - executor
+
+  executor:
+    image: ${BOXD_IMAGE:-hermes-box-lite:latest}
+    container_name: hbl-${BOX_NAME}-executor
+    entrypoint: /opt/hermes-box/bin/executor-entrypoint
+    init: true
+    restart: unless-stopped
+    cpus: ${EXECUTOR_CPUS:-2}
+    mem_limit: ${EXECUTOR_MEM_MIB:-2048}m
+    labels: [hermes-box-lite=1]
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 1
+    environment:
+      EXECUTOR_MCP_TOKEN: ${EXECUTOR_MCP_TOKEN}
+    volumes:
+      - exec-data:/data
+    ports:
+      # Container 4788 -> auto-assigned host port on all interfaces
+      # (LAN + Tailscale). Dashboard at /, MCP at /mcp, token-gated.
+      - "4788"
+
+volumes:
+  agent-data:
+  exec-data:

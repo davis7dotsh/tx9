@@ -33,7 +33,9 @@ for file in box guest/hb guest/hb-workload guest/hermes-state provision/provisio
 done
 
 grep -q 'WIRE_EXECUTOR_MCP' guest/hb
-grep -q 'http://127.0.0.1:.*}/mcp' guest/hb
+# HTTP MCP wiring goes through _executor_url (http://$EXECUTOR_HOST:$PORT/mcp,
+# loopback by default, container-DNS name in the compose split).
+grep -q "printf 'http://%s:%s/mcp' \"\$EXECUTOR_HOST\"" guest/hb
 if grep -q 'args = \["mcp"\]' guest/hb; then
   echo "legacy stdio Executor MCP wiring remains" >&2
   exit 1
@@ -128,7 +130,7 @@ grep -q '_stop_executor_bridge' guest/hb-workload
 grep -q 'LEGACY_QUIESCE_FILE' guest/hb guest/hb-workload
 grep -q 'Executor target port closed while quiesced' guest/hb
 grep -q 'gateway-is-disabled' guest/hb box
-grep -q 'EXECUTOR_PORT:-4788.*mcp' guest/hb
+grep -q "printf 'http://%s:%s/mcp'.*EXECUTOR_PORT:-4788" guest/hb
 grep -q 'guest_tmp="/data/home/agent/.config/hermes-box/import-' box
 if grep -q 'guest_tmp="/root/hermes-import-' box; then
   echo "Hermes import remains unreadable to the agent" >&2

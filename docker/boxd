@@ -1,30 +1,31 @@
 #!/usr/bin/env bash
-# boxd — hermes-box-lite on Docker. First draft.
+# boxd — hermes-box-lite on Docker Compose.
 #
-# Model: one box = one container (hbl-<name>) + one named volume (hbl-<name>-data
-# mounted at /data). Everything managed (/opt/hermes-box, /usr/local, node, uv,
-# claude, codex, hermes, executor) is baked into the image at build time by the
-# same provision/provision.sh the smolvm path streams into a live VM. Durable
-# state is exactly what it was before: /data. Backups are the same encrypted
-# tar-of-/data archives `./box save` produces, so archives are interchangeable
-# between the two runtimes.
+# One box = one compose project (hbl-<name>) from docker/compose.yaml:
 #
-# Deliberately lean vs ./box: no port registry (Docker assigns host ports), no
-# provisioning rollback machinery (image builds are atomic), no mkdir-based
-# lock forest (one flock per box). ~1/3 the code for the same lifecycle.
+#   agent container     linux land: claude/codex/hermes gateway, free rein,
+#                       durable /data volume (what save/load archives).
+#                       No published ports; reaches Executor only over the
+#                       private project network with a bearer token.
+#   executor container  Executor daemon alone on its own /data volume.
+#                       One published 0.0.0.0 port (LAN/Tailscale) serving
+#                       both the dashboard (/) and MCP (/mcp), token-gated.
+#
+# Both containers run the same image (one `boxd build`); managed tooling is
+# image layers, durable state is the volumes, backups are the same encrypted
+# tar-of-/data archives ./box produced on smolvm — they interchange.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck source=../box.env
 source "$ROOT/box.env"
 IMAGE="${BOXD_IMAGE:-hermes-box-lite:latest}"
-LABEL=hermes-box-lite
-LOCK_DIR="$ROOT/.boxd-locks"
-EXEC_BRIDGE=14788   # in-container 0.0.0.0 bridge -> executor 127.0.0.1:4788
-API_BRIDGE=18642    # in-container 0.0.0.0 bridge -> hermes API 127.0.0.1:8642
+COMPOSE_FILE="$ROOT/docker/compose.yaml"
+ENV_DIR="$ROOT/.boxd"          # per-box compose env (incl. executor token)
+LOCK_DIR="$ROOT/.boxd/locks"
 _BOX_PASS=""
 _TEMP_PATHS=()
-_RESUME_BOX=""      # box paused by us; resumed by the EXIT trap on any failure
+_RESUME_BOX=""                 # box paused by us; resumed by EXIT trap on failure
 
 die()  { printf '\033[31merror:\033[0m %s\n' "$*" >&2; exit 1; }
 say()  { printf '\033[36m==>\033[0m %s\n' "$*"; }
@@ -44,8 +45,6 @@ trap 'exit 129' HUP; trap 'exit 130' INT; trap 'exit 143' TERM
 
 _tmp() { local t; t="$(mktemp)"; _TEMP_PATHS+=("$t"); printf '%s' "$t"; }
 
-# Per-box serialization. flock on fd 9; the lock lives for the process, which
-# is exactly the critical section for every multi-step command here.
 _lock() {
   mkdir -p "$LOCK_DIR"
   exec 9>"$LOCK_DIR/$1.lock"
@@ -53,36 +52,60 @@ _lock() {
 }
 
 _validate_name() {
-  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$ ]] ||
-    die "invalid box name '$1' (1-63 letters, numbers, dots, underscores, dashes)"
+  [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9_-]{0,52}$ ]] ||
+    die "invalid box name '$1' (1-53 letters, numbers, underscores, dashes; compose project rules)"
 }
 
-cname() { printf 'hbl-%s' "$1"; }
-vname() { printf 'hbl-%s-data' "$1"; }
+proj()   { printf 'hbl-%s' "$1"; }
+agentc() { printf 'hbl-%s-agent' "$1"; }
+execc()  { printf 'hbl-%s-executor' "$1"; }
+envf()   { printf '%s/%s.env' "$ENV_DIR" "$1"; }
 
-_container_exists() { docker container inspect "$(cname "$1")" >/dev/null 2>&1; }
-_container_running() {
-  [[ "$(docker container inspect -f '{{.State.Running}}' "$(cname "$1")" 2>/dev/null)" == true ]]
+# All compose invocations for a box go through this so project/file/env are
+# always consistent. The env file must exist (created by `new`/`load`).
+_compose() {
+  local n="$1"; shift
+  docker compose -p "$(proj "$n")" -f "$COMPOSE_FILE" --env-file "$(envf "$n")" "$@"
 }
-_volume_exists() { docker volume inspect "$(vname "$1")" >/dev/null 2>&1; }
+
+_box_exists() { [[ -f "$(envf "$1")" ]] || docker container inspect "$(agentc "$1")" >/dev/null 2>&1; }
+_agent_running() {
+  [[ "$(docker container inspect -f '{{.State.Running}}' "$(agentc "$1")" 2>/dev/null)" == true ]]
+}
 
 _require_image() {
   docker image inspect "$IMAGE" >/dev/null 2>&1 ||
     die "image '$IMAGE' not found — run: ./docker/boxd build"
 }
 
-# Run hb inside the box as the agent user (mirrors ./box's _guest_hb).
+_write_env_file() {  # $1=name $2=token — chmod 600, contains the bearer token
+  mkdir -p "$ENV_DIR"
+  local f; f="$(envf "$1")"
+  umask 077
+  {
+    printf 'BOX_NAME=%s\n' "$1"
+    printf 'BOXD_IMAGE=%s\n' "$IMAGE"
+    printf 'EXECUTOR_MCP_TOKEN=%s\n' "$2"
+    printf 'BOX_CPUS=%s\n' "${BOX_CPUS:-4}"
+    printf 'BOX_MEM_MIB=%s\n' "${BOX_MEM_MIB:-8192}"
+  } >"$f"
+  chmod 0600 "$f"
+}
+
+# Run hb inside the agent container as the agent user.
 _guest_hb() {
   local n="$1"; shift
-  docker exec "$(cname "$n")" \
-    runuser -u agent -- env HOME=/data/home/agent bash --noprofile --norc -c \
+  docker exec "$(agentc "$n")" \
+    runuser -u agent -- env HOME=/data/home/agent \
+    EXECUTOR_HOST=executor BOXD_EXECUTOR_TOKEN="$(_token "$n")" \
+    bash --noprofile --norc -c \
     '. /etc/profile.d/hermes-box.sh; exec hb "$@"' hb "$@"
 }
 
-_host_port() {  # box name, internal port -> published host port ('' if none)
-  # `docker port` exits non-zero for unpublished ports; that's an empty
-  # result here, not an error (callers run under set -e).
-  { docker port "$(cname "$1")" "$2/tcp" 2>/dev/null || true; } | head -1 | awk -F: '{print $NF}'
+_token() { sed -n 's/^EXECUTOR_MCP_TOKEN=//p' "$(envf "$1")"; }
+
+_exec_host_port() {  # published host port of the executor service
+  { docker port "$(execc "$1")" 4788/tcp 2>/dev/null || true; } | head -1 | awk -F: '{print $NF}'
 }
 
 # ---------------------------------------------------------------- passphrase
@@ -245,34 +268,10 @@ cmd_build() {
   say "Built $IMAGE"
 }
 
-_run_container() {  # $1=name; publishes only what box.env exposure flags allow
-  local n="$1" ports=()
-  if [[ "${INSTALL_EXECUTOR:-0}" == 1 && "${EXPOSE_EXECUTOR_WEB:-0}" == 1 ]]; then
-    ports+=(-p "0.0.0.0::$EXEC_BRIDGE")
-  fi
-  if [[ "${INSTALL_HERMES:-0}" == 1 && "${EXPOSE_HERMES_API:-0}" == 1 ]]; then
-    ports+=(-p "0.0.0.0::$API_BRIDGE")
-  fi
-  docker run -d --init \
-    --name "$(cname "$n")" \
-    --label "$LABEL=1" \
-    --restart unless-stopped \
-    --sysctl net.ipv6.conf.all.disable_ipv6=1 \
-    --cpus "${BOX_CPUS:-4}" \
-    --memory "${BOX_MEM_MIB:-8192}m" \
-    -v "$(vname "$n"):/data" \
-    "${ports[@]}" \
-    -e "BOX_EXECUTOR_BRIDGE_PORT=$EXEC_BRIDGE" \
-    -e "BOX_HERMES_BRIDGE_PORT=$API_BRIDGE" \
-    "$IMAGE" >/dev/null
-}
-
 _prepare_runtime() {  # same post-create guarantee as ./box: up, wire, doctor
   local n="$1" attempt
-  # The in-container hb-workload reconcile loop may hold the executor/gateway
-  # daemon locks while it brings services up right after boot; `hb up` uses a
-  # 5s flock wait, so give the box up to ~90s to converge instead of failing
-  # on first contention.
+  # hb-workload's reconcile loop may hold daemon locks right after boot;
+  # `hb up` waits 5s per flock, so allow the box up to ~90s to converge.
   for attempt in 1 2 3 4 5 6; do
     _guest_hb "$n" up >/dev/null 2>&1 && break
     [[ "$attempt" == 6 ]] && { _guest_hb "$n" up >/dev/null; return 1; }
@@ -282,79 +281,87 @@ _prepare_runtime() {  # same post-create guarantee as ./box: up, wire, doctor
   _guest_hb "$n" doctor
 }
 
-_destroy() {  # rollback helper: container + volume, best-effort
-  docker rm -f "$(cname "$1")" >/dev/null 2>&1 || true
-  docker volume rm "$(vname "$1")" >/dev/null 2>&1 || true
+_destroy() {  # containers + volumes + network + env file, best-effort
+  _compose "$1" down -v --timeout 10 >/dev/null 2>&1 || true
+  rm -f "$(envf "$1")"
 }
 
 cmd_new() {
-  local n="${1:?usage: boxd new <name>}"
+  local n="${1:?usage: boxd new <name>}" token
   _validate_name "$n"
   _require_image
   _lock "$n"
-  ! _container_exists "$n" || die "box '$n' already exists"
-  ! _volume_exists "$n" || die "volume $(vname "$n") already exists (old state?) — remove it or pick another name"
-  say "Creating box '$n' (volume $(vname "$n"))"
-  docker volume create --label "$LABEL=1" "$(vname "$n")" >/dev/null
-  # First mount of the empty named volume copies the image's seeded /data
-  # skeleton into it automatically.
-  if ! _run_container "$n"; then
-    _destroy "$n"; die "container creation failed; volume removed"
+  ! _box_exists "$n" || die "box '$n' already exists"
+  say "Creating box '$n' (agent + executor containers, private network)"
+  token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  _write_env_file "$n" "$token"
+  if ! _compose "$n" up -d --quiet-pull 2>/dev/null; then
+    _destroy "$n"; die "compose up failed; box removed"
   fi
-  say "Preparing runtime (executor up, MCP wiring, doctor)"
+  say "Preparing runtime (executor reachability, MCP wiring, doctor)"
   if ! _prepare_runtime "$n"; then
     warn "runtime preparation failed; leaving '$n' in place for inspection"
     die "box '$n' created but unhealthy — inspect with: ./docker/boxd enter $n (or rm it)"
   fi
   say "Ready. Enter with: ./docker/boxd enter $n"
-  local ep; ep="$(_host_port "$n" "$EXEC_BRIDGE")"
-  [[ -n "$ep" ]] && say "Executor web: http://localhost:${ep}"
+  local ep; ep="$(_exec_host_port "$n")"
+  [[ -n "$ep" ]] && say "Executor dashboard + MCP (token-gated): http://${BOXD_URL_HOST:-siva.davis7.space}:${ep}/"
   say "Authenticate inside, then ./docker/boxd save $n to capture the state."
 }
 
 cmd_enter() {
   local n="${1:?usage: boxd enter <name>}"
   _validate_name "$n"
-  _container_exists "$n" || die "box '$n' does not exist"
-  _container_running "$n" || docker start "$(cname "$n")" >/dev/null
-  # bash -l as agent sources /etc/profile + ~/.bash_profile -> hb up + tmux,
-  # same experience as `box enter` on smolvm.
+  _box_exists "$n" || die "box '$n' does not exist"
+  _agent_running "$n" || _compose "$n" start >/dev/null
   exec docker exec -it -u agent \
     -e HOME=/data/home/agent -e USER=agent -e LOGNAME=agent -e SHELL=/bin/bash \
-    -w /data/home/agent "$(cname "$n")" bash -l
+    -e EXECUTOR_HOST=executor -e "BOXD_EXECUTOR_TOKEN=$(_token "$n")" \
+    -w /data/home/agent "$(agentc "$n")" bash -l
 }
 
 cmd_ls() {
-  local rows n state ep ap
-  rows="$(docker ps -a --filter "label=$LABEL" --format $'{{.Names}}\t{{.State}}')" ||
-    die "could not query the Docker daemon"
-  printf '%-16s %-10s %-28s %s\n' BOX STATE EXECUTOR HERMES_API
-  while IFS=$'\t' read -r n state; do
-    [[ -n "$n" ]] || continue
-    n="${n#hbl-}"
-    ep="$(_host_port "$n" "$EXEC_BRIDGE")"; ap="$(_host_port "$n" "$API_BRIDGE")"
-    printf '%-16s %-10s %-28s %s\n' "$n" "$state" \
-      "${ep:+http://localhost:$ep}" "${ap:+http://localhost:$ap}"
+  local rows name state n ep
+  rows="$(docker ps -a --filter "label=hermes-box-lite" --filter "name=-agent$" \
+    --format $'{{.Names}}\t{{.State}}')" || die "could not query the Docker daemon"
+  printf '%-16s %-10s %s\n' BOX STATE 'EXECUTOR (dashboard+MCP)'
+  while IFS=$'\t' read -r name state; do
+    [[ -n "$name" ]] || continue
+    n="${name#hbl-}"; n="${n%-agent}"
+    ep="$(_exec_host_port "$n")"
+    printf '%-16s %-10s %s\n' "$n" "$state" "${ep:+http://${BOXD_URL_HOST:-siva.davis7.space}:$ep/}"
   done <<<"$rows"
 }
 
 cmd_doctor() {
-  local n="${1:?usage: boxd doctor <name>}"
+  local n="${1:?usage: boxd doctor <name>}" ep
   _validate_name "$n"
-  _container_exists "$n" || die "box '$n' does not exist"
-  _container_running "$n" || die "box '$n' is not running"
+  _box_exists "$n" || die "box '$n' does not exist"
+  _agent_running "$n" || die "box '$n' is not running"
   _guest_hb "$n" doctor || die "guest doctor failed for '$n'"
+  ep="$(_exec_host_port "$n")"
+  if [[ -n "$ep" ]]; then
+    # Right after `start`, the executor daemon needs a few seconds; retry
+    # briefly so doctor doesn't flake in the boot window.
+    local attempt ok=0
+    for attempt in 1 2 3 4 5 6; do
+      curl -sf --connect-timeout 3 -o /dev/null "http://127.0.0.1:${ep}/" && { ok=1; break; }
+      sleep 3
+    done
+    [[ "$ok" == 1 ]] || die "executor dashboard unreachable on published host port $ep"
+    say "host executor endpoint: healthy on port $ep"
+  fi
   say "doctor passed for '$n'"
 }
 
-cmd_stop()  { _validate_name "${1:?usage: boxd stop <name>}";  _lock "$1"; docker stop "$(cname "$1")" >/dev/null; say "stopped '$1'"; }
-cmd_start() { _validate_name "${1:?usage: boxd start <name>}"; _lock "$1"; docker start "$(cname "$1")" >/dev/null; say "started '$1'"; }
+cmd_stop()  { _validate_name "${1:?usage: boxd stop <name>}";  _lock "$1"; _compose "$1" stop --timeout 20 >/dev/null; say "stopped '$1'"; }
+cmd_start() { _validate_name "${1:?usage: boxd start <name>}"; _lock "$1"; _compose "$1" start >/dev/null; say "started '$1'"; }
 
 cmd_save() {
   local n="${1:?usage: boxd save <name> [out.tar.gz.gpg]}" ts out raw encrypted
   _validate_name "$n"
   _lock "$n"
-  _container_running "$n" || die "box '$n' is not running"
+  _agent_running "$n" || die "box '$n' is not running"
   ts="$(date +%Y%m%d-%H%M%S)"
   out="${2:-backups/${n}-${ts}.tar.gz.gpg}"
   [[ ! -e "$out" ]] || die "refusing to overwrite existing backup: $out"
@@ -363,15 +370,15 @@ cmd_save() {
   encrypted="$(mktemp "${out}.tmp.XXXXXX")"
   _TEMP_PATHS+=("$encrypted")
 
-  say "Quiescing Hermes and Executor inside '$n'"
+  say "Quiescing the Hermes gateway inside '$n' (executor container unaffected)"
   if ! _guest_hb "$n" is-paused >/dev/null 2>&1; then
     _RESUME_BOX="$n"   # EXIT trap resumes on any failure past this point
     _guest_hb "$n" pause
   fi
   _guest_hb "$n" verify-state --checkpoint >/dev/null
   _guest_hb "$n" write-manifest
-  say "Archiving /data"
-  docker exec "$(cname "$n")" bash -c \
+  say "Archiving agent /data"
+  docker exec "$(agentc "$n")" bash -c \
     'set -euo pipefail; umask 077; sync
      tar czf - -C /data \
        --exclude="./home/agent/.config/hermes-box/quiesced" \
@@ -400,25 +407,29 @@ cmd_save() {
 }
 
 cmd_load() {
-  local file="${1:?usage: boxd load <archive.tar.gz.gpg> [name]}" n="${2:-restored}" raw
+  local file="${1:?usage: boxd load <archive.tar.gz.gpg> [name]}" n="${2:-restored}" raw token
   [[ -f "$file" ]] || die "no such archive: $file"
   _validate_name "$n"
   _require_image
   _lock "$n"
-  ! _container_exists "$n" || die "box '$n' already exists"
-  ! _volume_exists "$n" || die "volume $(vname "$n") already exists"
+  ! _box_exists "$n" || die "box '$n' already exists"
   raw="$(_tmp)"
   say "Decrypting and validating archive before creating anything"
   gpg_dec "$file" >"$raw"
   _validate_archive "$raw" || die "archive is invalid or unsafe"
 
-  say "Creating volume and restoring /data"
-  docker volume create --label "$LABEL=1" "$(vname "$n")" >/dev/null
-  # Throwaway container extracts into a staging dir on the fresh (empty)
-  # volume, asserts the permission topology, verifies Hermes state, then
-  # promotes. Freshness of the volume stands in for smolvm's rollback dir.
-  # Restore-safety markers re-arm quiesce + gateway-disable (single-writer).
-  if ! docker run --rm -i -v "$(vname "$n"):/data" --entrypoint bash "$IMAGE" -c '
+  say "Creating box and restoring agent /data"
+  token="$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  _write_env_file "$n" "$token"
+  # `create` materializes the project volumes without starting services, so a
+  # throwaway container can populate agent /data before anything runs.
+  if ! _compose "$n" create --quiet-pull >/dev/null 2>&1; then
+    _destroy "$n"; die "compose create failed; box removed"
+  fi
+  # Extract into a staging dir on the fresh volume, assert permission
+  # topology, verify Hermes state, then promote. Restore-safety markers
+  # re-arm quiesce + gateway-disable (single-writer rule).
+  if ! docker run --rm -i -v "$(proj "$n")_agent-data:/data" --entrypoint bash "$IMAGE" -c '
     set -euo pipefail
     find /data -mindepth 1 -delete
     stage=/data/.hb-restore-stage
@@ -440,13 +451,12 @@ cmd_load() {
     rmdir "$stage"
     chown root:root /data && chmod 0711 /data
   ' <"$raw"; then
-    docker volume rm "$(vname "$n")" >/dev/null 2>&1 || true
-    die "restore failed; volume removed"
+    _destroy "$n"; die "restore failed; box removed"
   fi
 
   say "Starting restored box '$n' (quiesced, gateway disabled)"
-  if ! _run_container "$n"; then
-    _destroy "$n"; die "container creation failed after restore; volume removed"
+  if ! _compose "$n" up -d >/dev/null 2>&1; then
+    _destroy "$n"; die "compose up failed after restore; box removed"
   fi
   _guest_hb "$n" verify-state >/dev/null || warn "post-start verify-state failed — inspect before resuming"
   say "Restored. Enter with: ./docker/boxd enter $n — then 'hb resume' and the gateway-enable gates."
@@ -459,41 +469,42 @@ cmd_rm() {
   if [[ -n "$latest" ]]; then say "latest backup: $latest"; else warn "no backup found for '$n'"; fi
   if [[ "$force" != --force ]]; then
     [[ -r /dev/tty ]] || die "refusing non-interactive deletion without --force"
-    printf "Type the box name '%s' to delete it AND its data volume permanently: " "$n" >/dev/tty
+    printf "Type the box name '%s' to delete its containers AND volumes permanently: " "$n" >/dev/tty
     read -r answer </dev/tty
     [[ "$answer" == "$n" ]] || die "deletion cancelled"
   fi
   _lock "$n"
-  docker rm -f "$(cname "$n")" >/dev/null 2>&1 || true
-  if _volume_exists "$n"; then
-    docker volume rm "$(vname "$n")" >/dev/null || die "volume $(vname "$n") could not be removed (in use?)"
-  fi
+  _compose "$n" down -v --timeout 20 >/dev/null 2>&1 ||
+    die "compose down failed for '$n' — inspect with: docker compose -p $(proj "$n") ps"
+  rm -f "$(envf "$n")" "$LOCK_DIR/$n.lock"
   say "deleted '$n'"
 }
 
 usage() {
   cat <<'EOF'
-boxd — hermes-box-lite on Docker (first draft)
+boxd — hermes-box-lite on Docker Compose (agent + executor per box)
 
-  ./docker/boxd build            Build the box image (runs provision.sh once)
-  ./docker/boxd new <name>       Create a box: named volume + container (seconds)
-  ./docker/boxd enter <name>     Shell in as agent (tmux 'main', same as box enter)
-  ./docker/boxd ls               List boxes with their published host ports
-  ./docker/boxd doctor <name>    In-box health check (hb doctor)
-  ./docker/boxd stop|start <n>   Stop / start the container (volume persists)
-  ./docker/boxd save <n> [out]   Quiesce + archive /data -> encrypted backup
-                                 (same format as ./box save; archives interchange)
+  ./docker/boxd build            Build the shared image (runs provision.sh once)
+  ./docker/boxd new <name>       Create a box: 2 containers + 2 volumes + network
+  ./docker/boxd enter <name>     Shell into the agent container (tmux 'main')
+  ./docker/boxd ls               List boxes and executor dashboard URLs
+  ./docker/boxd doctor <name>    In-box doctor + host executor endpoint check
+  ./docker/boxd stop|start <n>   Stop / start both containers (volumes persist)
+  ./docker/boxd save <n> [out]   Quiesce gateway + archive agent /data (encrypted;
+                                 same format as ./box save — archives interchange)
   ./docker/boxd load <file> [n]  Restore an archive into a fresh box (gateway disabled)
-  ./docker/boxd rm <name>        Delete container AND volume (confirmation required)
+  ./docker/boxd rm <name>        Delete containers AND volumes (confirmation required)
 
   BOX_PASSPHRASE / BOX_PASSPHRASE_FILE as before. BOXD_IMAGE overrides the image.
-  Exposure of Executor/Hermes ports follows box.env (EXPOSE_EXECUTOR_WEB,
-  EXPOSE_HERMES_API); published ports bind 0.0.0.0 and are auto-assigned.
+  The executor's published port serves the dashboard (/) and MCP (/mcp) on all
+  host interfaces (LAN + Tailscale); the bearer token in .boxd/<name>.env is
+  the gate. The agent container has no published ports.
 EOF
 }
 
 main() {
   command -v docker >/dev/null 2>&1 || die "docker not found on PATH"
+  docker compose version >/dev/null 2>&1 || die "docker compose v2 plugin not found"
   case "${1:-help}" in
     build)  shift; cmd_build "$@" ;;
     new)    shift; cmd_new "$@" ;;

@@ -27,38 +27,67 @@ Docker trades the VM boundary for a mature, boring runtime:
 
 ## Model
 
+One box = one Docker Compose project (`hbl-<name>`) with **two containers on
+a private network**. This split exists because the main security question is
+Executor: the agent (Hermes, claude, codex) should be free to do whatever it
+wants in its own container, and Executor — the thing that holds real
+credentials and takes real actions — should not share a filesystem, process
+table, or user namespace with it.
+
 ```text
 ./docker/boxd build          (once per box.env / pin change)
-      │  provision.sh runs INSIDE `docker build`
+      │  provision.sh runs INSIDE `docker build` (tools layer + assets layer)
       ▼
-  image hermes-box-lite:latest
-      │  managed tools: /opt/hermes-box and /usr/local — image layers, immutable
+  image hermes-box-lite:latest        one image, two entrypoints
       │
 ./docker/boxd new alpha      (seconds)
       ▼
-  container hbl-alpha  ←→  named volume hbl-alpha-data mounted at /data
-      │  portable state: /data/home/agent (.claude · .codex · .hermes ·
-      │  .executor · workspace · XDG state) — IDENTICAL layout to smolvm boxes
+ compose project hbl-alpha ──────────────────────────────────────────┐
+ │                                                                   │
+ │  ┌────────────────────────────┐     ┌───────────────────────────┐ │
+ │  │ agent  ("linux land")      │     │ executor                  │ │
+ │  │ claude · codex · hermes    │     │ Executor daemon ONLY      │ │
+ │  │ gateway; free rein, sudo   │     │ (foreground, 0.0.0.0:4788,│ │
+ │  │                            │     │  fixed bearer token)      │ │
+ │  │ volume: agent-data → /data │     │ volume: exec-data → /data │ │
+ │  │ THE box; save/load target  │     │ executor scratch state    │ │
+ │  │ NO published ports         │     │ publishes 4788 → host     │ │
+ │  └─────────────┬──────────────┘     └─────┬──────────────┬──────┘ │
+ │                │  http://executor:4788    │              │        │
+ │                └──── private network ─────┘              │        │
+ └──────────────────────────── (per-project; no cross-box) ─┼────────┘
+                                                            ▼
+                             host 0.0.0.0:<auto>  — LAN + Tailscale
+                             dashboard at /  ·  MCP at /mcp
+                             bearer token gates every request
       │
-./docker/boxd save alpha
+./docker/boxd save alpha     (archives agent /data only)
       ▼
   backups/alpha-<ts>.tar.gz.gpg   — SAME format as ./box save; archives are
                                     interchangeable between the two runtimes
 ```
 
-One box = one container + one named volume. The container is disposable
-(recreate it from the image at any time); the volume is the box. This is a
-sharper version of the smolvm story, where "/data" was only an organizational
-boundary on the same overlay — here it is a genuinely separate object with its
-own lifecycle, and `docker run --rm -v hbl-alpha-data:/data …` can operate on
-state with no box running at all (used by `boxd load`).
+Containers are disposable; the `agent-data` volume is the box. The executor
+container's volume is scratch — its identity is the bearer token boxd mints
+per box into `.boxd/<name>.env` (mode 0600) and injects into both containers.
+`hb` inside the agent wires claude/codex MCP against `http://executor:4788/mcp`
+with that token (`EXECUTOR_HOST` + `BOXD_EXECUTOR_TOKEN`); the same token
+authenticates you to the dashboard/MCP from the LAN or Tailscale.
+
+What the agent container can do to Executor: exactly what any LAN client can
+do — talk HTTP to the token-gated endpoint. Nothing else. Cross-box: each
+compose project gets its own network, so `alpha`'s agent cannot even resolve
+`beta`'s executor (verified: DNS fails).
 
 ### What stays exactly the same
 
-- `provision/provision.sh` — unchanged, now a build step.
-- `guest/` (hb, hb-workload, hermes-state, profiles, tmux) — unchanged.
-  `hb-workload` runs as the container workload under a tiny entrypoint loop;
-  its 20s reconcile of executor/gateway/socat bridges carries over verbatim.
+- `provision/provision.sh` — unchanged logic, now two cached build layers
+  (`tools` for the multi-minute installs, `assets` for repo-owned guest
+  files, so guest-script edits rebuild in seconds).
+- `guest/` (hb, hb-workload, hermes-state, profiles, tmux) — hb gained a
+  remote-executor mode (`EXECUTOR_HOST` ≠ loopback → check reachability and
+  wire MCP remotely instead of spawning/stopping a local daemon); everything
+  else unchanged.
 - `/data` layout, quiesce/gateway-policy markers, the single-writer gateway
   gates, and the encrypted backup format + `hermes-state verify`.
 - `box.env` as the single tuning file (now mostly consumed at build time).
@@ -79,44 +108,42 @@ lines were compensation for smolvm's sharp edges.
 
 ## The trade: isolation
 
-This is the one real cost, and it should be stated plainly:
+Decision (2026-07-03): VM isolation is a nice-to-have; containers are enough
+for now, and the agent keeps passwordless sudo inside its container. The
+security question that actually matters is **Executor**, and the compose
+split answers it structurally rather than with hardening flags:
 
-- smolvm: hardware virtualization; a kernel exploit in the box does not reach
-  the host.
-- Docker: shared kernel; isolation is namespaces + cgroups. The container runs
-  agent workloads that execute arbitrary code (that's the product).
+- The agent container is deliberately permissive — that's linux land, the
+  Hermes agent runs around freely, sudo included. What it can reach is the
+  network, its own volume, and one token-gated HTTP endpoint.
+- Executor's credentials and execution surface live in a container the agent
+  cannot exec into, whose filesystem it cannot see, whose processes it cannot
+  signal. Compromising the agent gets you the same position as any
+  unauthenticated LAN client: an HTTP endpoint that 401s without the token.
+  (The agent does hold a valid token — that's its job — so "agent can call
+  Executor tools" is by design; "agent can tamper with Executor itself"
+  is what the split removes.)
+- Per-project networks mean boxes can't see each other at all.
 
-Mitigations, in order of value-for-effort:
+gVisor (`--runtime=runsc`) remains the one-flag escape hatch if VM-grade
+isolation is ever wanted back — the design doesn't change.
 
-1. Keep **no host bind mounts** (the draft already does this — named volumes
-   only), so "the VM protects the host filesystem" degrades to "the container
-   protects the host filesystem" rather than disappearing.
-2. Run the workload as the non-root `agent` user (already the case); keep
-   root only for PID-1 reconcile, or drop to `--user agent` +
-   `sudo`-less design in a later pass.
-3. Optional hardening flags in one place in `boxd`: `--security-opt
-   no-new-privileges`, a seccomp profile, `--cap-drop ALL --cap-add` the few
-   needed, `--pids-limit`, and (if desired later) gVisor/Kata as a drop-in
-   `--runtime` for VM-grade isolation **without changing anything else in
-   this design**. That's the escape hatch if the isolation trade ever bites:
-   `--runtime=runsc` gets most of the VM boundary back and boxd doesn't care.
-
-Networking stance is unchanged from smolvm (always-on, tools need internet),
-so container networking is default bridge; only the two bridge ports are
-published, bound to 0.0.0.0 so they're reachable over Tailscale.
+Networking stance is unchanged from smolvm (always-on, tools need internet).
+The executor's single published port binds 0.0.0.0 (LAN + Tailscale, per
+decision); the agent container publishes nothing.
 
 ## Lifecycle mapping
 
 | smolvm (`./box`) | Docker (`boxd`) | Notes |
 | --- | --- | --- |
-| `new` (5–10 min) | `build` once + `new` (seconds) | build is the slow step, amortized |
-| `enter` | `enter` | `docker exec -it -u agent bash -l` → same tmux attach |
-| `ls` | `ls` | reads daemon state, no registry file |
-| `doctor` | `doctor` | in-box `hb doctor` unchanged; host port checks TBD |
-| `save` / `load` | `save` / `load` | same archive format; load restores into a fresh volume via a throwaway container, gateway disabled + quiesced on arrival |
-| `repair` | `build` + recreate container | volume untouched; "repair" becomes "replace" |
+| `new` (5–10 min) | `build` once + `new` (seconds) | compose up: agent + executor + network |
+| `enter` | `enter` | exec into the **agent** container → same tmux attach |
+| `ls` | `ls` | agent state + executor dashboard URL per box |
+| `doctor` | `doctor` | in-box `hb doctor` (remote-executor aware) + host dashboard probe |
+| `save` / `load` | `save` / `load` | same archive format; archives agent /data only; restored boxes arrive quiesced + gateway-disabled with a **fresh executor token** |
+| `repair` | `build` + `compose up` again | volumes untouched; "repair" becomes "replace" |
 | `import-hermes` | port later | pure `hermes-state` work; runtime-agnostic |
-| `stop`/`start`/`rm` | same | `rm` deletes container **and** volume after typed confirmation |
+| `stop`/`start`/`rm` | same | both containers together; `rm` deletes containers **and** volumes after typed confirmation |
 
 The "repair becomes replace" row is the philosophical center: containers are
 cattle, volumes are pets. Any doubt about a box's runtime → delete the
@@ -151,6 +178,23 @@ drift to repair because managed bits are image layers.
   `127.0.0.1`. Fixed by running containers with
   `--sysctl net.ipv6.conf.all.disable_ipv6=1` (matches the smolvm guest,
   which had no routable IPv6 either).
+
+### Compose-split verification (same day, after the two-container rework)
+
+- `boxd new` on the compose template: agent + executor + private network up,
+  MCP wired against `http://executor:4788/mcp`, full doctor green first try.
+- Isolation properties verified live: agent container publishes **zero**
+  ports; MCP returns 401 without the bearer token and 200 with it (from the
+  host and from inside the agent); dashboard serves on the published port;
+  `dry1`'s agent cannot resolve `dry3`'s executor (per-project networks).
+- save/load across the split: restored box gets a **fresh token**, and
+  `hb wire-once` detects the stale restored wiring (old token + old URL in
+  the archive) and rewires — this was a real bug found in the dry run: the
+  profile sources the restored `executor-mcp.env`, which clobbered the
+  injected token env var. Fixed with a `BOXD_EXECUTOR_TOKEN` override that
+  outranks the on-disk file, plus a URL-freshness check in `wire_once`.
+- The Dockerfile now provisions in two layers (`tools` then `assets`), so
+  guest-script iteration rebuilds the image in seconds instead of ~10 min.
 
 ## Draft gaps (known, deliberate for a first pass)
 

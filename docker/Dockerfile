@@ -17,15 +17,20 @@ FROM ubuntu:24.04
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-# provision.sh expects the repo context at $CTX with box.env at its root.
+# Two provisioning layers so day-to-day guest-script edits don't re-run the
+# multi-minute tool installs: `tools` (node/uv/claude/codex/hermes/executor)
+# caches until box.env or provision.sh changes; `assets` (hb, profiles, /data
+# skeleton) rebuilds in seconds when guest/ changes.
 COPY box.env /tmp/ctx/box.env
 COPY provision/ /tmp/ctx/provision/
-COPY guest/ /tmp/ctx/guest/
+RUN bash /tmp/ctx/provision/provision.sh tools
 
-RUN bash /tmp/ctx/provision/provision.sh full && rm -rf /tmp/ctx
+COPY guest/ /tmp/ctx/guest/
+RUN bash /tmp/ctx/provision/provision.sh assets && rm -rf /tmp/ctx
 
 COPY docker/entrypoint.sh /opt/hermes-box/bin/entrypoint
-RUN chmod 0755 /opt/hermes-box/bin/entrypoint
+COPY docker/executor-entrypoint.sh /opt/hermes-box/bin/executor-entrypoint
+RUN chmod 0755 /opt/hermes-box/bin/entrypoint /opt/hermes-box/bin/executor-entrypoint
 
 # Durable state. Everything else in the container is disposable image content.
 VOLUME /data
