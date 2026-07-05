@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -140,17 +141,42 @@ func VerifyEncrypted(encPath, passphrase string) error {
 		pw.Close()
 	}()
 
-    listErr := listTarGz(pr)
-    pr.Close()
-    decErr := <-decErrCh
+	listErr := listTarGz(pr)
+	pr.Close()
+	decErr := <-decErrCh
 
-	if decErr != nil {
+	// When listTarGz bails out early (e.g. the decrypted stream isn't a
+	// valid gzip/tar at all), it stops reading from pr while the decrypt
+	// goroutine above may still be mid-write into pw. Our own pr.Close()
+	// then unblocks that pending write with an io.ErrClosedPipe (surfaced
+	// through DecryptStream's %w-wrapped chain, ultimately from the
+	// os/exec-internal copy goroutine that services a non-*os.File
+	// cmd.Stdout). That's an artifact of us walking away early — not
+	// evidence of a wrong passphrase — so it must never be reported as
+	// such; the real diagnosis in that case is listErr's tar.gz
+	// classification failure.
+	if decErr != nil && !isClosedPipeErr(decErr) {
 		return fmt.Errorf("archive: verify %s: decrypt failed (wrong passphrase?): %w", encPath, decErr)
 	}
 	if listErr != nil {
 		return fmt.Errorf("archive: verify %s: decrypted data is not a valid tar.gz: %w", encPath, listErr)
 	}
+	if decErr != nil {
+		return fmt.Errorf("archive: verify %s: decrypt failed (wrong passphrase?): %w", encPath, decErr)
+	}
 	return nil
+}
+
+// isClosedPipeErr reports whether err is (or wraps) io.ErrClosedPipe.
+// errors.Is normally suffices here since every layer between the os/exec
+// copy goroutine and this function wraps with %w, but we also fall back to
+// a plain string match in case some exec-plumbing path ever flattens the
+// error into text instead of preserving the sentinel.
+func isClosedPipeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	return errors.Is(err, io.ErrClosedPipe) || strings.Contains(err.Error(), "closed pipe")
 }
 
 // listTarGz reads through every entry of a gzip-compressed tar stream
@@ -161,14 +187,25 @@ func listTarGz(r io.Reader) error {
 	if err != nil {
 		return err
 	}
-	defer gz.Close()
 	tr := tar.NewReader(gz)
 	for {
 		if _, err := tr.Next(); err != nil {
-			if err == io.EOF {
-				return nil
+			if err != io.EOF {
+				gz.Close()
+				return err
 			}
-			return err
+			break
 		}
 	}
+	// tar.Next() returning io.EOF only means the tar reader saw its own
+	// end-of-archive marker; it does not by itself force the underlying
+	// gzip stream to be read to its own end, so a corrupt trailing
+	// CRC32/ISIZE footer would otherwise go unnoticed. Drain the rest of
+	// the gzip stream and check gzip.Reader.Close (which validates that
+	// footer) so a corrupt one is still caught here.
+	if _, err := io.Copy(io.Discard, gz); err != nil {
+		gz.Close()
+		return err
+	}
+	return gz.Close()
 }

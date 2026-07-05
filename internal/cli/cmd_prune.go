@@ -10,6 +10,7 @@ import (
 
 	"github.com/davis7dotsh/tx9/internal/box"
 	"github.com/davis7dotsh/tx9/internal/docker"
+	"github.com/davis7dotsh/tx9/internal/lock"
 	"github.com/davis7dotsh/tx9/internal/state"
 	"github.com/davis7dotsh/tx9/internal/version"
 )
@@ -137,9 +138,29 @@ func pruneStateFiles(ctx context.Context, cli *docker.Client) ([]string, error) 
 		if known[name] {
 			continue
 		}
+
+		// An env file is written by create/import before either of them
+		// takes this box's per-box lock and holds it for their entire
+		// run, so a box with no containers yet (known[name] == false)
+		// might just be mid-create/mid-import rather than truly
+		// orphaned. Try the same non-blocking lock they use; if it's
+		// held, skip this file instead of deleting state out from under
+		// a running operation.
+		lockPath, err := state.LockPath(name)
+		if err != nil {
+			return removed, err
+		}
+		release, err := lock.Acquire(lockPath)
+		if err != nil {
+			fmt.Printf("tx9: skipping %s: operation in progress\n", name)
+			continue
+		}
+
 		path := filepath.Join(dir, e.Name())
-		if err := os.Remove(path); err != nil {
-			return removed, fmt.Errorf("remove %s: %w", path, err)
+		rmErr := os.Remove(path)
+		release()
+		if rmErr != nil {
+			return removed, fmt.Errorf("remove %s: %w", path, rmErr)
 		}
 		removed = append(removed, path)
 	}

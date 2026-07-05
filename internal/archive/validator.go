@@ -21,12 +21,19 @@ import (
 // It returns the first violation found, matching the Python version's
 // fail-fast, single-error behavior (the original never accumulates
 // multiple errors; it raises immediately at first fault).
+
+// maxArchiveMembers hard-caps how many tar entries ValidateDataTar will
+// read before erroring out, so a crafted archive with millions of tiny
+// entries can't exhaust memory before validation even gets a chance to
+// reject it. It's a var (not a const) so tests can lower it without having
+// to generate a million-entry archive.
+var maxArchiveMembers = 1_000_000
+
 func ValidateDataTar(r io.Reader) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
 		return fmt.Errorf("archive is not a valid gzip stream: %w", err)
 	}
-	defer gz.Close()
 
 	tr := tar.NewReader(gz)
 
@@ -39,9 +46,32 @@ func ValidateDataTar(r io.Reader) error {
 			break
 		}
 		if err != nil {
+			gz.Close()
 			return fmt.Errorf("archive is corrupt: %w", err)
 		}
 		headers = append(headers, hdr)
+		// A crafted archive with millions of tiny entries would otherwise
+		// exhaust memory (the entire header slice is buffered) before any
+		// of the checks below ever run. maxArchiveMembers is a var, not a
+		// const, so tests can lower it without generating a
+		// million-entry archive.
+		if len(headers) > maxArchiveMembers {
+			gz.Close()
+			return fmt.Errorf("archive contains more than %d members", maxArchiveMembers)
+		}
+	}
+	// tar.Next() returning io.EOF only means the tar reader saw its own
+	// end-of-archive marker; it does not by itself force the underlying
+	// gzip stream to be read to its own end, so a corrupt trailing
+	// CRC32/ISIZE footer would otherwise go unnoticed. Drain the rest of
+	// the gzip stream and check gzip.Reader.Close (which validates that
+	// footer) so a corrupt one is still caught here.
+	if _, err := io.Copy(io.Discard, gz); err != nil {
+		gz.Close()
+		return fmt.Errorf("archive is corrupt: %w", err)
+	}
+	if err := gz.Close(); err != nil {
+		return fmt.Errorf("archive is corrupt: %w", err)
 	}
 	if len(headers) == 0 {
 		return errors.New("archive is empty")

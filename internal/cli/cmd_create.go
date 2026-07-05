@@ -23,6 +23,9 @@ func cmdCreate(args []string) error {
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
 	}
+	if fs.NArg() > 1 {
+		return fmt.Errorf("create: expected at most one box name (usage: tx9 create [box])")
+	}
 	requested := fs.Arg(0)
 
 	ctx := context.Background()

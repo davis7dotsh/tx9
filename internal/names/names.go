@@ -2,9 +2,8 @@
 package names
 
 import (
-	"crypto/rand"
 	"fmt"
-	"math/big"
+	"math/rand/v2"
 	"regexp"
 )
 
@@ -38,10 +37,31 @@ var validPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]*$`)
 
 const maxNameLen = 32
 
-// Generate returns a friendly "adjective-animal" name not present in taken.
-// Falls back to appending a random numeric suffix if the whole word-list
-// product space is exhausted.
+// Generate returns a friendly "adjective-animal" name not present in taken,
+// picked randomly rather than always starting from the same fixed point in
+// the word-list product (which used to mean the first box ever created
+// always got the same name). No cryptographic randomness is needed here,
+// so math/rand/v2 is fine.
+//
+// It tries a bounded number of random (adjective, animal) picks first; if
+// that's unlucky (the product space is nearly exhausted), it falls back to
+// the exhaustive scan that used to be the only strategy; if even the whole
+// product space turns out to be taken, it disambiguates with a random
+// numeric suffix.
 func Generate(taken map[string]bool) (string, error) {
+	maxAttempts := 10 * len(adjectives) * len(animals)
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		adj := adjectives[rand.IntN(len(adjectives))]
+		an := animals[rand.IntN(len(animals))]
+		name := adj + "-" + an
+		if !taken[name] {
+			return name, nil
+		}
+	}
+
+	// Random attempts didn't land on a free name — fall back to an
+	// exhaustive scan so a merely-crowded (but not full) namespace still
+	// resolves deterministically instead of relying on luck.
 	for _, adj := range adjectives {
 		for _, an := range animals {
 			name := adj + "-" + an
@@ -50,29 +70,18 @@ func Generate(taken map[string]bool) (string, error) {
 			}
 		}
 	}
+
 	// Word-list space exhausted (very unlikely) — disambiguate with a
 	// random 4-digit suffix on a random base name.
 	for attempt := 0; attempt < 100; attempt++ {
-		adj := adjectives[randIndex(len(adjectives))]
-		an := animals[randIndex(len(animals))]
-		n, err := rand.Int(rand.Reader, big.NewInt(10000))
-		if err != nil {
-			return "", fmt.Errorf("names: generate: %w", err)
-		}
-		name := fmt.Sprintf("%s-%s-%04d", adj, an, n.Int64())
+		adj := adjectives[rand.IntN(len(adjectives))]
+		an := animals[rand.IntN(len(animals))]
+		name := fmt.Sprintf("%s-%s-%04d", adj, an, rand.IntN(10000))
 		if !taken[name] {
 			return name, nil
 		}
 	}
 	return "", fmt.Errorf("names: generate: exhausted candidates")
-}
-
-func randIndex(n int) int {
-	i, err := rand.Int(rand.Reader, big.NewInt(int64(n)))
-	if err != nil {
-		return 0
-	}
-	return int(i.Int64())
 }
 
 // Validate reports whether name is an acceptable box name: lowercase

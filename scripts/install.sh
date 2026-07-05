@@ -88,8 +88,7 @@ if command -v sha256sum >/dev/null 2>&1; then
 elif command -v shasum >/dev/null 2>&1; then
   actual=$(shasum -a 256 "$tmpdir/$asset" | awk '{ print $1 }')
 else
-  log "warning: neither sha256sum nor shasum found; skipping checksum verification"
-  actual="$expected"
+  die "neither sha256sum nor shasum found; cannot verify ${asset} (install them, or download and verify manually)"
 fi
 
 [ "$actual" = "$expected" ] || die "checksum mismatch for ${asset}: got ${actual}, want ${expected} (not installing)"

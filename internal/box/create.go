@@ -105,6 +105,14 @@ func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, err
 	}
 	executorID, err := cli.ContainerCreate(ctx, executorSpec)
 	if err != nil {
+		// The agent container was already created above; leaving it
+		// behind on this failure path leaks it, which matters most on
+		// the upgrade path where the caller doesn't call Destroy on
+		// error. Best-effort force-remove it (ignoring not-found) before
+		// returning.
+		if rmErr := cli.ContainerRemove(ctx, agentID, true); rmErr != nil && !dockerclient.IsErrNotFound(rmErr) {
+			return nil, fmt.Errorf("box: create %s: executor: %w (also failed to remove leaked agent container: %v)", name, err, rmErr)
+		}
 		return nil, fmt.Errorf("box: create %s: executor: %w", name, err)
 	}
 
@@ -181,7 +189,11 @@ func PrepareRuntime(ctx context.Context, cli *docker.Client, b *Box, token strin
 		}
 		fmt.Fprintf(out, "box %s: hb up attempt %d/%d failed: %v\n", b.Name, attempt, attempts, upErr)
 		if attempt < attempts {
-			time.Sleep(retryWait)
+			select {
+			case <-time.After(retryWait):
+			case <-ctx.Done():
+				return fmt.Errorf("box: prepare runtime %s: %w", b.Name, ctx.Err())
+			}
 		}
 	}
 	if upErr != nil {
@@ -243,12 +255,16 @@ func Destroy(ctx context.Context, cli *docker.Client, name string) error {
 			errs = append(errs, rmErr)
 		}
 	}
-	if rmErr := state.RemoveBoxEnv(name); rmErr != nil {
-		errs = append(errs, rmErr)
-	}
-
 	if len(errs) > 0 {
 		return fmt.Errorf("box: destroy %s: %w", name, errors.Join(errs...))
+	}
+
+	// Only drop the token env file once every other removal above
+	// succeeded — removing it unconditionally would strand a box that
+	// still exists (e.g. because a volume remove failed) without the
+	// token it needs.
+	if rmErr := state.RemoveBoxEnv(name); rmErr != nil {
+		return fmt.Errorf("box: destroy %s: %w", name, rmErr)
 	}
 	return nil
 }

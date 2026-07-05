@@ -21,6 +21,28 @@ func TestGenerate(t *testing.T) {
 	}
 }
 
+// TestGenerate_NotAlwaysTheSameFirstName guards against the original bug
+// where Generate always walked the adjective x animal product in the same
+// fixed order, so the very first box ever created (empty taken map) always
+// got the same name. With randomized picks, repeated calls against a fresh
+// empty map should not all agree.
+func TestGenerate_NotAlwaysTheSameFirstName(t *testing.T) {
+	first, err := Generate(map[string]bool{})
+	if err != nil {
+		t.Fatalf("Generate: %v", err)
+	}
+	for i := 0; i < 50; i++ {
+		name, err := Generate(map[string]bool{})
+		if err != nil {
+			t.Fatalf("Generate: %v", err)
+		}
+		if name != first {
+			return
+		}
+	}
+	t.Fatalf("Generate returned %q on every one of 51 calls against an empty taken map; expected randomization", first)
+}
+
 func TestValidate(t *testing.T) {
 	cases := []struct {
 		name string

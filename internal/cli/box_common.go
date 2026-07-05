@@ -47,11 +47,13 @@ func parseFlagsAnywhere(fs *flag.FlagSet, args []string) error {
 	return fs.Parse(append(flags, positionals...))
 }
 
-// requireBoxName returns fs's first positional argument as a box name, or
-// an actionable usage error if it's missing.
+// requireBoxName returns fs's sole positional argument as a box name, or an
+// actionable usage error if it's missing or if there's more than one (e.g.
+// `tx9 delete mybox typo --force` used to silently delete mybox and ignore
+// the extra "typo" positional).
 func requireBoxName(fs *flag.FlagSet, cmd string) (string, error) {
-	if fs.NArg() < 1 {
-		return "", fmt.Errorf("%s: box name required (usage: tx9 %s <box>)", cmd, cmd)
+	if fs.NArg() != 1 {
+		return "", fmt.Errorf("expected exactly one box name (usage: tx9 %s <box>)", cmd)
 	}
 	return fs.Arg(0), nil
 }

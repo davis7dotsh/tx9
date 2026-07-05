@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -78,6 +79,42 @@ func TestVerifyEncrypted(t *testing.T) {
 	}
 	if err := VerifyEncrypted(enc, "wrong"); err == nil {
 		t.Fatal("expected verify with wrong passphrase to fail")
+	}
+}
+
+// TestVerifyEncrypted_NotTarGz guards against the wrong-passphrase
+// misclassification bug: when the decrypted plaintext isn't a valid
+// tar.gz at all, VerifyEncrypted's own early exit from listTarGz closes
+// the pipe out from under the still-writing decrypt goroutine, which used
+// to surface as an io.ErrClosedPipe reported as "wrong passphrase?" even
+// though the CORRECT passphrase was used.
+func TestVerifyEncrypted_NotTarGz(t *testing.T) {
+	requireGPG(t)
+
+	dir := t.TempDir()
+	src := filepath.Join(dir, "not-a-tar.bin")
+	enc := filepath.Join(dir, "not-a-tar.bin.gpg")
+
+	// Deliberately not a valid gzip/tar stream, and large enough that gpg
+	// is still writing plaintext when listTarGz gives up on the gzip
+	// header.
+	if err := os.WriteFile(src, []byte(strings.Repeat("not a tar.gz stream ", 4096)), 0600); err != nil {
+		t.Fatalf("write plaintext: %v", err)
+	}
+
+	if err := Encrypt(src, enc, "s3cret"); err != nil {
+		t.Fatalf("encrypt: %v", err)
+	}
+
+	err := VerifyEncrypted(enc, "s3cret")
+	if err == nil {
+		t.Fatal("expected verify of a non-tar.gz payload to fail")
+	}
+	if !strings.Contains(err.Error(), "not a valid tar.gz") {
+		t.Fatalf("expected a tar.gz classification error, got: %v", err)
+	}
+	if strings.Contains(err.Error(), "wrong passphrase") {
+		t.Fatalf("misreported as wrong passphrase despite using the correct one: %v", err)
 	}
 }
 

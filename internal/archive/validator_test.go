@@ -4,6 +4,7 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -284,6 +285,44 @@ func TestValidateDataTar_Rejects(t *testing.T) {
 func TestValidateDataTar_NotGzip(t *testing.T) {
 	if err := ValidateDataTar(strings.NewReader("not a gzip stream")); err == nil {
 		t.Fatal("expected error for non-gzip input")
+	}
+}
+
+// TestValidateDataTar_CorruptGzipTrailer guards against a bug where
+// tar.Next() returning io.EOF (its own end-of-archive marker) was treated
+// as proof the whole stream was sound, even though the gzip trailer's
+// CRC32/ISIZE footer had never actually been read/verified. Flipping the
+// last 4 bytes of a valid archive corrupts that trailer without touching
+// any tar content, so this only fails if the trailer is actually checked.
+func TestValidateDataTar_CorruptGzipTrailer(t *testing.T) {
+	data := buildTarGz(t, append(validBase(), file("home/agent/foo.txt", "hello")))
+	corrupted := append([]byte(nil), data...)
+	for i := len(corrupted) - 4; i < len(corrupted); i++ {
+		corrupted[i] ^= 0xff
+	}
+	if err := ValidateDataTar(bytes.NewReader(corrupted)); err == nil {
+		t.Fatal("expected error for archive with a corrupt gzip trailer")
+	}
+}
+
+// TestValidateDataTar_MemberCapExceeded exercises the maxArchiveMembers
+// guard without needing to actually construct a million-entry archive: the
+// var (not const) is lowered for the duration of the test.
+func TestValidateDataTar_MemberCapExceeded(t *testing.T) {
+	orig := maxArchiveMembers
+	maxArchiveMembers = 10
+	defer func() { maxArchiveMembers = orig }()
+
+	entries := validBase()
+	for i := 0; i < maxArchiveMembers+5; i++ {
+		entries = append(entries, file(fmt.Sprintf("home/agent/f%d", i), "x"))
+	}
+	err := runValidate(t, entries)
+	if err == nil {
+		t.Fatal("expected error for archive exceeding the member cap")
+	}
+	if !strings.Contains(err.Error(), "more than") {
+		t.Fatalf("expected a member-cap error, got: %v", err)
 	}
 }
 

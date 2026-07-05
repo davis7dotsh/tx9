@@ -132,6 +132,21 @@ func cmdBackup(args []string) error {
 			}()
 		}
 
+		// boxd's cmd_save always runs these two after quiescing,
+		// unconditionally (dossier §6 / git show 9a030e2^:docker/boxd
+		// ~L405-415) — not just when we were the ones who paused. Relying
+		// solely on `hb pause`'s own checkpoint would skip it whenever
+		// the box was already paused, and boxd's runtime-manifest write
+		// never happened at all, so both are run here regardless of
+		// weQuiesced.
+		fmt.Println("tx9: checkpointing state")
+		if err := box.HB(ctx, cli, b, tok, io.Discard, os.Stderr, "verify-state", "--checkpoint"); err != nil {
+			return fmt.Errorf("backup %s: %w", name, err)
+		}
+		if err := box.HB(ctx, cli, b, tok, os.Stdout, os.Stderr, "write-manifest"); err != nil {
+			return fmt.Errorf("backup %s: %w", name, err)
+		}
+
 		fmt.Println("tx9: capturing /data from the agent container")
 		rawFile, err := os.CreateTemp("", "tx9-backup-*.tar.gz")
 		if err != nil {

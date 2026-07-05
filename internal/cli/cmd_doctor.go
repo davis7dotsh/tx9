@@ -30,7 +30,11 @@ func cmdDoctor(args []string) error {
 		if err != nil {
 			return fmt.Errorf("doctor %s: %w", name, err)
 		}
-		if b.AgentState != "running" {
+		// Use the aggregate state, not just AgentState: if the executor
+		// container is down while the agent is up, DerivedState() != "running"
+		// catches it here instead of burning the entire 6x3s host-probe
+		// loop below only to fail anyway.
+		if b.DerivedState() != "running" {
 			return fmt.Errorf("doctor %s: box is not running; run: tx9 start %s", name, name)
 		}
 
