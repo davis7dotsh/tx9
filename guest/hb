@@ -22,6 +22,15 @@ WIRED="$AGENT_HOME/.hermes-box-wired"
 TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
 TOKEN_ENV="$AGENT_HOME/.config/hermes-box/executor-mcp.env"
 
+# Remote-executor mode (Docker compose split): when EXECUTOR_HOST points away
+# from loopback, Executor runs in its own container. hb then only checks
+# reachability and wires MCP against it — it never spawns, stops, or reads
+# token files locally; the runtime supplies EXECUTOR_MCP_TOKEN via the
+# environment instead.
+EXECUTOR_HOST="${EXECUTOR_HOST:-127.0.0.1}"
+_exec_remote() { [[ "$EXECUTOR_HOST" != 127.0.0.1 ]]; }
+_executor_url() { printf 'http://%s:%s/mcp' "$EXECUTOR_HOST" "${EXECUTOR_PORT:-4788}"; }
+
 init() {
   local managed=(
     "$AGENT_HOME" "$AGENT_HOME/.claude" "$AGENT_HOME/.codex" "$AGENT_HOME/.hermes"
@@ -44,7 +53,7 @@ init() {
 }
 
 _port_open() {
-  (exec 3<>"/dev/tcp/127.0.0.1/${EXECUTOR_PORT:-4788}") 2>/dev/null && { exec 3>&-; return 0; }
+  (exec 3<>"/dev/tcp/$EXECUTOR_HOST/${EXECUTOR_PORT:-4788}") 2>/dev/null && { exec 3>&-; return 0; }
   return 1
 }
 
@@ -119,6 +128,11 @@ _spawn_without_lock_fd() {
 
 _executor_up() {
   init
+  if _exec_remote; then
+    _wait_port open || { echo "remote executor unreachable at $EXECUTOR_HOST:${EXECUTOR_PORT:-4788}" >&2; return 1; }
+    echo "executor daemon: reachable (remote)"
+    return 0
+  fi
   command -v executor >/dev/null 2>&1 || {
     [[ "${INSTALL_EXECUTOR:-0}" == 1 ]] && { echo "executor not installed" >&2; return 1; }
     echo "executor disabled"
@@ -185,6 +199,9 @@ reconcile() {
 }
 
 _stop_executor() {
+  # Remote executor has its own container lifecycle; quiescing this box must
+  # not (and cannot) stop it. boxd stops the executor service around saves.
+  _exec_remote && return 0
   command -v executor >/dev/null 2>&1 && executor daemon stop >/dev/null 2>&1 || true
   pkill -f "executor daemon run" 2>/dev/null || true
   rm -f "$AGENT_HOME/.executor"/daemon-active-* 2>/dev/null || true
@@ -302,8 +319,18 @@ web() {
 }
 
 executor_token() {
-  [[ -r "$TOKEN_FILE" ]] || return 1
-  sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TOKEN_FILE" | head -1
+  # BOXD_EXECUTOR_TOKEN is the runtime-injected token in the compose split.
+  # It must win over EXECUTOR_MCP_TOKEN because /etc/profile.d sources the
+  # on-disk executor-mcp.env, and after a restore that file carries the
+  # SOURCE box's stale token — clobbering EXECUTOR_MCP_TOKEN and quietly
+  # wiring MCP against a dead credential.
+  if [[ -n "${BOXD_EXECUTOR_TOKEN:-}" ]]; then printf '%s\n' "$BOXD_EXECUTOR_TOKEN"; return 0; fi
+  if [[ -r "$TOKEN_FILE" ]]; then
+    sed -n 's/.*"token"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$TOKEN_FILE" | head -1
+    return 0
+  fi
+  [[ -n "${EXECUTOR_MCP_TOKEN:-}" ]] && { printf '%s\n' "$EXECUTOR_MCP_TOKEN"; return 0; }
+  return 1
 }
 
 _write_token_env() {
@@ -335,9 +362,10 @@ wire_mcp() {
     rm -f "$WIRED" "$TOKEN_ENV"
     return 0
   fi
-  command -v executor >/dev/null 2>&1 || { echo "executor not installed" >&2; return 1; }
+  _exec_remote || command -v executor >/dev/null 2>&1 || { echo "executor not installed" >&2; return 1; }
   up >/dev/null
-  local token url="http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp" failed=0
+  local token url failed=0
+  url="$(_executor_url)"
   token="$(executor_token)"
   [[ -n "$token" ]] || { echo "executor token unavailable" >&2; return 1; }
   _write_token_env "$token"
@@ -362,11 +390,16 @@ wire_mcp() {
 }
 
 wire_once() {
-  local token
+  local token url
   if [[ "${WIRE_EXECUTOR_MCP:-0}" != 1 ]]; then wire_mcp; return; fi
   token="$(executor_token 2>/dev/null || true)"
+  url="$(_executor_url)"
+  # Freshness = version marker + current token in TOKEN_ENV + current URL in
+  # the codex config. The URL check catches restores that carry wiring from
+  # a box with a different executor host (e.g. loopback -> compose remote).
   if [[ -f "$WIRED" && "$(cat "$WIRED")" == "$WIRE_VERSION" && -r "$TOKEN_ENV" && -n "$token" ]] &&
-    grep -Fq "$token" "$TOKEN_ENV"; then return 0; fi
+    grep -Fq "$token" "$TOKEN_ENV" &&
+    grep -qF "url = \"$url\"" "$CODEX_HOME/config.toml" 2>/dev/null; then return 0; fi
   wire_mcp
 }
 
@@ -432,13 +465,13 @@ _command_exists() { command -v "$1" >/dev/null 2>&1; }
 _hermes_state_valid() { hermes-state verify >/dev/null; }
 
 _claude_http_config() {
-  (cd "$AGENT_HOME/workspace" && claude mcp get executor 2>/dev/null) | grep -q "http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp"
+  (cd "$AGENT_HOME/workspace" && claude mcp get executor 2>/dev/null) | grep -qF "$(_executor_url)"
 }
 
 _mcp_auth_works() {
   local token
   token="$(executor_token)" || return 1
-  _mcp_initialize "http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp" "$token"
+  _mcp_initialize "$(_executor_url)" "$token"
 }
 
 doctor() {
@@ -453,7 +486,12 @@ doctor() {
   else
     printf 'ok   Hermes gateway intentionally disabled or quiesced\n'
   fi
-  if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then
+  if _exec_remote; then
+    # Remote executor keeps running while this box quiesces; only reachability
+    # and auth are this box's concern.
+    _check "executor reachable (remote $EXECUTOR_HOST)" _port_open || failed=1
+    _check "executor MCP bearer accepted" _mcp_auth_works || failed=1
+  elif [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then
     _check "executor installed" _command_exists executor || failed=1
     if [[ -e "$QUIESCE_FILE" ]]; then
       _check "Executor target port closed while quiesced" _port_closed || failed=1
@@ -473,7 +511,7 @@ doctor() {
     _check "MCP wiring version" test "$(cat "$WIRED" 2>/dev/null)" = "$WIRE_VERSION" || failed=1
     _check "MCP token environment" test -r "$TOKEN_ENV" || failed=1
     _check "Claude HTTP MCP config" _claude_http_config || failed=1
-    _check "Codex HTTP MCP config" grep -q "url = \"http://127.0.0.1:${EXECUTOR_PORT:-4788}/mcp\"" "$CODEX_HOME/config.toml" || failed=1
+    _check "Codex HTTP MCP config" grep -qF "url = \"$(_executor_url)\"" "$CODEX_HOME/config.toml" || failed=1
   fi
   [[ "$failed" == 0 ]]
 }

@@ -331,9 +331,25 @@ main() {
   PATH="$NODE_PREFIX/bin:$UV_DIR:$PATH" "$OPT/bin/hb" versions || true
 }
 
+# Heavy tool installs only — no repo-owned guest assets. Lets the Docker
+# image build cache the multi-minute layer independently of guest/ edits;
+# a follow-up `assets` run places hb/profiles and seeds /data.
+tools_only() {
+  base_os
+  make_agent
+  install_node_uv
+  install_claude
+  install_codex
+  install_hermes
+  install_executor
+  slim
+  log "tool provisioning complete"
+}
+
 if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   case "${1:-full}" in
     full) main ;;
+    tools) tools_only ;;
     assets) assets_only ;;
     *) log "unknown provisioning mode: $1"; exit 2 ;;
   esac
