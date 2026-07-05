@@ -140,8 +140,9 @@ func VerifyEncrypted(encPath, passphrase string) error {
 		pw.Close()
 	}()
 
-	listErr := listTarGz(pr)
-	decErr := <-decErrCh
+    listErr := listTarGz(pr)
+    pr.Close()
+    decErr := <-decErrCh
 
 	if decErr != nil {
 		return fmt.Errorf("archive: verify %s: decrypt failed (wrong passphrase?): %w", encPath, decErr)
