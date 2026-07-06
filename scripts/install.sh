@@ -70,8 +70,15 @@ trap 'rm -rf "$tmpdir"' EXIT INT TERM HUP
 log "resolving latest version..."
 version=$(curl -fsSL "${ORIGIN}/releases/latest") \
   || die "could not resolve the latest version from ${ORIGIN}/releases/latest (no release published yet?)"
+# Strict X.Y.Z, mirroring site/src/index.ts's VERSION_RE — anything else
+# (including dot-only strings like "..", which would path-traverse the
+# URL) is rejected before it reaches a URL: only digits and dots, no
+# leading/trailing/adjacent dots, and exactly two dots.
 case "$version" in
-  *[!0-9.]* | "") die "unexpected version string from ${ORIGIN}/releases/latest: '${version}'" ;;
+  *[!0-9.]* | "" | .* | *. | *..* | *.*.*.*)
+    die "unexpected version string from ${ORIGIN}/releases/latest: '${version}'" ;;
+  *.*.*) ;;
+  *) die "unexpected version string from ${ORIGIN}/releases/latest: '${version}'" ;;
 esac
 
 base_url="${ORIGIN}/releases/${version}"
