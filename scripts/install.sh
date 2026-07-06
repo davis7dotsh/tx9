@@ -1,8 +1,8 @@
 #!/bin/sh
-# tx9 installer -- served by https://tx9.davis7.sh/install (decision 10,
+# tx9 installer -- served by https://tx9.col-agents.com/install (decision 10,
 # docs/tx9-cli-design.md; site/ is the Cloudflare Worker that serves it).
 #
-#   curl -fsSL https://tx9.davis7.sh/install | sh
+#   curl -fsSL https://tx9.col-agents.com/install | sh
 #
 # Detects OS/arch, resolves the current release version from the site,
 # downloads the matching tx9 binary + its checksums.txt from R2 (via the
@@ -11,7 +11,7 @@
 #
 # Asset naming is the one invariant this script shares with
 # internal/selfupdate.AssetName, the Makefile's `dist` target,
-# .github/workflows/release.yml, and site/src/index.ts: plain, uncompressed
+# .depot/workflows/release.yml, and site/src/index.ts: plain, uncompressed
 # executables named tx9_<os>_<arch>, verified against a checksums.txt in
 # `sha256sum` output format ("<64-hex-digest>  <filename>" per line).
 #
@@ -20,7 +20,7 @@
 # URLs are plain paths.
 set -eu
 
-ORIGIN="${TX9_ORIGIN:-https://tx9.davis7.sh}"
+ORIGIN="${TX9_ORIGIN:-https://tx9.col-agents.com}"
 INSTALL_DIR="${TX9_INSTALL_DIR:-$HOME/.local/bin}"
 
 log() {

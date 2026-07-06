@@ -1,4 +1,4 @@
-# site/ — tx9.davis7.sh
+# site/ — tx9.col-agents.com
 
 Cloudflare Worker serving tx9's public face (docs/tx9-cli-design.md
 decision 10): the homepage, the `curl | sh` installer, and release binary
@@ -25,17 +25,20 @@ latest.txt                    "0.1.0\n" — flipped last during publish
 0.1.0/checksums.txt
 ```
 
-`.github/workflows/release.yml` writes this on every `vX.Y.Z` tag push, after
+`.depot/workflows/release.yml` writes this on every `vX.Y.Z` tag push, after
 attaching the same files to the GitHub release (which `tx9 upgrade`
 self-update consumes).
 
 ## One-time setup
 
 1. `npx wrangler r2 bucket create tx9-releases`
-2. Add repo secrets `CLOUDFLARE_API_TOKEN` (Workers R2 Storage: edit) and
-   `CLOUDFLARE_ACCOUNT_ID` for the release workflow.
-3. With the `davis7.sh` zone on Cloudflare, uncomment the `routes` block in
-   `wrangler.jsonc` to bind `tx9.davis7.sh` as a custom domain.
+2. Add Depot CI secrets for the release workflow (deploys run on Depot;
+   these are `depot ci secrets`, not GitHub repo secrets):
+   `CLOUDFLARE_API_TOKEN` (Workers R2 Storage: edit) and
+   `CLOUDFLARE_ACCOUNT_ID`.
+3. The `routes` block in `wrangler.jsonc` binds `tx9.col-agents.com`
+   (interim hostname on the col-agents.com Cloudflare zone; swap the
+   pattern when tx9 gets its own domain).
 
 ## Develop / deploy
 

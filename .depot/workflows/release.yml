@@ -6,12 +6,16 @@ name: release
 #
 #   1. A GitHub release — what `internal/selfupdate` (via `tx9 upgrade`)
 #      consumes.
-#   2. The tx9-releases R2 bucket behind https://tx9.davis7.sh (site/) —
+#   2. The tx9-releases R2 bucket behind https://tx9.col-agents.com (site/) —
 #      what scripts/install.sh consumes: <version>/<asset> objects, plus a
 #      latest.txt version pointer flipped only after every asset uploads.
 #
-# R2 upload needs two repo secrets: CLOUDFLARE_API_TOKEN (an API token with
-# Workers R2 Storage edit on the bucket) and CLOUDFLARE_ACCOUNT_ID.
+# Runs on Depot CI (like check.yml). R2 upload needs two Depot CI secrets
+# scoped to this repo (`depot ci secrets add <NAME> --repo davis7dotsh/tx9`,
+# NOT GitHub repo secrets): CLOUDFLARE_API_TOKEN (an API token with Workers
+# R2 Storage edit on the bucket) and CLOUDFLARE_ACCOUNT_ID. The GitHub
+# release step uses the token Depot's GitHub App mints via `permissions:
+# contents: write`.
 
 # Plain X.Y.Z tags only: site/src/index.ts rejects any other shape, so a
 # `v1` or `v1.2.3-rc1` release would poison latest.txt and 404 the
@@ -37,7 +41,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: depot-ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -91,14 +95,14 @@ jobs:
           files: dist/*
           generate_release_notes: true
 
-      # Mirror dist/ into R2 for the tx9.davis7.sh install path. Versioned
+      # Mirror dist/ into R2 for the tx9.col-agents.com install path. Versioned
       # objects go first; latest.txt is flipped last so /releases/latest
       # never points at a version whose assets aren't all present yet.
       # `npx wrangler` pins the same major the site pins in its
       # devDependencies. R2 failures after the GitHub release step mean the
       # two channels can briefly disagree — re-run the job; uploads are
       # idempotent.
-      - name: Publish to R2 (tx9.davis7.sh)
+      - name: Publish to R2 (tx9.col-agents.com)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

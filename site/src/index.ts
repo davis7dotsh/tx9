@@ -1,4 +1,4 @@
-// tx9.davis7.sh — homepage, `curl | sh` installer, and release downloads.
+// tx9.col-agents.com — homepage, `curl | sh` installer, and release downloads.
 //
 // URL surface (shared contract with scripts/install.sh — change both):
 //   GET /                                homepage (static asset)

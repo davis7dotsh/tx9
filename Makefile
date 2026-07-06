@@ -67,7 +67,7 @@ go-check:
 
 # Cross-compiles the release binaries + checksums.txt into dist/. Asset
 # naming here MUST match internal/selfupdate.AssetName and
-# .github/workflows/release.yml: plain, uncompressed executables named
+# .depot/workflows/release.yml: plain, uncompressed executables named
 # tx9_<GOOS>_<GOARCH>, plus a checksums.txt in `sha256sum` output format.
 DIST_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
