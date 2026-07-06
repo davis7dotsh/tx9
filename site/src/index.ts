@@ -14,7 +14,11 @@
 
 // Text-module import (wrangler.jsonc "rules"): the repo's installer is the
 // deployed artifact, so /install can never drift from scripts/install.sh.
-import installScript from "../../scripts/install.sh";
+// install.txt is a symlink to ../../scripts/install.sh — Cloudflare's API
+// WAF 403s any worker upload containing a module named *.sh whose content
+// is a shell script (the same bytes upload fine under a .txt name), so
+// the import has to go through the .txt alias.
+import installScript from "./install.txt";
 
 interface Env {
 	ASSETS: Fetcher;

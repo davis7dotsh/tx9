@@ -9,7 +9,7 @@ downloads out of an R2 bucket.
 | Route | Serves |
 |---|---|
 | `/` | `public/index.html` homepage |
-| `/install` (and `/install.sh`) | `scripts/install.sh`, imported at build time — no copy step, can't drift |
+| `/install` (and `/install.sh`) | `scripts/install.sh`, imported at build time via the `src/install.txt` symlink — no copy step, can't drift. (The `.txt` alias is load-bearing: Cloudflare's API WAF rejects worker uploads containing a `*.sh` module with shell content.) |
 | `/releases/latest` | current version as bare text (e.g. `0.1.0`) |
 | `/releases/latest/<asset>` | 302 to the versioned path |
 | `/releases/<version>/<asset>` | binary / `checksums.txt` from R2 |

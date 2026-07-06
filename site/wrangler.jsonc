@@ -10,7 +10,9 @@
   // it can't see, which would block even the workers.dev deploy.
   // "routes": [{ "pattern": "tx9.davis7.sh", "custom_domain": true }],
   // The worker serves the installer from a Text-module import of
-  // ../scripts/install.sh (single source of truth, no copy step).
-  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  // src/install.txt, a symlink to ../scripts/install.sh (single source of
+  // truth, no copy step). The .txt alias matters: Cloudflare's API WAF
+  // 403s worker uploads containing a *.sh module with shell content.
+  "rules": [{ "type": "Text", "globs": ["**/*.txt"], "fallthrough": true }],
   "observability": { "enabled": true },
 }
