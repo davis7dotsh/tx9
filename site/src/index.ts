@@ -45,14 +45,30 @@ async function latestVersion(env: Env): Promise<string | null> {
 	return VERSION_RE.test(version) ? version : null;
 }
 
-async function serveReleaseObject(env: Env, version: string, asset: string): Promise<Response> {
+async function serveReleaseObject(
+	env: Env,
+	version: string,
+	asset: string,
+	method: string,
+): Promise<Response> {
 	if (!VERSION_RE.test(version)) return text("not found\n", 404);
 	if (asset !== CHECKSUMS && !ASSET_RE.test(asset)) return text("not found\n", 404);
 
-	const object = await env.RELEASES.get(`${version}/${asset}`);
+	// HEAD needs only metadata — head() skips pulling the (binary-sized)
+	// body out of R2 entirely.
+	const key = `${version}/${asset}`;
+	let object: R2Object | null;
+	let body: ReadableStream | null = null;
+	if (method === "HEAD") {
+		object = await env.RELEASES.head(key);
+	} else {
+		const got = await env.RELEASES.get(key);
+		object = got;
+		body = got?.body ?? null;
+	}
 	if (!object) return text("not found\n", 404);
 
-	return new Response(object.body, {
+	return new Response(body, {
 		headers: {
 			"Content-Type": asset === CHECKSUMS ? "text/plain; charset=utf-8" : "application/octet-stream",
 			"Content-Length": String(object.size),
@@ -102,7 +118,7 @@ export default {
 
 		const versioned = path.match(/^\/releases\/([^/]+)\/([^/]+)$/u);
 		if (versioned) {
-			return serveReleaseObject(env, versioned[1], versioned[2]);
+			return serveReleaseObject(env, versioned[1], versioned[2], request.method);
 		}
 
 		// Everything else (/, /favicon.ico, ...) falls through to static

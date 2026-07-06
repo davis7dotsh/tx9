@@ -1,8 +1,8 @@
 name: release
 
 # Tag-push CI for tx9's distribution (docs/tx9-cli-design.md decision 10):
-# push a `v*` tag, get cross-compiled binaries + checksums.txt published to
-# two places from one build:
+# push a `vX.Y.Z` tag, get cross-compiled binaries + checksums.txt published
+# to two places from one build:
 #
 #   1. A GitHub release — what `internal/selfupdate` (via `tx9 upgrade`)
 #      consumes.
@@ -13,13 +13,24 @@ name: release
 # R2 upload needs two repo secrets: CLOUDFLARE_API_TOKEN (an API token with
 # Workers R2 Storage edit on the bucket) and CLOUDFLARE_ACCOUNT_ID.
 
+# Plain X.Y.Z tags only: site/src/index.ts rejects any other shape, so a
+# `v1` or `v1.2.3-rc1` release would poison latest.txt and 404 the
+# installer until the next valid tag. The derive step re-checks the same
+# invariant in case this glob is ever loosened.
 on:
   push:
     tags:
-      - "v*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
 
 permissions:
   contents: write
+
+# Serialize release runs without cancelling any: two tags pushed close
+# together must both publish, but if the runs interleaved, the older one
+# could finish last and flip latest.txt back to a stale version.
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
   release:
@@ -60,7 +71,13 @@ jobs:
 
       - name: Derive VERSION from tag
         id: version
-        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag ${GITHUB_REF_NAME} is not a plain vX.Y.Z release tag; refusing to publish" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
 
       - name: Build dist/ (cross-compiled binaries + checksums.txt)
         run: make dist VERSION=${{ steps.version.outputs.version }}

@@ -4,7 +4,6 @@ import (
 	"archive/tar"
 	"bytes"
 	"compress/gzip"
-	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -142,41 +141,25 @@ func VerifyEncrypted(encPath, passphrase string) error {
 	}()
 
 	listErr := listTarGz(pr)
+	// When listTarGz bails out early (e.g. the decrypted stream isn't a
+	// valid gzip/tar at all), the decrypt goroutine above may still be
+	// mid-write into pw. Closing pr at that point races: either the exec
+	// copy goroutine sees io.ErrClosedPipe, or gpg itself takes an EPIPE
+	// and exits non-zero — both artifacts of us walking away early, not
+	// evidence of a wrong passphrase, and the second is indistinguishable
+	// from a genuine gpg failure. Drain the remaining plaintext instead so
+	// gpg always finishes cleanly and decErr keeps its real meaning.
+	io.Copy(io.Discard, pr)
 	pr.Close()
 	decErr := <-decErrCh
 
-	// When listTarGz bails out early (e.g. the decrypted stream isn't a
-	// valid gzip/tar at all), it stops reading from pr while the decrypt
-	// goroutine above may still be mid-write into pw. Our own pr.Close()
-	// then unblocks that pending write with an io.ErrClosedPipe (surfaced
-	// through DecryptStream's %w-wrapped chain, ultimately from the
-	// os/exec-internal copy goroutine that services a non-*os.File
-	// cmd.Stdout). That's an artifact of us walking away early — not
-	// evidence of a wrong passphrase — so it must never be reported as
-	// such; the real diagnosis in that case is listErr's tar.gz
-	// classification failure.
-	if decErr != nil && !isClosedPipeErr(decErr) {
+	if decErr != nil {
 		return fmt.Errorf("archive: verify %s: decrypt failed (wrong passphrase?): %w", encPath, decErr)
 	}
 	if listErr != nil {
 		return fmt.Errorf("archive: verify %s: decrypted data is not a valid tar.gz: %w", encPath, listErr)
 	}
-	if decErr != nil {
-		return fmt.Errorf("archive: verify %s: decrypt failed (wrong passphrase?): %w", encPath, decErr)
-	}
 	return nil
-}
-
-// isClosedPipeErr reports whether err is (or wraps) io.ErrClosedPipe.
-// errors.Is normally suffices here since every layer between the os/exec
-// copy goroutine and this function wraps with %w, but we also fall back to
-// a plain string match in case some exec-plumbing path ever flattens the
-// error into text instead of preserving the sentinel.
-func isClosedPipeErr(err error) bool {
-	if err == nil {
-		return false
-	}
-	return errors.Is(err, io.ErrClosedPipe) || strings.Contains(err.Error(), "closed pipe")
 }
 
 // listTarGz reads through every entry of a gzip-compressed tar stream

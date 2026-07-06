@@ -16,7 +16,7 @@ downloads out of an R2 bucket.
 
 ## R2 bucket layout (`tx9-releases`)
 
-```
+```text
 latest.txt                    "0.1.0\n" — flipped last during publish
 0.1.0/tx9_linux_amd64
 0.1.0/tx9_linux_arm64
@@ -25,7 +25,7 @@ latest.txt                    "0.1.0\n" — flipped last during publish
 0.1.0/checksums.txt
 ```
 
-`.github/workflows/release.yml` writes this on every `v*` tag push, after
+`.github/workflows/release.yml` writes this on every `vX.Y.Z` tag push, after
 attaching the same files to the GitHub release (which `tx9 upgrade`
 self-update consumes).
 
