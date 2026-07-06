@@ -25,12 +25,15 @@ on:
 permissions:
   contents: write
 
-# Serialize release runs without cancelling any: two tags pushed close
-# together must both publish, but if the runs interleaved, the older one
-# could finish last and flip latest.txt back to a stale version.
+# Serialize release runs without cancelling or dropping any: two tags
+# pushed close together must both publish, but if the runs interleaved,
+# the older one could finish last and flip latest.txt back to a stale
+# version. queue: max keeps every queued run (the default, single, would
+# cancel-and-replace a pending release when a third tag arrives).
 concurrency:
   group: release
   cancel-in-progress: false
+  queue: max
 
 jobs:
   release:
