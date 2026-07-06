@@ -32,7 +32,7 @@ tx9 create
 | 7 | Scope | **Local-only v1.** The CLI drives the local Docker daemon; cross-machine moves are backup → transfer yourself → import. (Remote is a saved future direction — see below.) |
 | 8 | Docker interface | **Engine API via the official Go SDK**, not shelling to compose. tx9 creates the network/volumes/containers itself. Kills the compose-plugin dependency (bit us on siva) and owns all progress/error UX. |
 | 9 | Repo | **This repo.** Go code lives alongside provision/ and guest/ because they co-evolve; embedding pulls from source at build time. |
-| 10 | Distribution | **GitHub Releases** (cross-compiled, tag-push CI) + **`https://tx9.davis7.sh/install`** (redirect to the raw installer; detects OS/arch, drops binary in `~/.local/bin`). Repo goes public when ready; hosted page/site later. |
+| 10 | Distribution | **GitHub Releases** (cross-compiled, tag-push CI) for `tx9 upgrade` self-update, mirrored to an **R2 bucket behind `https://tx9.davis7.sh`** (`site/`, a Cloudflare Worker: homepage + `/install` + `/releases/*`) for `curl \| sh` installs — works while the repo is still private. Installer detects OS/arch, drops binary in `~/.local/bin`. |
 | 11 | Versioning | `tx9 upgrade` (no args) self-updates the CLI; `tx9 upgrade <box>` moves a box onto the current image. Images tagged `tx9-box:<cli-version>`; `list` shows per-box image version so drift is visible; unused old images pruned. |
 | 12 | Bash prototypes | **Both deleted** (done, this commit). git history is the reference. |
 

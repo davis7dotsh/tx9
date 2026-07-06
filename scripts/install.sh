@@ -1,25 +1,26 @@
 #!/bin/sh
 # tx9 installer -- served by https://tx9.davis7.sh/install (decision 10,
-# docs/tx9-cli-design.md).
+# docs/tx9-cli-design.md; site/ is the Cloudflare Worker that serves it).
 #
 #   curl -fsSL https://tx9.davis7.sh/install | sh
 #
-# Detects OS/arch, downloads the matching tx9 release binary + its
-# checksums.txt from the latest GitHub release, verifies the checksum, and
-# installs to ~/.local/bin/tx9 (override with TX9_INSTALL_DIR).
+# Detects OS/arch, resolves the current release version from the site,
+# downloads the matching tx9 binary + its checksums.txt from R2 (via the
+# site's /releases/<version>/ routes), verifies the checksum, and installs
+# to ~/.local/bin/tx9 (override with TX9_INSTALL_DIR).
 #
 # Asset naming is the one invariant this script shares with
-# internal/selfupdate.AssetName, the Makefile's `dist` target, and
-# .github/workflows/release.yml: plain, uncompressed executables named
-# tx9_<os>_<arch>, verified against a checksums.txt release asset in
+# internal/selfupdate.AssetName, the Makefile's `dist` target,
+# .github/workflows/release.yml, and site/src/index.ts: plain, uncompressed
+# executables named tx9_<os>_<arch>, verified against a checksums.txt in
 # `sha256sum` output format ("<64-hex-digest>  <filename>" per line).
 #
-# Deliberately plain POSIX sh + curl: no jq, no GitHub API call -- the
-# stable /releases/latest/download/<asset> URL shape resolves straight to
-# the current release's asset without needing to parse JSON.
+# Deliberately plain POSIX sh + curl: no jq, no JSON parsing -- the site
+# serves /releases/latest as a bare version string, and versioned asset
+# URLs are plain paths.
 set -eu
 
-REPO="davis7dotsh/tx9"
+ORIGIN="${TX9_ORIGIN:-https://tx9.davis7.sh}"
 INSTALL_DIR="${TX9_INSTALL_DIR:-$HOME/.local/bin}"
 
 log() {
@@ -63,16 +64,23 @@ os=$(detect_os)
 arch=$(detect_arch)
 asset="tx9_${os}_${arch}"
 
-base_url="https://github.com/${REPO}/releases/latest/download"
-asset_url="${base_url}/${asset}"
-checksums_url="${base_url}/checksums.txt"
-
 tmpdir=$(mktemp -d)
 trap 'rm -rf "$tmpdir"' EXIT INT TERM HUP
 
-log "downloading ${asset}..."
+log "resolving latest version..."
+version=$(curl -fsSL "${ORIGIN}/releases/latest") \
+  || die "could not resolve the latest version from ${ORIGIN}/releases/latest (no release published yet?)"
+case "$version" in
+  *[!0-9.]* | "") die "unexpected version string from ${ORIGIN}/releases/latest: '${version}'" ;;
+esac
+
+base_url="${ORIGIN}/releases/${version}"
+asset_url="${base_url}/${asset}"
+checksums_url="${base_url}/checksums.txt"
+
+log "downloading ${asset} ${version}..."
 if ! curl -fsSL "$asset_url" -o "$tmpdir/$asset"; then
-  die "download failed: $asset_url (no release published yet, or an unsupported platform)"
+  die "download failed: $asset_url (unsupported platform, or a partially published release)"
 fi
 
 log "downloading checksums.txt..."
@@ -107,8 +115,8 @@ case ":${PATH}:" in
     ;;
 esac
 
-if version=$("$INSTALL_DIR/tx9" version 2>/dev/null); then
-  log "tx9 ${version} ready"
+if installed=$("$INSTALL_DIR/tx9" version 2>/dev/null); then
+  log "tx9 ${installed} ready"
 else
   log "installed, but 'tx9 version' did not run cleanly -- check ${INSTALL_DIR}/tx9 manually"
 fi

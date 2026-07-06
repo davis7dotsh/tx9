@@ -44,6 +44,7 @@ tools require internet access.
 | Path | Role |
 |---|---|
 | `box.env` | Build/runtime configuration: tool pins, Hermes installer SHA pin, feature flags |
+| `site/` | Cloudflare Worker for tx9.davis7.sh: homepage, `/install` script, release downloads from R2 |
 | `provision/provision.sh` | Runs inside `docker build` (`tools` + `assets` layers); installs everything |
 | `guest/` | In-box runtime: `hb` control CLI, `hb-workload` reconcile loop, `hermes-state` validator, profiles, tmux config |
 | `docker/` | Image build assets: `Dockerfile`, agent + executor entrypoints |

@@ -1,9 +1,17 @@
 name: release
 
 # Tag-push CI for tx9's distribution (docs/tx9-cli-design.md decision 10):
-# push a `v*` tag, get cross-compiled binaries + checksums.txt attached to
-# a GitHub release that `internal/selfupdate` (via `tx9 upgrade`) and
-# scripts/install.sh both know how to consume.
+# push a `v*` tag, get cross-compiled binaries + checksums.txt published to
+# two places from one build:
+#
+#   1. A GitHub release — what `internal/selfupdate` (via `tx9 upgrade`)
+#      consumes.
+#   2. The tx9-releases R2 bucket behind https://tx9.davis7.sh (site/) —
+#      what scripts/install.sh consumes: <version>/<asset> objects, plus a
+#      latest.txt version pointer flipped only after every asset uploads.
+#
+# R2 upload needs two repo secrets: CLOUDFLARE_API_TOKEN (an API token with
+# Workers R2 Storage edit on the bucket) and CLOUDFLARE_ACCOUNT_ID.
 
 on:
   push:
@@ -62,3 +70,24 @@ jobs:
         with:
           files: dist/*
           generate_release_notes: true
+
+      # Mirror dist/ into R2 for the tx9.davis7.sh install path. Versioned
+      # objects go first; latest.txt is flipped last so /releases/latest
+      # never points at a version whose assets aren't all present yet.
+      # `npx wrangler` pins the same major the site pins in its
+      # devDependencies. R2 failures after the GitHub release step mean the
+      # two channels can briefly disagree — re-run the job; uploads are
+      # idempotent.
+      - name: Publish to R2 (tx9.davis7.sh)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for f in dist/*; do
+            npx --yes wrangler@4 r2 object put "tx9-releases/${VERSION}/$(basename "$f")" \
+              --file "$f" --remote
+          done
+          printf '%s\n' "$VERSION" > latest.txt
+          npx --yes wrangler@4 r2 object put "tx9-releases/latest.txt" \
+            --file latest.txt --remote

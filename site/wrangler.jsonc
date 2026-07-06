@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tx9-site",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "assets": { "binding": "ASSETS", "directory": "./public" },
+  "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "tx9-releases" }],
+  // Uncomment once the davis7.sh zone (or at least this hostname) lives in
+  // Cloudflare — wrangler refuses to deploy a custom_domain route for a zone
+  // it can't see, which would block even the workers.dev deploy.
+  // "routes": [{ "pattern": "tx9.davis7.sh", "custom_domain": true }],
+  // The worker serves the installer from a Text-module import of
+  // ../scripts/install.sh (single source of truth, no copy step).
+  "rules": [{ "type": "Text", "globs": ["**/*.sh"], "fallthrough": true }],
+  "observability": { "enabled": true },
+}

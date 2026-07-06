@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>tx9 — isolated agent boxes on Docker</title>
+<meta name="description" content="tx9 creates isolated, portable agent boxes — Claude Code, Codex, Hermes, and Executor in paired containers whose entire state travels as one encrypted archive." />
+<style>
+  :root {
+    --bg: #0d1117;
+    --panel: #161b22;
+    --border: #30363d;
+    --text: #e6edf3;
+    --muted: #9198a1;
+    --accent: #7ee787;
+    color-scheme: dark;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 16px/1.6 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 44rem; margin: 0 auto; padding: 4.5rem 1.25rem 5rem; }
+  h1 { font-size: 2.25rem; margin: 0 0 0.25rem; letter-spacing: -0.02em; }
+  h1 span { color: var(--accent); }
+  .tagline { color: var(--muted); font-size: 1.125rem; margin: 0 0 2.5rem; }
+  h2 { font-size: 1rem; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); margin: 2.5rem 0 0.75rem; }
+  p { margin: 0.75rem 0; }
+  code, pre { font: 0.9rem/1.55 ui-monospace, "SF Mono", Menlo, Consolas, monospace; }
+  code { background: var(--panel); border: 1px solid var(--border); border-radius: 4px; padding: 0.1em 0.35em; }
+  pre {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.9rem 1.1rem;
+    overflow-x: auto;
+    margin: 0.75rem 0;
+  }
+  pre code { background: none; border: none; padding: 0; }
+  .prompt { color: var(--muted); user-select: none; }
+  ul { padding-left: 1.25rem; margin: 0.75rem 0; }
+  li { margin: 0.4rem 0; }
+  li code { white-space: nowrap; }
+  a { color: var(--accent); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  footer { margin-top: 3.5rem; padding-top: 1.25rem; border-top: 1px solid var(--border); color: var(--muted); font-size: 0.875rem; }
+</style>
+</head>
+<body>
+<main>
+  <h1><span>tx9</span></h1>
+  <p class="tagline">Isolated, portable agent boxes on Docker.</p>
+
+  <p>
+    One command gives you a <strong>box</strong>: a pair of containers with
+    Claude&nbsp;Code, Codex, and the Hermes agent in one, and the Executor
+    daemon isolated in the other, joined by a private network. The agent gets
+    free rein inside its container; Executor — the thing holding real
+    credentials — stays walled off behind a bearer-token-gated HTTP endpoint.
+  </p>
+  <p>
+    All durable state lives on a single volume that travels as an encrypted,
+    validated <code>.tx9</code> archive — back a box up on one machine, import
+    it on another, and it arrives paused, gateway-disabled, and ready to be
+    switched on deliberately.
+  </p>
+
+  <h2>Install</h2>
+  <pre><code><span class="prompt">$</span> curl -fsSL https://tx9.davis7.sh/install | sh</code></pre>
+  <p>
+    Drops a single static binary in <code>~/.local/bin</code> (Linux &amp;
+    macOS, amd64 &amp; arm64), checksum-verified. The only runtime dependency
+    is Docker.
+  </p>
+
+  <h2>Use</h2>
+  <pre><code><span class="prompt">$</span> tx9 create            <span class="prompt"># build image + start a new box</span>
+<span class="prompt">$</span> tx9 enter my-box      <span class="prompt"># shell into the agent container</span>
+<span class="prompt">$</span> tx9 backup my-box     <span class="prompt"># encrypted .tx9 snapshot</span>
+<span class="prompt">$</span> tx9 import my-box.tx9 <span class="prompt"># restore it anywhere</span></code></pre>
+  <ul>
+    <li><code>tx9 list</code> — every box on the machine, straight from the Docker daemon</li>
+    <li><code>tx9 doctor</code> — end-to-end health checks, in-box and from the host</li>
+    <li><code>tx9 upgrade</code> — self-update the CLI, or move a box onto the current image</li>
+    <li><code>tx9 open</code> — authenticated Executor dashboard URL</li>
+  </ul>
+
+  <footer>
+    <a href="https://github.com/davis7dotsh/tx9">Source on GitHub</a> ·
+    <a href="/install">install script</a>
+  </footer>
+</main>
+</body>
+</html>
