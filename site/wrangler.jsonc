@@ -1,0 +1,17 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "tx9-site",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-01",
+  "assets": { "binding": "ASSETS", "directory": "./public" },
+  "r2_buckets": [{ "binding": "RELEASES", "bucket_name": "tx9-releases" }],
+  // Interim hostname on the col-agents.com zone (Cloudflare) until tx9
+  // gets its own domain.
+  "routes": [{ "pattern": "tx9.col-agents.com", "custom_domain": true }],
+  // The worker serves the installer from a Text-module import of
+  // src/install.txt, a symlink to ../scripts/install.sh (single source of
+  // truth, no copy step). The .txt alias matters: Cloudflare's API WAF
+  // 403s worker uploads containing a *.sh module with shell content.
+  "rules": [{ "type": "Text", "globs": ["**/*.txt"], "fallthrough": true }],
+  "observability": { "enabled": true },
+}

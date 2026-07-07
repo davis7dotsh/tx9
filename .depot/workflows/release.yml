@@ -1,0 +1,117 @@
+name: release
+
+# Tag-push CI for tx9's distribution (docs/tx9-cli-design.md decision 10):
+# push a `vX.Y.Z` tag, get cross-compiled binaries + checksums.txt published
+# to two places from one build:
+#
+#   1. A GitHub release — what `internal/selfupdate` (via `tx9 upgrade`)
+#      consumes.
+#   2. The tx9-releases R2 bucket behind https://tx9.col-agents.com (site/) —
+#      what scripts/install.sh consumes: <version>/<asset> objects, plus a
+#      latest.txt version pointer flipped only after every asset uploads.
+#
+# Runs on Depot CI (like check.yml). R2 upload needs two Depot CI secrets
+# scoped to this repo (`depot ci secrets add <NAME> --repo davis7dotsh/tx9`,
+# NOT GitHub repo secrets): CLOUDFLARE_API_TOKEN (an API token with Workers
+# R2 Storage edit on the bucket) and CLOUDFLARE_ACCOUNT_ID. The GitHub
+# release step uses the token Depot's GitHub App mints via `permissions:
+# contents: write`.
+
+# Plain X.Y.Z tags only: site/src/index.ts rejects any other shape, so a
+# `v1` or `v1.2.3-rc1` release would poison latest.txt and 404 the
+# installer until the next valid tag. The derive step re-checks the same
+# invariant in case this glob is ever loosened.
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+permissions:
+  contents: write
+
+# Serialize release runs without cancelling or dropping any: two tags
+# pushed close together must both publish, but if the runs interleaved,
+# the older one could finish last and flip latest.txt back to a stale
+# version. queue: max keeps every queued run (the default, single, would
+# cancel-and-replace a pending release when a third tag arrives).
+concurrency:
+  group: release
+  cancel-in-progress: false
+  queue: max
+
+jobs:
+  release:
+    runs-on: depot-ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.26"
+
+      - name: Install jq
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends jq
+
+      - name: Install shellcheck
+        # Pinned to match .depot/workflows/check.yml and local dev, so a
+        # release build never fails a check that `make check` passed
+        # locally for a different reason (older/newer shellcheck).
+        env:
+          SHELLCHECK_VERSION: v0.11.0
+        run: |
+          curl -fsSL "https://github.com/koalaman/shellcheck/releases/download/${SHELLCHECK_VERSION}/shellcheck-${SHELLCHECK_VERSION}.linux.x86_64.tar.xz" \
+            | tar -xJ
+          sudo install "shellcheck-${SHELLCHECK_VERSION}/shellcheck" /usr/local/bin/shellcheck
+          shellcheck --version
+
+      # `make check` (syntax + shellcheck + static contracts + guest-script
+      # regressions + go-check) needs no Docker daemon and no network
+      # access: none of tests/*.sh shell out to `docker` (checked — they
+      # only grep the repo's Docker-related source files/strings), so
+      # nothing here is trimmed down; the full local gate runs unmodified
+      # before a release is ever built.
+      - name: make check
+        run: make check
+
+      - name: Derive VERSION from tag
+        id: version
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          if ! printf '%s' "$version" | grep -Eq '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+            echo "tag ${GITHUB_REF_NAME} is not a plain vX.Y.Z release tag; refusing to publish" >&2
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build dist/ (cross-compiled binaries + checksums.txt)
+        run: make dist VERSION=${{ steps.version.outputs.version }}
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+
+      # Mirror dist/ into R2 for the tx9.col-agents.com install path. Versioned
+      # objects go first; latest.txt is flipped last so /releases/latest
+      # never points at a version whose assets aren't all present yet.
+      # `npx wrangler` pins the same major the site pins in its
+      # devDependencies. R2 failures after the GitHub release step mean the
+      # two channels can briefly disagree — re-run the job; uploads are
+      # idempotent.
+      - name: Publish to R2 (tx9.col-agents.com)
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          for f in dist/*; do
+            npx --yes wrangler@4 r2 object put "tx9-releases/${VERSION}/$(basename "$f")" \
+              --file "$f" --remote
+          done
+          printf '%s\n' "$VERSION" > latest.txt
+          npx --yes wrangler@4 r2 object put "tx9-releases/latest.txt" \
+            --file latest.txt --remote
