@@ -103,6 +103,7 @@ install_hermes() {
   if command -v hermes >/dev/null 2>&1 && [[ -x "$install_dir/venv/bin/python" ]]; then
     log "hermes already installed — skipping reinstall"
     install_hermes_messaging_deps "$install_dir" || return 1
+    chown -R agent:agent "$install_dir"
     return 0
   fi
   log "hermes (official installer)"
@@ -139,6 +140,10 @@ install_hermes() {
     fi
     install_hermes_messaging_deps "$install_dir" || return 1
     own_hermes_home
+    # agent owns the code checkout + venv so `hermes update` (which runs
+    # `uv pip install --upgrade hermes-agent` into the venv) works without
+    # sudo. Verified: update fails with EACCES on venv/bin otherwise.
+    chown -R agent:agent "$install_dir"
     log "hermes installed -> $(command -v hermes || echo "$OPT/bin/hermes")"
   else
     log "hermes install FAILED"

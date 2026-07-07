@@ -25,6 +25,7 @@ import (
 // is no separate `hb enter` subcommand to invoke.
 func cmdEnter(args []string) error {
 	fs := flag.NewFlagSet("enter", flag.ContinueOnError)
+	intoExecutor := fs.Bool("executor", false, "enter the box's executor container instead of the agent container")
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
 	}
@@ -33,7 +34,7 @@ func cmdEnter(args []string) error {
 		return err
 	}
 
-	var agentID, tok string
+	var containerID, tok string
 	err = withBoxLock(name, func(ctx context.Context, cli *docker.Client) error {
 		b, err := box.Get(ctx, cli, name)
 		if err != nil {
@@ -48,7 +49,10 @@ func cmdEnter(args []string) error {
 		if err != nil {
 			return fmt.Errorf("enter %s: %w", name, err)
 		}
-		agentID = b.AgentID
+		containerID = b.AgentID
+		if *intoExecutor {
+			containerID = b.ExecutorID
+		}
 		return nil
 	})
 	if err != nil {
@@ -60,16 +64,36 @@ func cmdEnter(args []string) error {
 		return fmt.Errorf("enter %s: docker binary not found on PATH: %w", name, err)
 	}
 
-	argv := []string{
-		dockerBin, "exec", "-it", "-u", "agent",
-		"-e", "HOME=/data/home/agent",
-		"-e", "USER=agent",
-		"-e", "LOGNAME=agent",
-		"-e", "SHELL=/bin/bash",
-		"-e", "EXECUTOR_HOST=executor",
-		"-e", "BOXD_EXECUTOR_TOKEN=" + tok,
-		"-w", "/data/home/agent",
-		agentID, "bash", "-l",
+	var argv []string
+	if *intoExecutor {
+		// The executor container runs only the daemon — no tmux session, no
+		// login-profile automation. A plain interactive shell with the box
+		// profile sourced (PATH to vp/executor, /data env) is what you want
+		// for maintenance like `vp install -g executor@latest`. --norc keeps
+		// bash from reading skel dotfiles for a home that doesn't exist here.
+		argv = []string{
+			dockerBin, "exec", "-it", "-u", "agent",
+			"-e", "HOME=/data/home/agent",
+			"-e", "USER=agent",
+			"-e", "LOGNAME=agent",
+			"-e", "SHELL=/bin/bash",
+			"-e", "EXECUTOR_MCP_TOKEN=" + tok,
+			"-w", "/data/home/agent",
+			containerID, "bash", "--norc", "-c",
+			". /etc/profile.d/hermes-box.sh; exec bash --norc -i",
+		}
+	} else {
+		argv = []string{
+			dockerBin, "exec", "-it", "-u", "agent",
+			"-e", "HOME=/data/home/agent",
+			"-e", "USER=agent",
+			"-e", "LOGNAME=agent",
+			"-e", "SHELL=/bin/bash",
+			"-e", "EXECUTOR_HOST=executor",
+			"-e", "BOXD_EXECUTOR_TOKEN=" + tok,
+			"-w", "/data/home/agent",
+			containerID, "bash", "-l",
+		}
 	}
 
 	// syscall.Exec replaces this process outright so the TTY (job control,

@@ -41,7 +41,7 @@ var commandOrder = []string{
 var commandHelp = map[string]string{
 	"create":  "generate/build if needed, create and start a new box",
 	"list":    "list boxes on this machine (state, image version, dashboard URL)",
-	"enter":   "exec into a box's agent container (alias: ssh)",
+	"enter":   "exec into a box's agent container (alias: ssh; --executor for the executor container)",
 	"start":   "start a stopped box",
 	"stop":    "stop a running box",
 	"backup":  "archive a box to a .tx9 file (alias: export)",

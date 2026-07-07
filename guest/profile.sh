@@ -28,6 +28,19 @@ export XDG_CONFIG_HOME=/data/home/agent/.config
 export XDG_DATA_HOME=/data/home/agent/.local/share
 export XDG_STATE_HOME=/data/home/agent/.local/state
 
+# `codex update` detects a standalone install by looking for the running
+# binary under $CODEX_HOME/packages/standalone — but at runtime CODEX_HOME
+# points at /data (config/auth), while the release binaries live in the
+# image's tooling dir. Point just the updater at the install home; every
+# other invocation keeps the durable CODEX_HOME.
+codex() {
+  if [ "${1:-}" = "update" ]; then
+    CODEX_HOME=/opt/hermes-box/tooling/codex command codex "$@"
+  else
+    command codex "$@"
+  fi
+}
+
 # Codex reads Executor's local bearer token from this environment variable.
 # The root-owned service mints the token; hb refreshes this mode-0600 file when
 # it wires MCP clients.
