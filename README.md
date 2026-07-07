@@ -87,12 +87,7 @@ and rewire MCP automatically.
 
 ```bash
 make check          # syntax + shellcheck + static contracts + regressions; hermetic
-make check-hermes-pin   # network: compare HERMES_INSTALLER_SHA256 against upstream
 ```
 
 `.depot/workflows/check.yml` runs `make check` on every push and pull request
 to `main` via Depot CI.
-
-If an image build fails with "Hermes installer checksum verification failed",
-upstream rotated `install.sh` since the pin: run `make check-hermes-pin`,
-review the new installer, then update `box.env` yourself.

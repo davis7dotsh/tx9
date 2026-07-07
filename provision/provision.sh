@@ -8,27 +8,18 @@ CTX="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"   # /tmp/ctx
 source "$CTX/box.env"
 
 OPT=/opt/hermes-box
-NODE_PREFIX="$OPT/tooling/node-global"
+# Vite+ manages the Node.js runtime (and hosts npm-global bins like executor);
+# its shims live in $VP_HOME/bin. https://viteplus.dev/guide/env
+export VP_HOME="$OPT/tooling/vite-plus"
 UV_DIR="$OPT/tooling/uv"
 # $OPT/bin holds repo-owned tools (hb, hb-workload, hermes-state) plus the
-# hermes launcher symlink installed below — must be on PATH here too, not
+# claude/codex launchers installed below — must be on PATH here too, not
 # just for the agent user (guest/profile.sh), so verify_required's
 # `command -v` checks see what a real shell would see.
-export PATH="$OPT/bin:$NODE_PREFIX/bin:$UV_DIR:$PATH"
+export PATH="$OPT/bin:$VP_HOME/bin:$UV_DIR:$PATH"
 export DEBIAN_FRONTEND=noninteractive
 
 log() { printf '\033[35m[provision]\033[0m %s\n' "$*"; }
-
-verify_self_contained_bundle() {
-  local bundle_path="$1" verify_repo status=0
-  verify_repo="$(mktemp -d)" || return 1
-  git init --bare "$verify_repo" >/dev/null 2>&1 || status=$?
-  if [[ "$status" == 0 ]]; then
-    git -C "$verify_repo" bundle verify "$bundle_path" >/dev/null 2>&1 || status=$?
-  fi
-  rm -rf "$verify_repo"
-  return "$status"
-}
 
 base_os() {
   log "base packages"
@@ -56,132 +47,100 @@ make_agent() {
 }
 
 install_node_uv() {
-  log "node ${NODE_MAJOR}.x (NodeSource) + uv"
-  curl -fsSL "https://deb.nodesource.com/setup_${NODE_MAJOR}.x" | bash - >/dev/null 2>&1
-  apt-get install -y -qq nodejs >/dev/null
-  # Global npm installs go to our /opt prefix, not /usr — keeps tools self-contained.
-  mkdir -p "$NODE_PREFIX"
-  npm config set prefix "$NODE_PREFIX" --global
+  # Vite+ owns the Node.js runtime: its node/npm/npx shims land in
+  # $VP_HOME/bin and resolve to the managed install, defaulted to LTS below.
+  # VP_NODE_MANAGER=yes answers the installer's interactive "manage Node?"
+  # prompt (per its documented CI escape hatch).
+  log "vite+ (managed node/npm) -> $VP_HOME"
+  curl -fsSL https://vite.plus | env VP_NODE_MANAGER=yes bash >/dev/null 2>&1
+  "$VP_HOME/bin/vp" env default lts >/dev/null
+  # The agent user owns the tree so it can update the managed runtime and
+  # vp-installed globals (e.g. `vp install -g executor@latest`) without sudo.
+  chown -R agent:agent "$VP_HOME"
   log "uv -> $UV_DIR"
   curl -LsSf https://astral.sh/uv/install.sh \
     | env UV_INSTALL_DIR="$UV_DIR" UV_UNMANAGED_INSTALL="$UV_DIR" sh >/dev/null 2>&1
 }
 
 install_claude() {
-  local pkg="@anthropic-ai/claude-code${CLAUDE_CODE_VERSION:+@$CLAUDE_CODE_VERSION}"
-  log "claude-code${CLAUDE_CODE_VERSION:+ ($CLAUDE_CODE_VERSION)}"
-  "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
-    || npm install -g "$pkg" >/dev/null
+  # Native installer (no Node dependency): a self-contained binary under
+  # $HOME/.local/share/claude plus a $HOME/.local/bin/claude launcher. HOME
+  # is pointed at our tooling dir so the whole install stays image content;
+  # per-box state still lands on /data via CLAUDE_CONFIG_DIR (profile.sh).
+  local channel="${CLAUDE_CODE_CHANNEL:-stable}"
+  log "claude-code (native installer, $channel)"
+  curl -fsSL https://claude.ai/install.sh \
+    | env HOME="$OPT/tooling/claude" bash -s -- "$channel" >/dev/null 2>&1 \
+    || { log "claude install FAILED"; return 1; }
+  ln -sf "$OPT/tooling/claude/.local/bin/claude" "$OPT/bin/claude"
+  # agent owns the tree so claude's self-updater can swap versions in place.
+  chown -R agent:agent "$OPT/tooling/claude"
 }
 
 install_codex() {
-  local pkg="@openai/codex${CODEX_VERSION:+@$CODEX_VERSION}"
-  log "codex${CODEX_VERSION:+ ($CODEX_VERSION)}"
-  "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
-    || npm install -g "$pkg" >/dev/null
+  # Native installer: standalone binary releases under CODEX_HOME/packages
+  # with a $CODEX_INSTALL_DIR/codex symlink. Installed into our tooling dir
+  # directly on $OPT/bin; per-box state still lands on /data via CODEX_HOME
+  # at runtime (profile.sh) — the install-time CODEX_HOME here only decides
+  # where the release binaries live.
+  log "codex (native installer${CODEX_VERSION:+, $CODEX_VERSION})"
+  curl -fsSL https://chatgpt.com/codex/install.sh \
+    | env CODEX_INSTALL_DIR="$OPT/bin" CODEX_HOME="$OPT/tooling/codex" \
+        CODEX_NON_INTERACTIVE=1 CODEX_RELEASE="${CODEX_VERSION:-latest}" sh >/dev/null 2>&1 \
+    || { log "codex install FAILED"; return 1; }
+  # agent owns the standalone releases tree so re-running the installer (or a
+  # future codex self-update) can swap versions in place.
+  chown -R agent:agent "$OPT/tooling/codex"
 }
 
 install_hermes() {
   if [[ "${INSTALL_HERMES:-0}" != "1" ]]; then
     log "hermes: INSTALL_HERMES != 1 — skipping"; return
   fi
-  local sha="${HERMES_GIT_SHA:-}" bundle="${HERMES_GIT_BUNDLE:-}" install_dir=/usr/local/lib/hermes-agent
-  local installer_sha="${HERMES_INSTALLER_SHA256:-}" installer
-  [[ "$sha" =~ ^[0-9a-fA-F]{40}$ ]] || { log "invalid HERMES_GIT_SHA: $sha"; return 1; }
-  [[ "$installer_sha" =~ ^[0-9a-fA-F]{64}$ ]] || { log "invalid HERMES_INSTALLER_SHA256"; return 1; }
-  # Idempotent: skip the multi-minute reinstall if hermes is already on PATH
-  # and already checked out at the pinned commit (the same bar verify_required
-  # holds it to). Lets `assets` repair mode call this safely on every run.
-  if command -v hermes >/dev/null 2>&1 && [[ "$(git -C "$install_dir" rev-parse HEAD 2>/dev/null)" == "$sha" ]]; then
-    log "hermes already installed at pinned $sha — skipping reinstall"
+  local install_dir=/usr/local/lib/hermes-agent
+  # Idempotent: skip the multi-minute reinstall if hermes is already on PATH.
+  # Lets `assets` repair mode call this safely on every run.
+  if command -v hermes >/dev/null 2>&1 && [[ -x "$install_dir/venv/bin/python" ]]; then
+    log "hermes already installed — skipping reinstall"
     install_hermes_messaging_deps "$install_dir" || return 1
     return 0
   fi
-  log "hermes (official installer pinned to $sha)"
-  # We run as root and pass an explicit --dir below, which makes the installer
-  # skip its own root/FHS auto-detection (resolve_install_layout() returns
-  # early whenever --dir is explicit) and link the `hermes` command into
-  # $HOME/.local/bin instead of /usr/local/bin. $HOME is root's home here
-  # since this whole script runs as root. Code still lands at $install_dir
-  # (/usr/local/lib/hermes-agent) since that part of --dir is honored either
-  # way. HERMES_HOME pins the durable state (auth, sessions, skills, memory)
-  # onto /data. See the symlink step below that puts `hermes` on agent's PATH.
+  log "hermes (official installer)"
+  # The normal curl setup. Running as root with no --dir lets the installer's
+  # own FHS auto-detection place code at /usr/local/lib/hermes-agent and link
+  # the `hermes` command into /usr/local/bin. HERMES_HOME pins the durable
+  # state (auth, sessions, skills, memory) onto /data.
   export HERMES_HOME=/data/home/agent/.hermes
   mkdir -p "$HERMES_HOME"
-  if [[ -n "$bundle" ]]; then
-    [[ "$bundle" != /* && "$bundle" != *..* && "$bundle" == artifacts/* ]] || {
-      log "HERMES_GIT_BUNDLE must be a safe path beneath artifacts/"; return 1;
-    }
-    [[ -f "$CTX/$bundle" ]] || { log "Hermes Git bundle is missing: $CTX/$bundle"; return 1; }
-    verify_self_contained_bundle "$CTX/$bundle" || {
-      log "Hermes Git bundle is incomplete or invalid"; return 1;
-    }
-  fi
   local arg args=()
   read -r -a args <<<"${HERMES_INSTALL_ARGS:-}"
   for arg in "${args[@]}"; do
     case "$arg" in
-      --dir | --dir=* | --hermes-home | --hermes-home=* | --commit | --commit=* | \
-      --skip-setup | --skip-setup=* | --non-interactive | --non-interactive=*)
+      --hermes-home | --hermes-home=* | --skip-setup | --skip-setup=* | \
+      --non-interactive | --non-interactive=*)
         log "HERMES_INSTALL_ARGS cannot override protected installer option: $arg"
         return 1
         ;;
     esac
   done
-  installer="$(mktemp)"
-  if ! curl -fsSL https://hermes-agent.nousresearch.com/install.sh -o "$installer"; then
-    rm -f "$installer"
-    log "Hermes installer download failed"
-    return 1
-  fi
-  if ! printf '%s  %s\n' "$installer_sha" "$installer" | sha256sum --check --status; then
-    rm -f "$installer"
-    log "Hermes installer checksum verification failed"
-    return 1
-  fi
-  if [[ -n "$bundle" ]]; then
-    if ! rm -rf "$install_dir" \
-      || ! git clone --no-checkout "$CTX/$bundle" "$install_dir" >/dev/null \
-      || ! git -C "$install_dir" cat-file -e "$sha^{commit}" \
-      || ! git -C "$install_dir" checkout --detach "$sha"; then
-      rm -f "$installer"
-      log "Hermes bundle checkout failed"
-      return 1
-    fi
-  fi
-  if bash "$installer" "${args[@]}" --dir "$install_dir" --hermes-home "$HERMES_HOME" \
-       --commit "$sha" --skip-setup --non-interactive; then
-    rm -f "$installer"
-    [[ "$(git -C "$install_dir" rev-parse HEAD)" == "$sha" ]] || {
-      log "Hermes checkout verification failed"; return 1;
-    }
-    if [[ -n "$bundle" ]]; then
-      git -C "$install_dir" remote set-url origin \
-        "${HERMES_REPO_URL:-https://github.com/NousResearch/hermes-agent.git}"
-    fi
-    # Put the launcher on PATH for both this script (root) and the agent user
-    # (guest/profile.sh puts $OPT/bin first). $HOME is root's home since this
-    # whole script runs as root; that's where an explicit --dir install links
-    # the command (see the comment above this function). Fall back to the
-    # FHS location in case a future installer version goes back to it.
-    if [[ -x "$HOME/.local/bin/hermes" ]]; then
-      ln -sf "$HOME/.local/bin/hermes" "$OPT/bin/hermes"
-      # agent must traverse $HOME (root's home) to dereference that symlink.
-      # The base image happens to ship root's home at 755 today, but don't
-      # depend on that staying true upstream — grant +x explicitly on just
-      # the path components the launcher needs.
-      chmod o+x "$HOME" "$HOME/.local" "$HOME/.local/bin"
-    elif [[ -x /usr/local/bin/hermes ]]; then
+  if curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
+      | bash -s -- "${args[@]}" --hermes-home "$HERMES_HOME" --skip-setup --non-interactive; then
+    # Put the launcher on $OPT/bin too so verify_required and the agent user
+    # (guest/profile.sh puts $OPT/bin first) see it regardless of where the
+    # installer linked it (/usr/local/bin under root/FHS today).
+    if [[ -x /usr/local/bin/hermes ]]; then
       ln -sf /usr/local/bin/hermes "$OPT/bin/hermes"
+    elif [[ -x "$HOME/.local/bin/hermes" ]]; then
+      ln -sf "$HOME/.local/bin/hermes" "$OPT/bin/hermes"
+      chmod o+x "$HOME" "$HOME/.local" "$HOME/.local/bin"
     else
-      log "hermes install FAILED: launcher not found in \$HOME/.local/bin or /usr/local/bin"
+      log "hermes install FAILED: launcher not found in /usr/local/bin or \$HOME/.local/bin"
       return 1
     fi
     install_hermes_messaging_deps "$install_dir" || return 1
     own_hermes_home
     log "hermes installed -> $(command -v hermes || echo "$OPT/bin/hermes")"
   else
-    rm -f "$installer"
     log "hermes install FAILED"
     return 1
   fi
@@ -238,10 +197,12 @@ install_executor() {
     fi
   fi
   local pkg="executor${EXECUTOR_VERSION:+@$EXECUTOR_VERSION}"
-  log "executor (npm global)${EXECUTOR_VERSION:+ ($EXECUTOR_VERSION)}"
-  if "$NODE_PREFIX/bin/npm" install -g "$pkg" >/dev/null 2>&1 \
-       || npm install -g "$pkg" >/dev/null 2>&1; then
-    log "executor installed -> $("$NODE_PREFIX/bin/npm" prefix -g 2>/dev/null)/bin/executor"
+  # Global install through Vite+ so the bin lands in $VP_HOME/bin next to the
+  # node/npm shims and `vp install -g executor@latest` updates it in place.
+  log "executor (vp global)${EXECUTOR_VERSION:+ ($EXECUTOR_VERSION)}"
+  if "$VP_HOME/bin/vp" install -g "$pkg" >/dev/null 2>&1; then
+    chown -R agent:agent "$VP_HOME"
+    log "executor installed -> $VP_HOME/bin/executor"
   else
     log "executor install FAILED"
     return 1
@@ -272,13 +233,12 @@ seed_data() {
   "$OPT/bin/hb" init
 }
 
-# Drop build caches so the overlay stays under smolvm's 4 GiB pack-export cap.
+# Drop build caches so the image stays lean.
 slim() {
-  log "slimming overlay (apt/npm/uv caches)"
+  log "slimming image (apt/npm/uv caches)"
   apt-get clean
   rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/* /var/tmp/* /tmp/ctx.tgz 2>/dev/null || true
-  "$NODE_PREFIX/bin/npm" cache clean --force >/dev/null 2>&1 || true
-  npm cache clean --force >/dev/null 2>&1 || true
+  "$VP_HOME/bin/npm" cache clean --force >/dev/null 2>&1 || true
   command -v uv >/dev/null 2>&1 && uv cache clean >/dev/null 2>&1 || true
   rm -rf /root/.npm /root/.cache /data/home/agent/.cache 2>/dev/null || true
 }
@@ -286,7 +246,7 @@ slim() {
 verify_required() {
   log "verifying required tools"
   local cmd
-  for cmd in node uv nvim claude codex; do
+  for cmd in node vp uv nvim claude codex; do
     command -v "$cmd" >/dev/null 2>&1 || { log "missing required tool: $cmd"; return 1; }
   done
   if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then
@@ -294,11 +254,6 @@ verify_required() {
   fi
   if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then
     command -v executor >/dev/null 2>&1 || { log "missing required tool: executor"; return 1; }
-  fi
-  if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then
-    [[ "$(git -C /usr/local/lib/hermes-agent rev-parse HEAD)" == "${HERMES_GIT_SHA}" ]] || {
-      log "Hermes checkout HEAD does not match pinned HERMES_GIT_SHA"; return 1;
-    }
   fi
 }
 
@@ -328,7 +283,7 @@ main() {
   verify_required
   slim
   log "provision complete"
-  PATH="$NODE_PREFIX/bin:$UV_DIR:$PATH" "$OPT/bin/hb" versions || true
+  PATH="$VP_HOME/bin:$UV_DIR:$PATH" "$OPT/bin/hb" versions || true
 }
 
 # Heavy tool installs only — no repo-owned guest assets. Lets the Docker

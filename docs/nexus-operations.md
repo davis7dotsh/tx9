@@ -22,26 +22,11 @@ Install this checkout at `/opt/tx9`, owned by `tx9`, and run `make check`
 before using it. Do not copy Eventide's macOS virtual environments,
 `node_modules`, caches, launchd files, or ARM64 binaries.
 
-For Eventide's custom runtime, create a complete Git bundle outside this repo
-and copy it locally to ignored `artifacts/hermes-eventide.bundle`. Then edit the
-installed tx9 checkout itself; transient shell variables are overwritten by
-`box.env` and are not reliably carried through `sudo`:
-
-```bash
-cd /opt/tx9
-sudoedit box.env
-# Set these exact keys in /opt/tx9/box.env:
-# HERMES_GIT_SHA="b9e586ec7534fad49d6599a742830a0024cc0906"
-# HERMES_GIT_BUNDLE="artifacts/hermes-eventide.bundle"
-grep -E '^(HERMES_GIT_SHA|HERMES_GIT_BUNDLE)=' box.env
-sudo -u tx9 ./box new hermes
-```
-
-The host and guest validate the bundle, the official installer rebuilds the
-checkout and venv for Linux x86_64, and provisioning verifies the final HEAD.
-The bundle must be self-contained: incremental bundles that depend on external
-prerequisite objects are intentionally unsupported for offline reproducibility.
-The checked-in default remains the known official SHA in `box.env`.
+> **Historical note:** the pinned-SHA / Git-bundle Hermes install path
+> (`HERMES_GIT_SHA`, `HERMES_GIT_BUNDLE`, `HERMES_INSTALLER_SHA256`) described
+> in earlier revisions of this runbook was removed. Provisioning now runs the
+> plain official installer (`curl … | bash`), always installing the latest
+> Hermes release.
 
 ## 2. Install boot, health, and backup supervision
 

@@ -1,6 +1,9 @@
 package box
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 func TestContainerNames(t *testing.T) {
 	agent, executor := ContainerNames("dry1")
@@ -86,7 +89,24 @@ func TestURLHostFallsBackToHostname(t *testing.T) {
 	t.Setenv("TX9_URL_HOST", "")
 	got := URLHost()
 	if got == "" {
-		t.Error("URLHost() = \"\", want a non-empty hostname or \"localhost\" fallback")
+		t.Error("URLHost() = \"\", want a non-empty IP, hostname, or \"localhost\" fallback")
+	}
+}
+
+func TestURLHostPrefersTailscaleIP(t *testing.T) {
+	t.Setenv("TX9_URL_HOST", "")
+	ts := tailscaleIP()
+	if ts == "" {
+		t.Skip("no Tailscale interface on this machine")
+	}
+	if got := URLHost(); got != ts {
+		t.Errorf("URLHost() = %q, want the Tailscale IP %q", got, ts)
+	}
+}
+
+func TestTailscaleIPRange(t *testing.T) {
+	if ip := tailscaleIP(); ip != "" && !tailscaleCGNAT.Contains(net.ParseIP(ip)) {
+		t.Errorf("tailscaleIP() = %q, want an address in 100.64.0.0/10", ip)
 	}
 }
 

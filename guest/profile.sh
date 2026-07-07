@@ -4,7 +4,13 @@
 [ -r /etc/hermes-box.env ] && . /etc/hermes-box.env
 
 HB=/opt/hermes-box
-export PATH="$HB/bin:$HB/tooling/node-global/bin:$HB/tooling/uv:$PATH"
+# Vite+ manages node/npm (LTS by default) and hosts vp-installed globals
+# like executor; its shims resolve the managed runtime via VP_HOME.
+export VP_HOME="$HB/tooling/vite-plus"
+# /data/home/agent/.local/bin first: self-updates run in the box (claude
+# update, re-running the codex installer) land launchers there on the durable
+# volume, and must win over the image-baked copies in $HB/bin.
+export PATH="/data/home/agent/.local/bin:$HB/bin:$VP_HOME/bin:$HB/tooling/uv:$PATH"
 
 # neovim is the default editor; its config/state (~/.config/nvim, ~/.local/share/nvim)
 # lands on /data via the XDG vars below.
