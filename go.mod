@@ -6,6 +6,7 @@ require (
 	github.com/docker/docker v28.5.2+incompatible
 	github.com/docker/go-connections v0.7.0
 	golang.org/x/sys v0.46.0
+	golang.org/x/term v0.44.0
 )
 
 require (

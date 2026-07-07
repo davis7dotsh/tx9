@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bufio"
 	"bytes"
 	"context"
 	"errors"
@@ -13,7 +12,7 @@ import (
 	"strings"
 	"time"
 
-	"golang.org/x/sys/unix"
+	"golang.org/x/term"
 
 	"github.com/davis7dotsh/tx9/internal/archive"
 	"github.com/davis7dotsh/tx9/internal/box"
@@ -271,9 +270,10 @@ func writeTx9Staged(stagingPath string, meta archive.Metadata, dataFile string) 
 }
 
 // readPassword prompts on /dev/tty with echo disabled (dossier §6.4's
-// interactive-prompt fallback), toggling ECHO off / ECHONL on exactly like
-// a standard `stty -echo` password prompt, and always restoring the
-// original termios settings afterward.
+// interactive-prompt fallback) and always restores the original terminal
+// state afterward. x/term rather than raw termios ioctls: TCGETS/TCSETS
+// are Linux-only names (darwin spells them TIOCGETA/TIOCSETA), which broke
+// the darwin cross-compile in the release workflow.
 func readPassword(prompt string) (string, error) {
 	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
 	if err != nil {
@@ -281,25 +281,13 @@ func readPassword(prompt string) (string, error) {
 	}
 	defer tty.Close()
 
-	fd := int(tty.Fd())
-	oldState, err := unix.IoctlGetTermios(fd, unix.TCGETS)
-	if err != nil {
-		return "", fmt.Errorf("read password: get termios: %w", err)
-	}
-	newState := *oldState
-	newState.Lflag &^= unix.ECHO
-	newState.Lflag |= unix.ECHONL
-	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &newState); err != nil {
-		return "", fmt.Errorf("read password: set termios: %w", err)
-	}
-	defer unix.IoctlSetTermios(fd, unix.TCSETS, oldState)
-
 	fmt.Fprint(tty, prompt)
-	line, err := bufio.NewReader(tty).ReadString('\n')
-	if err != nil && !errors.Is(err, io.EOF) {
+	pw, err := term.ReadPassword(int(tty.Fd()))
+	fmt.Fprintln(tty)
+	if err != nil {
 		return "", fmt.Errorf("read password: %w", err)
 	}
-	return strings.TrimRight(line, "\r\n"), nil
+	return string(pw), nil
 }
 
 // resolvePassword implements the flag > env > interactive-prompt
