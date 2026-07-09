@@ -117,7 +117,7 @@ install_hermes() {
   read -r -a args <<<"${HERMES_INSTALL_ARGS:-}"
   for arg in "${args[@]}"; do
     case "$arg" in
-      --hermes-home | --hermes-home=* | --skip-setup | --skip-setup=* | \
+      --dir | --dir=* | --hermes-home | --hermes-home=* | --skip-setup | --skip-setup=* | \
       --non-interactive | --non-interactive=*)
         log "HERMES_INSTALL_ARGS cannot override protected installer option: $arg"
         return 1

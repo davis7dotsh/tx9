@@ -35,7 +35,7 @@ export XDG_STATE_HOME=/data/home/agent/.local/state
 # other invocation keeps the durable CODEX_HOME.
 codex() {
   if [ "${1:-}" = "update" ]; then
-    CODEX_HOME=/opt/hermes-box/tooling/codex command codex "$@"
+    CODEX_HOME="$HB/tooling/codex" command codex "$@"
   else
     command codex "$@"
   fi

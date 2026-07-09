@@ -69,6 +69,7 @@ grep -q 'vite-plus' guest/profile.sh
 grep -q 'env default lts' provision/provision.sh
 grep -q 'claude.ai/install.sh' provision/provision.sh
 grep -q 'chatgpt.com/codex/install.sh' provision/provision.sh
+grep -Fq -- '--dir | --dir=* | --hermes-home' provision/provision.sh
 if grep -q 'npm install -g' provision/provision.sh; then
   echo "provision.sh still installs npm globals directly (use vp install -g)" >&2
   exit 1
