@@ -4,11 +4,13 @@ name: release
 # push a `vX.Y.Z` tag, get cross-compiled binaries + checksums.txt published
 # to two places from one build:
 #
-#   1. A GitHub release — what `internal/selfupdate` (via `tx9 upgrade`)
-#      consumes.
+#   1. A GitHub release — a browsable archive with generated release notes
+#      (not consumed programmatically: the repo is private, so the GitHub
+#      API 404s for anonymous clients).
 #   2. The tx9-releases R2 bucket behind https://tx9.col-agents.com (site/) —
-#      what scripts/install.sh consumes: <version>/<asset> objects, plus a
-#      latest.txt version pointer flipped only after every asset uploads.
+#      what both scripts/install.sh and `tx9 upgrade` (internal/selfupdate)
+#      consume: <version>/<asset> objects, plus a latest.txt version
+#      pointer flipped only after every asset uploads.
 #
 # Runs on Depot CI (like check.yml). R2 upload needs two Depot CI secrets
 # scoped to this repo (`depot ci secrets add <NAME> --repo davis7dotsh/tx9`,
