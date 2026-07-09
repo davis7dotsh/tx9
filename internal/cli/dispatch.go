@@ -33,7 +33,7 @@ var commands = map[string]commandFunc{}
 // docs/tx9-cli-design.md).
 var commandOrder = []string{
 	"create", "list", "enter", "start", "stop", "backup", "import",
-	"open", "doctor", "upgrade", "delete", "prune",
+	"gateway", "open", "doctor", "upgrade", "delete", "prune",
 }
 
 // commandHelp is a one-line description per canonical command, for help
@@ -46,6 +46,7 @@ var commandHelp = map[string]string{
 	"stop":    "stop a running box",
 	"backup":  "archive a box to a .tx9 file (alias: export)",
 	"import":  "restore a box from a .tx9 file",
+	"gateway": "status/enable/disable the supervised Hermes gateway",
 	"open":    "print/open a box's authenticated dashboard URL",
 	"doctor":  "run health checks against a box",
 	"upgrade": "self-update the CLI, or move a box onto the current image",
@@ -68,6 +69,7 @@ func registerCommands() {
 	commands["stop"] = cmdStop
 	commands["backup"] = cmdBackup
 	commands["import"] = cmdImport
+	commands["gateway"] = cmdGateway
 	commands["open"] = cmdOpen
 	commands["doctor"] = cmdDoctor
 	commands["upgrade"] = cmdUpgrade

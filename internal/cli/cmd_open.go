@@ -43,7 +43,7 @@ func cmdOpen(args []string) error {
 			return fmt.Errorf("open %s: %w", name, err)
 		}
 
-		url := box.OpenURL(port, tok)
+		url := box.OpenURL(port, tok, b.ExecutorWebBaseURL)
 
 		if browser := firstNonEmpty(os.Getenv("TX9_BROWSER"), os.Getenv("BOX_BROWSER")); browser != "" {
 			if _, lookErr := exec.LookPath(browser); lookErr == nil {

@@ -61,7 +61,8 @@ table, or user namespace with it.
  │                └──── private network ─────┘              │        │
  └──────────────────────────── (per-project; no cross-box) ─┼────────┘
                                                             ▼
-                             host 0.0.0.0:<auto>  — LAN + Tailscale
+                             host 0.0.0.0:<auto> by default
+                             or 127.0.0.1:<fixed> behind Tailscale Serve
                              dashboard at /  ·  MCP at /mcp
                              bearer token gates every request
       │
@@ -133,8 +134,12 @@ gVisor (`--runtime=runsc`) remains the one-flag escape hatch if VM-grade
 isolation is ever wanted back — the design doesn't change.
 
 Networking stance is unchanged from smolvm (always-on, tools need internet).
-The executor's single published port binds 0.0.0.0 (LAN + Tailscale, per
-decision); the agent container publishes nothing.
+The executor's single published port binds `0.0.0.0` on a Docker-assigned port
+by default; the agent container publishes nothing. A box may instead persist a
+fixed loopback binding, public `EXECUTOR_WEB_BASE_URL`, and container DNS list
+for a reverse proxy such as Tailscale Serve. This preserves the two-container
+isolation boundary while giving OAuth redirects a stable trusted HTTPS origin;
+see [Tailscale HTTPS for Executor](tailscale-executor.md).
 
 ## Lifecycle mapping
 

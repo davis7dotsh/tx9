@@ -10,7 +10,6 @@ import (
 	"github.com/davis7dotsh/tx9/internal/box"
 	"github.com/davis7dotsh/tx9/internal/docker"
 	"github.com/davis7dotsh/tx9/internal/names"
-	"github.com/davis7dotsh/tx9/internal/state"
 	"github.com/davis7dotsh/tx9/internal/token"
 	"github.com/davis7dotsh/tx9/internal/version"
 )
@@ -57,6 +56,7 @@ chown root:root /data && chmod 0711 /data
 // wire MCP against a box the restore deliberately leaves quiesced).
 func cmdImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
+	executorFlags := addExecutorConfigFlags(fs)
 	nameOverride := fs.String("name", "", "box name to restore under (default: from archive metadata)")
 	password := fs.String("password", "", "archive passphrase (else TX9_PASSWORD env, else prompt)")
 	if err := parseFlagsAnywhere(fs, args); err != nil {
@@ -78,6 +78,10 @@ func cmdImport(args []string) error {
 	}
 	if err := names.Validate(name); err != nil {
 		return fmt.Errorf("import %s: %w", archivePath, err)
+	}
+	executorConfig, err := executorFlags.load(name)
+	if err != nil {
+		return fmt.Errorf("import %s: %w", name, err)
 	}
 
 	var passphrase string
@@ -126,7 +130,7 @@ func cmdImport(args []string) error {
 		if err != nil {
 			return fmt.Errorf("import %s: %w", name, err)
 		}
-		if err := state.WriteBoxEnv(name, map[string]string{"EXECUTOR_MCP_TOKEN": tok}); err != nil {
+		if err := box.SaveExecutorConfig(name, tok, executorConfig); err != nil {
 			return fmt.Errorf("import %s: %w", name, err)
 		}
 
@@ -136,7 +140,9 @@ func cmdImport(args []string) error {
 		}
 
 		fmt.Printf("tx9: creating box %q (network, volumes, containers — not started yet)\n", name)
-		b, err := box.Create(ctx, cli, box.CreateOpts{Name: name, Image: imageTag, Token: tok, NoStart: true})
+		b, err := box.Create(ctx, cli, box.CreateOpts{
+			Name: name, Image: imageTag, Token: tok, Executor: executorConfig, NoStart: true,
+		})
 		if err != nil {
 			box.Destroy(ctx, cli, name)
 			return fmt.Errorf("import %s: %w", name, err)
@@ -189,7 +195,7 @@ func cmdImport(args []string) error {
 		fmt.Println("It has arrived quiesced and with the Hermes gateway disabled (single-writer safety gate). Next steps:")
 		fmt.Printf("  1. tx9 enter %s\n", name)
 		fmt.Println("  2. hb resume")
-		fmt.Println("  3. hb gateway-enable --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY")
+		fmt.Printf("  3. tx9 gateway enable %s --confirm-single-writer\n", name)
 		return nil
 	})
 }

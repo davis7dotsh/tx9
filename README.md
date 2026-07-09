@@ -14,6 +14,9 @@ See [docs/tx9-cli-design.md](docs/tx9-cli-design.md) for the full
 design and [docs/docker-architecture.md](docs/docker-architecture.md) for
 the runtime architecture and its verification history.
 
+For a stable HTTPS Executor origin and OAuth callbacks over a tailnet, see
+[Tailscale HTTPS for Executor](docs/tailscale-executor.md).
+
 ## Model
 
 ```text
@@ -25,7 +28,7 @@ tx9 create                      (Go CLI, embedded build assets)
  │  │ claude·codex·hermes   │      │ Executor daemon only    │  │
  │  │ gateway, sudo, free   │      │ dashboard / + MCP /mcp  │  │
  │  │ agent volume = the box│      │ scratch volume          │  │
- │  │ no published ports    │      │ one 0.0.0.0 host port   │  │
+ │  │ no published ports    │      │ one configurable port   │  │
  │  └───────────┬───────────┘      └───┬─────────────────────┘  │
  │              │ http://executor:4788 │ bearer-token gated     │
  │              └── private network ───┘                        │
@@ -66,11 +69,21 @@ hb wire-mcp        # (re)register Executor's authenticated HTTP MCP for claude+c
 hb logs executor
 ```
 
+The host CLI exposes the safe gateway lifecycle directly:
+
+```bash
+tx9 gateway status <box>
+tx9 gateway enable <box> --confirm-single-writer
+tx9 gateway disable <box>
+```
+
 Fresh and restored boxes begin with the Hermes gateway durably disabled so
 setup and migration cannot create a second Discord writer; enabling it is
-always an explicit, confirmed step. Executor runs remotely from the agent's
-perspective (`EXECUTOR_HOST=executor`): `hb` checks reachability and wires
-MCP with the injected bearer token; it never spawns or stops the daemon.
+always an explicit, confirmed step. Do not use `hermes gateway run` as the
+persistent TX9 lifecycle: it is foreground work and exits with its terminal.
+Executor runs remotely from the agent's perspective (`EXECUTOR_HOST=executor`):
+`hb` checks reachability and wires MCP with the injected bearer token; it never
+spawns or stops the daemon.
 
 ## Backup guarantees
 

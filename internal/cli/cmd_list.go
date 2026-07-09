@@ -39,7 +39,7 @@ func cmdList(args []string) error {
 			url := "-"
 			if state == "running" {
 				if port, err := box.HostPort(ctx, cli, &b); err == nil {
-					url = box.DashboardURL(port)
+					url = box.DashboardURL(port, b.ExecutorWebBaseURL)
 				}
 			}
 

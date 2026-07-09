@@ -112,15 +112,23 @@ func TestTailscaleIPRange(t *testing.T) {
 
 func TestDashboardURL(t *testing.T) {
 	t.Setenv("TX9_URL_HOST", "box.example.com")
-	if got := DashboardURL("32768"); got != "http://box.example.com:32768/" {
+	if got := DashboardURL("32768", ""); got != "http://box.example.com:32768/" {
 		t.Errorf("DashboardURL() = %q, want http://box.example.com:32768/", got)
+	}
+	if got := DashboardURL("32768", "https://box.example.ts.net"); got != "https://box.example.ts.net/" {
+		t.Errorf("DashboardURL() = %q, want public HTTPS URL", got)
 	}
 }
 
 func TestOpenURL(t *testing.T) {
 	t.Setenv("TX9_URL_HOST", "box.example.com")
-	got := OpenURL("32768", "sekret")
+	got := OpenURL("32768", "sekret", "")
 	want := "http://box.example.com:32768/?_token=sekret"
+	if got != want {
+		t.Errorf("OpenURL() = %q, want %q", got, want)
+	}
+	got = OpenURL("32768", "secret with spaces", "https://box.example.ts.net")
+	want = "https://box.example.ts.net/?_token=secret+with+spaces"
 	if got != want {
 		t.Errorf("OpenURL() = %q, want %q", got, want)
 	}

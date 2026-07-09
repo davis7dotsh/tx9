@@ -34,10 +34,11 @@ const (
 
 // CreateOpts parameterizes Create.
 type CreateOpts struct {
-	Name    string
-	Image   string // e.g. "tx9-box:dev"
-	Token   string
-	NoStart bool // create network/volumes/containers but do not start them (import path)
+	Name     string
+	Image    string // e.g. "tx9-box:dev"
+	Token    string
+	Executor ExecutorConfig
+	NoStart  bool // create network/volumes/containers but do not start them (import path)
 }
 
 // Create materializes a box's network, volumes, and both containers per the
@@ -88,17 +89,30 @@ func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, err
 	}
 
 	execPort := nat.Port(executorPort)
+	executorEnv := []string{"EXECUTOR_MCP_TOKEN=" + opts.Token}
+	if opts.Executor.WebBaseURL != "" {
+		executorEnv = append(executorEnv, "EXECUTOR_WEB_BASE_URL="+opts.Executor.WebBaseURL)
+	}
+	executorLabels := docker.BoxLabels(name, ver, docker.RoleExecutor)
+	if opts.Executor.WebBaseURL != "" {
+		executorLabels[docker.LabelExecutorWebBaseURL] = opts.Executor.WebBaseURL
+	}
+	publishIP := opts.Executor.PublishIP
+	if publishIP == "" {
+		publishIP = "0.0.0.0"
+	}
 	executorSpec := docker.ContainerSpec{
 		Name:           executorName,
 		Image:          opts.Image,
 		Entrypoint:     []string{"/opt/hermes-box/bin/executor-entrypoint"},
-		Env:            []string{"EXECUTOR_MCP_TOKEN=" + opts.Token},
-		Labels:         docker.BoxLabels(name, ver, docker.RoleExecutor),
+		Env:            executorEnv,
+		Labels:         executorLabels,
 		NetworkID:      netID,
 		NetworkAliases: []string{"executor"},
 		Binds:          []string{execVol + ":/data"},
 		ExposedPorts:   nat.PortSet{execPort: struct{}{}},
-		PortBindings:   nat.PortMap{execPort: []nat.PortBinding{{HostIP: "0.0.0.0", HostPort: ""}}},
+		PortBindings:   nat.PortMap{execPort: []nat.PortBinding{{HostIP: publishIP, HostPort: opts.Executor.PublishPort}}},
+		DNS:            opts.Executor.DNS,
 		Sysctls:        ipv6DisableSysctl,
 		NanoCPUs:       executorNanoCPUs,
 		MemoryBytes:    executorMemoryBytes,
@@ -117,12 +131,13 @@ func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, err
 	}
 
 	b := &Box{
-		Name:          name,
-		AgentID:       agentID,
-		ExecutorID:    executorID,
-		AgentState:    "created",
-		ExecutorState: "created",
-		Version:       ver,
+		Name:               name,
+		AgentID:            agentID,
+		ExecutorID:         executorID,
+		AgentState:         "created",
+		ExecutorState:      "created",
+		ExecutorWebBaseURL: opts.Executor.WebBaseURL,
+		Version:            ver,
 	}
 
 	if !opts.NoStart {

@@ -156,6 +156,7 @@ type ContainerSpec struct {
 	Binds          []string // "volume:/container/path" or "volume:/path:ro"
 	ExposedPorts   nat.PortSet
 	PortBindings   nat.PortMap
+	DNS            []string
 	Sysctls        map[string]string
 	NanoCPUs       int64
 	MemoryBytes    int64
@@ -177,6 +178,7 @@ func (c *Client) ContainerCreate(ctx context.Context, spec ContainerSpec) (strin
 	hostCfg := &container.HostConfig{
 		Binds:        spec.Binds,
 		PortBindings: spec.PortBindings,
+		DNS:          spec.DNS,
 		Sysctls:      spec.Sysctls,
 		Init:         &initEnabled,
 		RestartPolicy: container.RestartPolicy{
