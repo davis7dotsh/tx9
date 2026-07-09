@@ -55,6 +55,16 @@ func TestValidate(t *testing.T) {
 		{"Bad-Case", false},
 		{"-leading-dash", false},
 		{"create", false},
+		{"new", false},
+		{"ls", false},
+		{"shell", false},
+		{"save", false},
+		{"load", false},
+		{"restore", false},
+		{"gateway", false},
+		{"update", false},
+		{"rm", false},
+		{"remove", false},
 		{"way-too-long-name-that-exceeds-the-maximum-length-allowed", false},
 	}
 	for _, c := range cases {

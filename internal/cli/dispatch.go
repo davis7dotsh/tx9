@@ -6,6 +6,7 @@ package cli
 
 import (
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 
@@ -24,57 +25,43 @@ var BuildContext fs.FS
 // itself (i.e. it's exactly what flag.FlagSet.Parse expects).
 type commandFunc func(args []string) error
 
-// commands maps canonical subcommand names to their implementation.
-// Registered in registerCommands below.
+type commandSpec struct {
+	name    string
+	help    string
+	aliases []string
+	run     commandFunc
+}
+
+// commandSpecs is the ordered source of truth for the command surface and
+// aliases shown in help (matches docs/tx9-cli-design.md). registerCommands
+// derives the dispatcher maps from it so aliases cannot drift from help.
+var commandSpecs = []commandSpec{
+	{name: "create", help: "generate/build if needed, create and start a new box", aliases: []string{"new"}, run: cmdCreate},
+	{name: "list", help: "list boxes on this machine (state, image version, dashboard URL)", aliases: []string{"ls"}, run: cmdList},
+	{name: "enter", help: "exec into a box's agent container (--executor for the executor container)", aliases: []string{"ssh", "shell"}, run: cmdEnter},
+	{name: "start", help: "start a stopped box", run: cmdStart},
+	{name: "stop", help: "stop a running box", run: cmdStop},
+	{name: "backup", help: "archive a box to a .tx9 file", aliases: []string{"export", "save"}, run: cmdBackup},
+	{name: "import", help: "restore a box from a .tx9 file", aliases: []string{"load", "restore"}, run: cmdImport},
+	{name: "gateway", help: "status/enable/disable the supervised Hermes gateway", run: cmdGateway},
+	{name: "open", help: "print/open a box's authenticated dashboard URL", run: cmdOpen},
+	{name: "doctor", help: "run health checks against a box", run: cmdDoctor},
+	{name: "upgrade", help: "self-update the CLI, or move a box onto the current image", aliases: []string{"update"}, run: cmdUpgrade},
+	{name: "delete", help: "delete a box's containers, volumes, and state", aliases: []string{"rm", "remove"}, run: cmdDelete},
+	{name: "prune", help: "remove unused tx9-box images and stale state", run: cmdPrune},
+}
+
+// commands and aliases are derived from commandSpecs in registerCommands.
 var commands = map[string]commandFunc{}
-
-// commandOrder lists canonical subcommand names in the order they should
-// appear in help output (matches the command surface table in
-// docs/tx9-cli-design.md).
-var commandOrder = []string{
-	"create", "list", "enter", "start", "stop", "backup", "import",
-	"gateway", "open", "doctor", "upgrade", "delete", "prune",
-}
-
-// commandHelp is a one-line description per canonical command, for help
-// output (matches docs/tx9-cli-design.md's command surface table).
-var commandHelp = map[string]string{
-	"create":  "generate/build if needed, create and start a new box",
-	"list":    "list boxes on this machine (state, image version, dashboard URL)",
-	"enter":   "exec into a box's agent container (alias: ssh; --executor for the executor container)",
-	"start":   "start a stopped box",
-	"stop":    "stop a running box",
-	"backup":  "archive a box to a .tx9 file (alias: export)",
-	"import":  "restore a box from a .tx9 file",
-	"gateway": "status/enable/disable the supervised Hermes gateway",
-	"open":    "print/open a box's authenticated dashboard URL",
-	"doctor":  "run health checks against a box",
-	"upgrade": "self-update the CLI, or move a box onto the current image",
-	"delete":  "delete a box's containers, volumes, and state",
-	"prune":   "remove unused tx9-box images and stale state",
-}
-
-// aliases maps alternate spellings to their canonical command name
-// (decision 4: enter/ssh and backup/export are aliases).
-var aliases = map[string]string{
-	"ssh":    "enter",
-	"export": "backup",
-}
+var aliases = map[string]string{}
 
 func registerCommands() {
-	commands["create"] = cmdCreate
-	commands["list"] = cmdList
-	commands["enter"] = cmdEnter
-	commands["start"] = cmdStart
-	commands["stop"] = cmdStop
-	commands["backup"] = cmdBackup
-	commands["import"] = cmdImport
-	commands["gateway"] = cmdGateway
-	commands["open"] = cmdOpen
-	commands["doctor"] = cmdDoctor
-	commands["upgrade"] = cmdUpgrade
-	commands["delete"] = cmdDelete
-	commands["prune"] = cmdPrune
+	for _, spec := range commandSpecs {
+		commands[spec.name] = spec.run
+		for _, alias := range spec.aliases {
+			aliases[alias] = spec.name
+		}
+	}
 }
 
 func init() {
@@ -122,14 +109,19 @@ func Run(args []string, buildContext fs.FS) int {
 	return 0
 }
 
-func printUsage(w *os.File) {
+func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "tx9 %s — manage hermes boxes\n\n", version.Version)
 	fmt.Fprintln(w, "Usage: tx9 <command> [args]")
 	fmt.Fprintln(w, "\nCommands:")
-	for _, name := range commandOrder {
-		fmt.Fprintf(w, "  %-10s %s\n", name, commandHelp[name])
+	for _, spec := range commandSpecs {
+		fmt.Fprintf(w, "  %-10s %s\n", spec.name, spec.help)
 	}
-	fmt.Fprintln(w, "\nAliases: ssh -> enter, export -> backup")
+	fmt.Fprintln(w, "\nAliases:")
+	for _, spec := range commandSpecs {
+		for _, alias := range spec.aliases {
+			fmt.Fprintf(w, "  %-10s %s\n", alias, spec.name)
+		}
+	}
 	fmt.Fprintln(w, "\nOther:")
 	fmt.Fprintln(w, "  help       show this message")
 	fmt.Fprintln(w, "  version    print the CLI version")

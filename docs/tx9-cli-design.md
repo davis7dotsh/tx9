@@ -26,7 +26,7 @@ tx9 create
 | 1 | Image source | **Embedded assets, local build.** The binary `go:embed`s provision/, guest/, Dockerfile, box.env; first `create` builds the image locally (~10 min, then cached). No registry. |
 | 2 | State home | **`~/.tx9/`** — `boxes/<name>.env` (token cache), `locks/`, `config.toml`. Docker objects are label-tagged so `tx9 list` reconstructs truth from the daemon even if `~/.tx9` is lost. Backups default to **`~/Downloads`**. |
 | 3 | Naming + create UX | Friendly generated names (`large-cat` style) by default, `tx9 create my_box` for explicit. `create` ends with a printed numbered checklist (enter, auth claude/codex, hermes setup, dashboard URL). |
-| 4 | Command surface | See table below. `enter`/`ssh` are aliases; `backup`/`export` are aliases. |
+| 4 | Command surface | See table below. Natural aliases: `new` → `create`, `ls` → `list`, `ssh`/`shell` → `enter`, `export`/`save` → `backup`, `load`/`restore` → `import`, `update` → `upgrade`, and `rm`/`remove` → `delete`. |
 | 5 | Password UX | Precedence: `--password` flag → `TX9_PASSWORD` env → interactive hidden prompt. **`--no-encrypt` escape hatch** for quick local snapshots. |
 | 6 | Archive format | **`.tx9` extension** (tar.gz inside, GPG-wrapped unless --no-encrypt; CLI sniffs which). Embeds box-name metadata; `import` restores under that name, `--name` overrides, collision = hard fail. |
 | 7 | Scope | **Local-only v1.** The CLI drives the local Docker daemon; cross-machine moves are backup → transfer yourself → import. (Remote is a saved future direction — see below.) |
@@ -40,17 +40,17 @@ tx9 create
 
 | Command | Behavior |
 |---|---|
-| `tx9 create [name]` | Generate name if absent. Build `tx9-box:<version>` if missing (with real progress UX). Create network + volumes + both containers, mint token, wire MCP, run doctor. Print getting-started checklist. |
-| `tx9 list` | All boxes on this machine from daemon labels: state (running/stopped/crashed), image version vs CLI version (drift flag), dashboard URL. |
-| `tx9 enter <box>` (alias `ssh`) | Exec into the agent container as `agent`, tmux `main` attach. Starts the box if stopped. |
+| `tx9 create [name]` (alias `new`) | Generate name if absent. Build `tx9-box:<version>` if missing (with real progress UX). Create network + volumes + both containers, mint token, wire MCP, run doctor. Print getting-started checklist. |
+| `tx9 list` (alias `ls`) | All boxes on this machine from daemon labels: state (running/stopped/crashed), image version vs CLI version (drift flag), dashboard URL. |
+| `tx9 enter <box>` (aliases `ssh`, `shell`) | Exec into the agent container as `agent`, tmux `main` attach. Starts the box if stopped. |
 | `tx9 start <box>` / `tx9 stop <box>` | Both containers together. Volumes persist. |
-| `tx9 backup <box>` (alias `export`) | Flags: `--path` (default `~/Downloads`), `--password`/env/prompt, `--no-encrypt`. Quiesce → archive agent /data → validate → (encrypt) → verify → `<box>-<timestamp>.tx9`. |
-| `tx9 import <file.tx9>` | Flags: `--name`, `--password`/env/prompt. Validate before creating anything; restore staged; arrive quiesced + gateway-disabled + fresh token; fail on name collision. |
+| `tx9 backup <box>` (aliases `export`, `save`) | Flags: `--path` (default `~/Downloads`), `--password`/env/prompt, `--no-encrypt`. Quiesce → archive agent /data → validate → (encrypt) → verify → `<box>-<timestamp>.tx9`. |
+| `tx9 import <file.tx9>` (aliases `load`, `restore`) | Flags: `--name`, `--password`/env/prompt. Validate before creating anything; restore staged; arrive quiesced + gateway-disabled + fresh token; fail on name collision. |
 | `tx9 gateway <status\|enable\|disable> <box>` | Inspect or control the container-supervised Hermes gateway. Enable requires `--confirm-single-writer`. |
 | `tx9 open <box>` | Print (or open) the authenticated dashboard URL (`?_token=`). |
 | `tx9 doctor <box>` | In-box `hb doctor` + host-side published-port probe. |
-| `tx9 upgrade [box]` | No args: self-update (re-run installer logic). With box: recreate containers on current image + readiness gate. |
-| `tx9 delete <box>` | Containers + volumes + token file, typed-name confirmation (`--force` to skip). |
+| `tx9 upgrade [box]` (alias `update`) | No args: self-update (re-run installer logic). With box: recreate containers on current image + readiness gate. |
+| `tx9 delete <box>` (aliases `rm`, `remove`) | Containers + volumes + token file, typed-name confirmation (`--force` to skip). |
 | `tx9 prune` | Remove unused `tx9-box:*` image versions and stale state files. |
 
 `create`, `import`, and box-specific `upgrade` accept the shared
