@@ -179,6 +179,24 @@ func TestUpdateNoReleaseYet(t *testing.T) {
 	}
 }
 
+func TestResolveOrigin(t *testing.T) {
+	t.Setenv("TX9_ORIGIN", "")
+	if got := ResolveOrigin(""); got != DefaultOrigin {
+		t.Errorf("ResolveOrigin(\"\") = %q, want DefaultOrigin %q", got, DefaultOrigin)
+	}
+	if got := ResolveOrigin("https://example.com/"); got != "https://example.com" {
+		t.Errorf("ResolveOrigin trailing slash = %q, want %q", got, "https://example.com")
+	}
+
+	t.Setenv("TX9_ORIGIN", "https://mirror.example.com/")
+	if got := ResolveOrigin(""); got != "https://mirror.example.com" {
+		t.Errorf("ResolveOrigin with TX9_ORIGIN = %q, want %q", got, "https://mirror.example.com")
+	}
+	if got := ResolveOrigin("https://override.example.com"); got != "https://override.example.com" {
+		t.Errorf("ResolveOrigin override beats env: got %q", got)
+	}
+}
+
 func TestUpdateRejectsMalformedLatestVersion(t *testing.T) {
 	// A version string that isn't plain X.Y.Z must be rejected before it
 	// reaches a URL path (mirrors install.sh's guard against traversal).

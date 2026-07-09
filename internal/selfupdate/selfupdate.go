@@ -96,13 +96,7 @@ func Update(opts Options) (*Result, error) {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 
-	origin := opts.Origin
-	if origin == "" {
-		origin = DefaultOrigin
-		if env := os.Getenv("TX9_ORIGIN"); env != "" {
-			origin = env
-		}
-	}
+	origin := ResolveOrigin(opts.Origin)
 
 	fmt.Fprintln(out, "tx9: checking latest release...")
 	latest, err := fetchLatestVersion(client, origin)

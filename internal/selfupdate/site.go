@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"os"
 	"regexp"
 	"strings"
 )
@@ -25,6 +26,23 @@ const DefaultOrigin = "https://tx9.col-agents.com"
 // callers should surface this as a clean, actionable message rather than
 // a raw HTTP error.
 var ErrNoRelease = fmt.Errorf("no releases published yet")
+
+// ResolveOrigin returns the release site origin Update uses for a given
+// Options.Origin: the override itself when non-empty, else TX9_ORIGIN,
+// else DefaultOrigin. Trailing slashes are trimmed either way — the site
+// worker routes exact paths, so "https://host//releases/latest" would 404
+// and misread as "no releases". Exported so callers (internal/cli) can
+// name the same origin Update actually queried in their own messages.
+func ResolveOrigin(override string) string {
+	origin := override
+	if origin == "" {
+		origin = DefaultOrigin
+		if env := os.Getenv("TX9_ORIGIN"); env != "" {
+			origin = env
+		}
+	}
+	return strings.TrimRight(origin, "/")
+}
 
 // versionRE mirrors site/src/index.ts's VERSION_RE and install.sh's
 // version check: plain X.Y.Z only. Anything else from /releases/latest is

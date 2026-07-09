@@ -93,7 +93,9 @@ func cmdUpgradeSelf(force bool) error {
 	})
 	if err != nil {
 		if errors.Is(err, selfupdate.ErrNoRelease) {
-			return fmt.Errorf("upgrade: no releases published yet at %s (build from source, or check back after the first release)", selfupdate.DefaultOrigin)
+			// ResolveOrigin("") names the origin Update actually queried
+			// (TX9_ORIGIN or the default), not necessarily DefaultOrigin.
+			return fmt.Errorf("upgrade: no releases published yet at %s (build from source, or check back after the first release)", selfupdate.ResolveOrigin(""))
 		}
 		// ErrDevVersion and everything else already read fine wrapped
 		// plainly; selfupdate's own errors carry their own context.
