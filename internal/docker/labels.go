@@ -3,10 +3,11 @@ package docker
 // Label keys tx9 stamps on every Docker object it creates, so `tx9 list`
 // can reconstruct truth from the daemon even if ~/.tx9 is lost (decision 2).
 const (
-	LabelManaged = "tx9"         // "1" on every tx9-managed object
-	LabelBox     = "tx9.box"     // box name
-	LabelVersion = "tx9.version" // image/CLI version that created the object
-	LabelRole    = "tx9.role"    // "agent" or "executor"
+	LabelManaged            = "tx9"                       // "1" on every tx9-managed object
+	LabelBox                = "tx9.box"                   // box name
+	LabelVersion            = "tx9.version"               // image/CLI version that created the object
+	LabelRole               = "tx9.role"                  // "agent" or "executor"
+	LabelExecutorWebBaseURL = "tx9.executor-web-base-url" // public Executor browser origin
 )
 
 // Roles for LabelRole.

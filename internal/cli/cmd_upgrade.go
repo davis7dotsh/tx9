@@ -28,12 +28,19 @@ import (
 func cmdUpgrade(args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	force := fs.Bool("force", false, "self-update: skip the dev-build guard and reinstall even if already current")
+	executorFlags := addExecutorConfigFlags(fs)
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
 	}
 
 	if fs.NArg() == 0 {
+		if executorFlags.hasOverrides() {
+			return fmt.Errorf("upgrade: executor flags require a box name")
+		}
 		return cmdUpgradeSelf(*force)
+	}
+	if fs.NArg() != 1 {
+		return fmt.Errorf("upgrade: expected at most one box name (usage: tx9 upgrade [box])")
 	}
 	name := fs.Arg(0)
 
@@ -43,6 +50,10 @@ func cmdUpgrade(args []string) error {
 			return fmt.Errorf("upgrade %s: %w", name, err)
 		}
 		fromVersion := b.Version
+		executorConfig, err := executorFlags.load(name)
+		if err != nil {
+			return fmt.Errorf("upgrade %s: %w", name, err)
+		}
 
 		imageTag := fmt.Sprintf("tx9-box:%s", version.Version)
 		if err := ensureBoxImage(ctx, cli, imageTag); err != nil {
@@ -53,6 +64,9 @@ func cmdUpgrade(args []string) error {
 		if err != nil {
 			return fmt.Errorf("upgrade %s: %w", name, err)
 		}
+		if err := box.SaveExecutorConfig(name, tok, executorConfig); err != nil {
+			return fmt.Errorf("upgrade %s: %w", name, err)
+		}
 
 		fmt.Printf("tx9: stopping and removing %s's containers (network/volumes/token kept)\n", name)
 		if err := removeBoxContainers(ctx, cli, b); err != nil {
@@ -60,9 +74,18 @@ func cmdUpgrade(args []string) error {
 		}
 
 		fmt.Printf("tx9: recreating %s on %s\n", name, imageTag)
-		newB, err := box.Create(ctx, cli, box.CreateOpts{Name: name, Image: imageTag, Token: tok})
+		newB, err := box.Create(ctx, cli, box.CreateOpts{
+			Name: name, Image: imageTag, Token: tok, Executor: executorConfig,
+		})
 		if err != nil {
-			return fmt.Errorf("upgrade %s: containers not recreated, box left without them: %w", name, err)
+			// Create returns the box when the containers exist but failed to
+			// start (e.g. a fixed --executor-publish port already bound).
+			// They are labeled, so retrying the upgrade removes and recreates
+			// them; no manual docker cleanup is needed either way.
+			if newB != nil {
+				return fmt.Errorf("upgrade %s: containers recreated but failed to start (fix the cause, then `tx9 start %s` or re-run the upgrade): %w", name, name, err)
+			}
+			return fmt.Errorf("upgrade %s: containers not recreated, box left without them (re-run the upgrade): %w", name, err)
 		}
 
 		fmt.Println("tx9: preparing runtime (executor reachability, MCP wiring, doctor)")

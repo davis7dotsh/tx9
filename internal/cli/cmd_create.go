@@ -20,6 +20,7 @@ import (
 // network + volumes + both containers, mint token, wire MCP, run doctor).
 func cmdCreate(args []string) error {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
+	executorFlags := addExecutorConfigFlags(fs)
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
 	}
@@ -52,6 +53,10 @@ func cmdCreate(args []string) error {
 	} else if err := names.Validate(name); err != nil {
 		return fmt.Errorf("create: %w", err)
 	}
+	executorConfig, err := executorFlags.loadFresh(name)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", name, err)
+	}
 
 	lockPath, err := state.LockPath(name)
 	if err != nil {
@@ -80,12 +85,14 @@ func cmdCreate(args []string) error {
 	if err != nil {
 		return fmt.Errorf("create %s: %w", name, err)
 	}
-	if err := state.WriteBoxEnv(name, map[string]string{"EXECUTOR_MCP_TOKEN": tok}); err != nil {
+	if err := box.SaveExecutorConfig(name, tok, executorConfig); err != nil {
 		return fmt.Errorf("create %s: %w", name, err)
 	}
 
 	fmt.Printf("tx9: creating box %q (agent + executor containers, private network)\n", name)
-	b, err := box.Create(ctx, cli, box.CreateOpts{Name: name, Image: imageTag, Token: tok})
+	b, err := box.Create(ctx, cli, box.CreateOpts{
+		Name: name, Image: imageTag, Token: tok, Executor: executorConfig,
+	})
 	if err != nil {
 		box.Destroy(ctx, cli, name)
 		return fmt.Errorf("create %s: %w", name, err)
@@ -104,9 +111,9 @@ func cmdCreate(args []string) error {
 
 	fmt.Printf("\nBox %q is ready. Next steps:\n", name)
 	fmt.Printf("  1. tx9 enter %s\n", name)
-	fmt.Println("  2. inside the box, authenticate: claude (Claude Code) and codex")
-	fmt.Println("  3. when ready to go live, run (the only path that starts the gateway):")
-	fmt.Println("       hb gateway-enable --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY")
-	fmt.Printf("  4. dashboard: %s (run `tx9 open %s` for an authenticated one-shot URL)\n", box.DashboardURL(port), name)
+	fmt.Println("  2. inside the box, authenticate claude/codex and run: hermes gateway setup")
+	fmt.Println("  3. leave the foreground setup process, then enable TX9's durable gateway from the host:")
+	fmt.Printf("       tx9 gateway enable %s --confirm-single-writer\n", name)
+	fmt.Printf("  4. dashboard: %s (run `tx9 open %s` for an authenticated one-shot URL)\n", box.DashboardURL(port, b.ExecutorWebBaseURL), name)
 	return nil
 }

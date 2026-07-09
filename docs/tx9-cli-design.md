@@ -46,11 +46,17 @@ tx9 create
 | `tx9 start <box>` / `tx9 stop <box>` | Both containers together. Volumes persist. |
 | `tx9 backup <box>` (alias `export`) | Flags: `--path` (default `~/Downloads`), `--password`/env/prompt, `--no-encrypt`. Quiesce → archive agent /data → validate → (encrypt) → verify → `<box>-<timestamp>.tx9`. |
 | `tx9 import <file.tx9>` | Flags: `--name`, `--password`/env/prompt. Validate before creating anything; restore staged; arrive quiesced + gateway-disabled + fresh token; fail on name collision. |
+| `tx9 gateway <status\|enable\|disable> <box>` | Inspect or control the container-supervised Hermes gateway. Enable requires `--confirm-single-writer`. |
 | `tx9 open <box>` | Print (or open) the authenticated dashboard URL (`?_token=`). |
 | `tx9 doctor <box>` | In-box `hb doctor` + host-side published-port probe. |
 | `tx9 upgrade [box]` | No args: self-update (re-run installer logic). With box: recreate containers on current image + readiness gate. |
 | `tx9 delete <box>` | Containers + volumes + token file, typed-name confirmation (`--force` to skip). |
 | `tx9 prune` | Remove unused `tx9-box:*` image versions and stale state files. |
+
+`create`, `import`, and box-specific `upgrade` accept the shared
+`--executor-web-base-url`, `--executor-publish`, and `--executor-dns` options.
+Their resolved values are persisted per box and reused on future upgrades.
+`--clear-executor-config` returns a box to the default dynamic HTTP exposure.
 
 ## Fixed contracts (carried from the verified bash draft)
 
@@ -60,7 +66,8 @@ the port:
 - **Topology**: agent container (no published ports, volume = the box, sudo,
   IPv6 disabled via sysctl) + executor container (daemon only,
   `--hostname 0.0.0.0 --port 4788 --auth-token <token>`, one published
-  0.0.0.0 host port, scratch volume) + per-box private network. Labels
+  host port (all interfaces/automatic by default, optionally fixed and
+  loopback-only), scratch volume) + per-box private network. Labels
   (`tx9=1`, `tx9.box=<name>`, `tx9.version=<v>`) on every object.
 - **Token**: 256-bit random per box, minted at create/import, injected as
   `BOXD_EXECUTOR_TOKEN` (outranks any restored on-disk `executor-mcp.env` —
@@ -72,7 +79,12 @@ the port:
   tar on backup. Restores stage-then-promote in a throwaway container and
   re-arm quiesce + gateway-disabled markers.
 - **Gateway single-writer**: restored boxes never auto-enable the Hermes
-  gateway. `hb gateway-enable --confirm-single-writer …` stays the only path.
+  gateway. `tx9 gateway enable <box> --confirm-single-writer` delegates to
+  `hb gateway-enable` and stays the only host-side path.
+- **Executor public origin**: create/import/upgrade optionally persist an exact
+  `EXECUTOR_WEB_BASE_URL`, fixed host publish address, and container DNS list.
+  This supports HTTPS reverse proxies such as Tailscale Serve without losing
+  the callback origin or proxy target on the next container recreation.
 - **Entrypoints**: agent PID-1 = `hb init` (fail fast) + hb-workload loop
   under docker `--init`; executor PID-1 = foreground daemon. Restart policy
   `unless-stopped`.

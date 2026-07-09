@@ -4,9 +4,12 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/davis7dotsh/tx9/internal/box"
@@ -55,13 +58,50 @@ func cmdDoctor(args []string) error {
 				fmt.Printf("ok   host executor endpoint reachable on port %s\n", port)
 			}
 		}
+		var publicProbeErr error
+		if b.ExecutorWebBaseURL != "" {
+			publicProbeErr = probeExecutorPublicURL(ctx, b.ExecutorWebBaseURL)
+			if publicProbeErr == nil {
+				fmt.Printf("ok   executor public URL reachable at %s\n", b.ExecutorWebBaseURL)
+			}
+		}
 
-		if guestErr != nil || probeErr != nil {
-			return fmt.Errorf("doctor %s: guest=%v host=%v", name, guestErr, probeErr)
+		if guestErr != nil || probeErr != nil || publicProbeErr != nil {
+			return fmt.Errorf("doctor %s: guest=%v host=%v public=%v", name, guestErr, probeErr, publicProbeErr)
 		}
 		fmt.Printf("doctor passed for %s\n", name)
 		return nil
 	})
+}
+
+func probeExecutorPublicURL(ctx context.Context, baseURL string) error {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return fmt.Errorf("executor public URL %q is invalid: %w", baseURL, err)
+	}
+	u.Path = "/api/health"
+	u.RawPath = ""
+	u.RawQuery = ""
+	u.Fragment = ""
+
+	client := &http.Client{Timeout: 10 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("executor public health probe %s: %w", u, err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return fmt.Errorf("executor public health probe %s: %w", u, err)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64))
+	if err != nil {
+		return fmt.Errorf("executor public health probe %s: %w", u, err)
+	}
+	if resp.StatusCode != http.StatusOK || strings.TrimSpace(string(body)) != "ok" {
+		return fmt.Errorf("executor public health probe %s returned status %d body %q", u, resp.StatusCode, strings.TrimSpace(string(body)))
+	}
+	return nil
 }
 
 // probeHostPort mirrors boxd's cmd_doctor host-side retry loop (dossier

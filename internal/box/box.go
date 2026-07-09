@@ -12,8 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"sort"
+	"strings"
 
 	dockernetwork "github.com/docker/docker/api/types/network"
 	dockerclient "github.com/docker/docker/client"
@@ -35,12 +37,13 @@ const executorPort = "4788/tcp"
 // tx9-labeled containers (decision 2, tx9-cli-design.md: ~/.tx9 is a cache,
 // the daemon's labels are the source of truth).
 type Box struct {
-	Name          string
-	AgentID       string // container ID, "" if missing
-	ExecutorID    string
-	AgentState    string // docker state string: running/exited/...
-	ExecutorState string
-	Version       string // tx9.version label value
+	Name               string
+	AgentID            string // container ID, "" if missing
+	ExecutorID         string
+	AgentState         string // docker state string: running/exited/...
+	ExecutorState      string
+	ExecutorWebBaseURL string
+	Version            string // tx9.version label value
 }
 
 // DerivedState collapses AgentState/ExecutorState into one of
@@ -110,6 +113,7 @@ func List(ctx context.Context, cli *docker.Client) ([]Box, error) {
 		case docker.RoleExecutor:
 			b.ExecutorID = c.ID
 			b.ExecutorState = c.State
+			b.ExecutorWebBaseURL = c.Labels[docker.LabelExecutorWebBaseURL]
 		}
 	}
 
@@ -283,15 +287,25 @@ func outboundIP() string {
 // DashboardURL is the box's unauthenticated dashboard URL (no token) —
 // what `tx9 create` prints (dossier §3 step 9): meant to be shared/logged
 // freely.
-func DashboardURL(port string) string {
+func DashboardURL(port, webBaseURL string) string {
+	if webBaseURL != "" {
+		return strings.TrimRight(webBaseURL, "/") + "/"
+	}
 	return fmt.Sprintf("http://%s:%s/", URLHost(), port)
 }
 
 // OpenURL is the box's authenticated dashboard URL, with the bearer token
 // embedded in the query string (dossier §4) — what `tx9 open` prints: a
 // one-shot secret, not meant for logs.
-func OpenURL(port, token string) string {
-	return fmt.Sprintf("http://%s:%s/?_token=%s", URLHost(), port, token)
+func OpenURL(port, token, webBaseURL string) (string, error) {
+	u, err := url.Parse(DashboardURL(port, webBaseURL))
+	if err != nil {
+		return "", fmt.Errorf("box: open URL: configured web base URL %q is invalid: %w", webBaseURL, err)
+	}
+	query := u.Query()
+	query.Set("_token", token)
+	u.RawQuery = query.Encode()
+	return u.String(), nil
 }
 
 // ensureNetwork returns the per-box network's ID, creating it if absent so
