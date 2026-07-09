@@ -1,15 +1,17 @@
 // Package selfupdate implements `tx9 upgrade` with no box argument
-// (docs/tx9-cli-design.md decision 11): it queries GitHub Releases for the
-// latest tagged tx9 release, compares it against the running binary's
-// version, downloads and checksum-verifies the matching platform asset,
-// and atomically replaces the currently running executable.
+// (docs/tx9-cli-design.md decision 11): it queries the tx9 release site
+// (the same origin scripts/install.sh installs from — the GitHub repo is
+// private, so the GitHub API is not usable anonymously) for the latest
+// release version, compares it against the running binary's version,
+// downloads and checksum-verifies the matching platform asset, and
+// atomically replaces the currently running executable.
 //
 // Asset naming (the one invariant shared across this package, the
-// Makefile's `dist` target, and .github/workflows/release.yml):
-// plain, uncompressed executables named "tx9_<GOOS>_<GOARCH>" (see
-// AssetName), plus a "checksums.txt" asset in `sha256sum` output format
-// (see ParseChecksums). Changing this naming means changing it in all
-// three places.
+// Makefile's `dist` target, scripts/install.sh, site/src/index.ts, and
+// .depot/workflows/release.yml): plain, uncompressed executables named
+// "tx9_<GOOS>_<GOARCH>" (see AssetName), plus a "checksums.txt" asset in
+// `sha256sum` output format (see ParseChecksums). Changing this naming
+// means changing it everywhere.
 package selfupdate
 
 import (
@@ -36,11 +38,15 @@ type Options struct {
 	// Force skips the dev-version guard and the already-up-to-date
 	// short-circuit, and re-installs even the same version.
 	Force bool
+	// Origin overrides the release site origin. Zero value means
+	// DefaultOrigin, unless TX9_ORIGIN is set (same override install.sh
+	// honors).
+	Origin string
 	// GOOS/GOARCH override runtime.GOOS/GOARCH. Tests only; zero value
 	// means "use the running binary's platform".
 	GOOS, GOARCH string
-	// HTTPClient overrides the default client used for both the GitHub
-	// API call and the asset downloads. Tests only; zero value means
+	// HTTPClient overrides the default client used for both the version
+	// check and the asset downloads. Tests only; zero value means
 	// "use a client with a sane timeout".
 	HTTPClient *http.Client
 	// Out receives human-readable progress lines. Defaults to io.Discard.
@@ -59,7 +65,7 @@ type Result struct {
 	Applied bool
 	// FromVersion is the version that was running before Update was called.
 	FromVersion string
-	// ToVersion is the release tag_name (with leading "v" kept as published).
+	// ToVersion is the latest release version, plain "X.Y.Z".
 	ToVersion string
 	// InstalledPath is the executable path that was replaced. Empty when
 	// Applied is false.
@@ -90,14 +96,16 @@ func Update(opts Options) (*Result, error) {
 		client = &http.Client{Timeout: 30 * time.Second}
 	}
 
+	origin := ResolveOrigin(opts.Origin)
+
 	fmt.Fprintln(out, "tx9: checking latest release...")
-	rel, err := FetchLatestRelease(client)
+	latest, err := fetchLatestVersion(client, origin)
 	if err != nil {
 		return nil, err
 	}
 
-	if !opts.Force && SameVersion(opts.CurrentVersion, rel.TagName) {
-		return &Result{Applied: false, FromVersion: opts.CurrentVersion, ToVersion: rel.TagName}, nil
+	if !opts.Force && SameVersion(opts.CurrentVersion, latest) {
+		return &Result{Applied: false, FromVersion: opts.CurrentVersion, ToVersion: latest}, nil
 	}
 
 	goos, goarch := opts.GOOS, opts.GOARCH
@@ -109,14 +117,12 @@ func Update(opts Options) (*Result, error) {
 	}
 	assetName := AssetName(goos, goarch)
 
-	asset, ok := rel.FindAsset(assetName)
-	if !ok {
-		return nil, fmt.Errorf("selfupdate: release %s has no asset named %q (have: %s)", rel.TagName, assetName, rel.assetNames())
-	}
-	checksumsAsset, ok := rel.FindAsset(checksumsAssetName)
-	if !ok {
-		return nil, fmt.Errorf("selfupdate: release %s is missing %s, can't verify %q", rel.TagName, checksumsAssetName, assetName)
-	}
+	// Versioned paths are immutable on the site, so resolve the version
+	// once and download both objects from it — a release published between
+	// the two requests can't mismatch the checksums against the binary.
+	baseURL := fmt.Sprintf("%s/releases/%s", origin, latest)
+	assetURL := baseURL + "/" + assetName
+	checksumsURL := baseURL + "/" + checksumsAssetName
 
 	// Resolve the running executable's real path before touching the
 	// network for the (larger) binary asset, so a broken install layout
@@ -133,8 +139,8 @@ func Update(opts Options) (*Result, error) {
 		}
 	}
 
-	fmt.Fprintf(out, "tx9: fetching checksums for %s...\n", rel.TagName)
-	checksumsData, err := fetchBytes(client, checksumsAsset.BrowserDownloadURL)
+	fmt.Fprintf(out, "tx9: fetching checksums for %s...\n", latest)
+	checksumsData, err := fetchBytes(client, checksumsURL)
 	if err != nil {
 		return nil, fmt.Errorf("selfupdate: download %s: %w", checksumsAssetName, err)
 	}
@@ -144,12 +150,12 @@ func Update(opts Options) (*Result, error) {
 	}
 	wantDigest, ok := sums[assetName]
 	if !ok {
-		return nil, fmt.Errorf("selfupdate: %s has no checksum entry for %q", checksumsAssetName, assetName)
+		return nil, fmt.Errorf("selfupdate: %s has no checksum entry for %q (unsupported platform?)", checksumsAssetName, assetName)
 	}
 
 	stagePath := realPath + ".new"
-	fmt.Fprintf(out, "tx9: downloading %s %s -> %s\n", assetName, rel.TagName, stagePath)
-	gotDigest, err := downloadToFile(client, asset.BrowserDownloadURL, stagePath)
+	fmt.Fprintf(out, "tx9: downloading %s %s -> %s\n", assetName, latest, stagePath)
+	gotDigest, err := downloadToFile(client, assetURL, stagePath)
 	if err != nil {
 		os.Remove(stagePath)
 		return nil, fmt.Errorf("selfupdate: download %s: %w", assetName, err)
@@ -173,11 +179,11 @@ func Update(opts Options) (*Result, error) {
 		return nil, fmt.Errorf("selfupdate: install new binary at %s: %w (old binary untouched)", realPath, err)
 	}
 
-	fmt.Fprintf(out, "tx9: installed %s at %s\n", rel.TagName, realPath)
+	fmt.Fprintf(out, "tx9: installed %s at %s\n", latest, realPath)
 	return &Result{
 		Applied:       true,
 		FromVersion:   opts.CurrentVersion,
-		ToVersion:     rel.TagName,
+		ToVersion:     latest,
 		InstalledPath: realPath,
 	}, nil
 }

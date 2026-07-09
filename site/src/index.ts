@@ -1,6 +1,7 @@
 // tx9.col-agents.com — homepage, `curl | sh` installer, and release downloads.
 //
-// URL surface (shared contract with scripts/install.sh — change both):
+// URL surface (shared contract with scripts/install.sh and
+// internal/selfupdate — change all of them together):
 //   GET /                                homepage (static asset)
 //   GET /install                         scripts/install.sh, as text
 //   GET /releases/latest                 current version string, text/plain

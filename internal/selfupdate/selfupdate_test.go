@@ -3,7 +3,6 @@ package selfupdate
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -13,68 +12,39 @@ import (
 	"testing"
 )
 
-// newTestServer serves a fake GitHub releases API + asset downloads for
-// one release. assetContent is the payload for the platform binary asset
-// named tx9_<goos>_<goarch>; checksums.txt is generated to match it.
-func newTestServer(t *testing.T, tag, goos, goarch string, assetContent []byte) *httptest.Server {
+// newTestServer serves a fake release site (site/src/index.ts's URL
+// contract) for one release. assetContent is the payload for the platform
+// binary asset named tx9_<goos>_<goarch>; checksums.txt is generated to
+// match it.
+func newTestServer(t *testing.T, version, goos, goarch string, assetContent []byte) *httptest.Server {
 	t.Helper()
 	assetName := AssetName(goos, goarch)
 	sum := sha256.Sum256(assetContent)
 	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), assetName)
 
 	mux := http.NewServeMux()
-	var srv *httptest.Server
-	mux.HandleFunc("/repos/"+Repo+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
-		rel := Release{
-			TagName: tag,
-			Assets: []Asset{
-				{Name: assetName, BrowserDownloadURL: srv.URL + "/download/" + assetName},
-				{Name: checksumsAssetName, BrowserDownloadURL: srv.URL + "/download/" + checksumsAssetName},
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(rel)
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s\n", version)
 	})
-	mux.HandleFunc("/download/"+assetName, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/releases/"+version+"/"+assetName, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write(assetContent)
 	})
-	mux.HandleFunc("/download/"+checksumsAssetName, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/releases/"+version+"/"+checksumsAssetName, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(checksums))
 	})
-	srv = httptest.NewServer(mux)
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
 }
 
-// apiURLClient points FetchLatestRelease's github.com/api URL at our test
-// server by overriding the transport's DialContext... Instead of faking
-// DNS, selfupdate.go builds the URL from the Repo constant against a fixed
-// host, so tests use a small indirection: an http.Client whose Transport
-// rewrites api.github.com requests to the test server.
-type rewriteTransport struct {
-	target string
-	rt     http.RoundTripper
-}
-
-func (rt rewriteTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req.URL.Host == "api.github.com" {
-		req.URL.Scheme = "http"
-		req.URL.Host = rt.target[len("http://"):]
-	}
-	return rt.rt.RoundTrip(req)
-}
-
-func clientFor(srv *httptest.Server) *http.Client {
-	return &http.Client{Transport: rewriteTransport{target: srv.URL, rt: http.DefaultTransport}}
-}
-
 func TestUpdateAlreadyUpToDate(t *testing.T) {
-	srv := newTestServer(t, "v1.2.3", "linux", "amd64", []byte("binary contents"))
+	srv := newTestServer(t, "1.2.3", "linux", "amd64", []byte("binary contents"))
 	res, err := Update(Options{
 		CurrentVersion: "1.2.3",
+		Origin:         srv.URL,
 		GOOS:           "linux",
 		GOARCH:         "amd64",
-		HTTPClient:     clientFor(srv),
+		HTTPClient:     srv.Client(),
 	})
 	if err != nil {
 		t.Fatalf("Update: %v", err)
@@ -93,7 +63,7 @@ func TestUpdateDevVersionRefusesWithoutForce(t *testing.T) {
 
 func TestUpdateDownloadsVerifiesAndReplaces(t *testing.T) {
 	content := []byte("new binary contents v1.2.4")
-	srv := newTestServer(t, "v1.2.4", "linux", "amd64", content)
+	srv := newTestServer(t, "1.2.4", "linux", "amd64", content)
 
 	dir := t.TempDir()
 	exePath := filepath.Join(dir, "tx9")
@@ -103,9 +73,10 @@ func TestUpdateDownloadsVerifiesAndReplaces(t *testing.T) {
 
 	opts := Options{
 		CurrentVersion:   "1.2.3",
+		Origin:           srv.URL,
 		GOOS:             "linux",
 		GOARCH:           "amd64",
-		HTTPClient:       clientFor(srv),
+		HTTPClient:       srv.Client(),
 		execPathOverride: exePath,
 	}
 	res, err := Update(opts)
@@ -115,8 +86,8 @@ func TestUpdateDownloadsVerifiesAndReplaces(t *testing.T) {
 	if !res.Applied {
 		t.Fatal("Update: Applied = false, want true")
 	}
-	if res.ToVersion != "v1.2.4" {
-		t.Errorf("Update: ToVersion = %q, want v1.2.4", res.ToVersion)
+	if res.ToVersion != "1.2.4" {
+		t.Errorf("Update: ToVersion = %q, want 1.2.4", res.ToVersion)
 	}
 	if res.InstalledPath != exePath {
 		t.Errorf("Update: InstalledPath = %q, want %q", res.InstalledPath, exePath)
@@ -154,32 +125,24 @@ func TestUpdateChecksumMismatchLeavesOldBinaryUntouched(t *testing.T) {
 	assetName := AssetName("linux", "amd64")
 	badChecksum := strings.Repeat("0", 64)
 	mux := http.NewServeMux()
-	var srv *httptest.Server
-	mux.HandleFunc("/repos/"+Repo+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
-		rel := Release{
-			TagName: "v1.2.4",
-			Assets: []Asset{
-				{Name: assetName, BrowserDownloadURL: srv.URL + "/download/" + assetName},
-				{Name: checksumsAssetName, BrowserDownloadURL: srv.URL + "/download/checksums.txt"},
-			},
-		}
-		w.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(w).Encode(rel)
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "1.2.4")
 	})
-	mux.HandleFunc("/download/"+assetName, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/releases/1.2.4/"+assetName, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte("new binary contents"))
 	})
-	mux.HandleFunc("/download/checksums.txt", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/releases/1.2.4/"+checksumsAssetName, func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(badChecksum + "  " + assetName + "\n"))
 	})
-	srv = httptest.NewServer(mux)
+	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
 	_, err := Update(Options{
 		CurrentVersion:   "1.2.3",
+		Origin:           srv.URL,
 		GOOS:             "linux",
 		GOARCH:           "amd64",
-		HTTPClient:       clientFor(srv),
+		HTTPClient:       srv.Client(),
 		execPathOverride: exePath,
 	})
 	if err == nil {
@@ -200,7 +163,7 @@ func TestUpdateChecksumMismatchLeavesOldBinaryUntouched(t *testing.T) {
 
 func TestUpdateNoReleaseYet(t *testing.T) {
 	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/"+Repo+"/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusNotFound)
 	})
 	srv := httptest.NewServer(mux)
@@ -208,9 +171,48 @@ func TestUpdateNoReleaseYet(t *testing.T) {
 
 	_, err := Update(Options{
 		CurrentVersion: "1.2.3",
-		HTTPClient:     clientFor(srv),
+		Origin:         srv.URL,
+		HTTPClient:     srv.Client(),
 	})
 	if err != ErrNoRelease {
 		t.Fatalf("Update: err = %v, want ErrNoRelease", err)
+	}
+}
+
+func TestResolveOrigin(t *testing.T) {
+	t.Setenv("TX9_ORIGIN", "")
+	if got := ResolveOrigin(""); got != DefaultOrigin {
+		t.Errorf("ResolveOrigin(\"\") = %q, want DefaultOrigin %q", got, DefaultOrigin)
+	}
+	if got := ResolveOrigin("https://example.com/"); got != "https://example.com" {
+		t.Errorf("ResolveOrigin trailing slash = %q, want %q", got, "https://example.com")
+	}
+
+	t.Setenv("TX9_ORIGIN", "https://mirror.example.com/")
+	if got := ResolveOrigin(""); got != "https://mirror.example.com" {
+		t.Errorf("ResolveOrigin with TX9_ORIGIN = %q, want %q", got, "https://mirror.example.com")
+	}
+	if got := ResolveOrigin("https://override.example.com"); got != "https://override.example.com" {
+		t.Errorf("ResolveOrigin override beats env: got %q", got)
+	}
+}
+
+func TestUpdateRejectsMalformedLatestVersion(t *testing.T) {
+	// A version string that isn't plain X.Y.Z must be rejected before it
+	// reaches a URL path (mirrors install.sh's guard against traversal).
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintln(w, "../secrets")
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	_, err := Update(Options{
+		CurrentVersion: "1.2.3",
+		Origin:         srv.URL,
+		HTTPClient:     srv.Client(),
+	})
+	if err == nil || !strings.Contains(err.Error(), "unexpected version string") {
+		t.Fatalf("Update: err = %v, want unexpected-version-string error", err)
 	}
 }

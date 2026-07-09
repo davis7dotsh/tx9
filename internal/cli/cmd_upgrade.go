@@ -22,7 +22,7 @@ import (
 // network/volumes) and run the same readiness gate `create` uses.
 //
 // With no argument: self-update the tx9 binary itself (internal/selfupdate,
-// tx9-cli-design.md decision 11) — query GitHub Releases, download +
+// tx9-cli-design.md decision 11) — query the tx9 release site, download +
 // checksum-verify the matching asset, and atomically replace the running
 // executable.
 func cmdUpgrade(args []string) error {
@@ -93,7 +93,9 @@ func cmdUpgradeSelf(force bool) error {
 	})
 	if err != nil {
 		if errors.Is(err, selfupdate.ErrNoRelease) {
-			return fmt.Errorf("upgrade: no releases published yet for %s (build from source, or check back after the first release)", selfupdate.Repo)
+			// ResolveOrigin("") names the origin Update actually queried
+			// (TX9_ORIGIN or the default), not necessarily DefaultOrigin.
+			return fmt.Errorf("upgrade: no releases published yet at %s (build from source, or check back after the first release)", selfupdate.ResolveOrigin(""))
 		}
 		// ErrDevVersion and everything else already read fine wrapped
 		// plainly; selfupdate's own errors carry their own context.
