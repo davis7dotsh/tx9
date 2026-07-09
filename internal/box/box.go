@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
 	"os"
 	"sort"
 
@@ -216,18 +217,67 @@ func HostPort(ctx context.Context, cli *docker.Client, b *Box) (string, error) {
 	return bindings[0].HostPort, nil
 }
 
-// URLHost returns the hostname tx9 prints in dashboard/open URLs:
-// TX9_URL_HOST env override, falling back to the machine's own hostname
-// (dossier §3/§4 used a hardcoded siva.davis7.space default; tx9 makes this
-// configurable per-install instead).
+// URLHost returns the host tx9 prints in dashboard/open URLs: TX9_URL_HOST
+// env override, then the machine's Tailscale IP when tailscale is set up,
+// then the machine's primary LAN IP, then hostname. IPs beat hostnames here
+// because these URLs are opened from other machines, where a bare hostname
+// often doesn't resolve.
 func URLHost() string {
 	if h := os.Getenv("TX9_URL_HOST"); h != "" {
 		return h
+	}
+	if ip := tailscaleIP(); ip != "" {
+		return ip
+	}
+	if ip := outboundIP(); ip != "" {
+		return ip
 	}
 	if h, err := os.Hostname(); err == nil && h != "" {
 		return h
 	}
 	return "localhost"
+}
+
+// tailscaleCGNAT is the 100.64.0.0/10 range Tailscale assigns node IPs from.
+var tailscaleCGNAT = net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+
+// tailscaleIP returns this machine's Tailscale IPv4 address, or "" when no
+// interface carries one. Detected by address range rather than by shelling
+// out to the tailscale CLI, so it works regardless of how tailscaled was
+// installed.
+func tailscaleIP() string {
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return ""
+	}
+	for _, addr := range addrs {
+		ipnet, ok := addr.(*net.IPNet)
+		if !ok {
+			continue
+		}
+		ip4 := ipnet.IP.To4()
+		if ip4 != nil && tailscaleCGNAT.Contains(ip4) {
+			return ip4.String()
+		}
+	}
+	return ""
+}
+
+// outboundIP returns the machine's primary IPv4 address — the source address
+// the kernel picks for outbound traffic. The UDP "connection" never sends a
+// packet; it only runs route selection, which is exactly the answer we want
+// (and skips loopback and docker bridge addresses that a plain interface
+// scan couldn't tell apart from the real LAN address).
+func outboundIP() string {
+	conn, err := net.Dial("udp4", "192.0.2.1:9") // TEST-NET-1, never routed
+	if err != nil {
+		return ""
+	}
+	defer conn.Close()
+	if addr, ok := conn.LocalAddr().(*net.UDPAddr); ok && addr.IP.To4() != nil {
+		return addr.IP.String()
+	}
+	return ""
 }
 
 // DashboardURL is the box's unauthenticated dashboard URL (no token) —

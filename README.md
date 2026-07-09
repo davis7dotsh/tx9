@@ -9,8 +9,8 @@ validated backup archive.
 **Status: experiment, mid-transition.** The bash prototypes (smolvm `./box`
 and the compose `./docker/boxd`) have been retired in favor of a Go CLI
 (`tx9`, this repo, embedding its provisioning and guest assets) that is now
-implemented and under active development — still experimental, not yet
-released. See [docs/tx9-cli-design.md](docs/tx9-cli-design.md) for the full
+implemented, released, and under active development, though still experimental.
+See [docs/tx9-cli-design.md](docs/tx9-cli-design.md) for the full
 design and [docs/docker-architecture.md](docs/docker-architecture.md) for
 the runtime architecture and its verification history.
 
@@ -43,7 +43,7 @@ tools require internet access.
 
 | Path | Role |
 |---|---|
-| `box.env` | Build/runtime configuration: tool pins, Hermes installer SHA pin, feature flags |
+| `box.env` | Build/runtime configuration: tool versions/channels and feature flags |
 | `site/` | Cloudflare Worker for tx9.col-agents.com: homepage, `/install` script, release downloads from R2 |
 | `provision/provision.sh` | Runs inside `docker build` (`tools` + `assets` layers); installs everything |
 | `guest/` | In-box runtime: `hb` control CLI, `hb-workload` reconcile loop, `hermes-state` validator, profiles, tmux config |
@@ -87,12 +87,7 @@ and rewire MCP automatically.
 
 ```bash
 make check          # syntax + shellcheck + static contracts + regressions; hermetic
-make check-hermes-pin   # network: compare HERMES_INSTALLER_SHA256 against upstream
 ```
 
 `.depot/workflows/check.yml` runs `make check` on every push and pull request
 to `main` via Depot CI.
-
-If an image build fails with "Hermes installer checksum verification failed",
-upstream rotated `install.sh` since the pin: run `make check-hermes-pin`,
-review the new installer, then update `box.env` yourself.

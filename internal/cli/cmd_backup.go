@@ -34,6 +34,12 @@ var tarExclusions = []string{
 	"./home/agent/.config/hermes-box/quiesced",
 	"./home/agent/.codex/tmp",
 	"./home/agent/.hermes/tmp",
+	// Self-update launcher symlinks (claude update, codex update). Their
+	// targets are absolute — which the archive validator refuses — and
+	// point at either image content (/opt) or a versioned path that the
+	// next self-update in the restored box recreates anyway.
+	"./home/agent/.local/bin/claude",
+	"./home/agent/.local/bin/codex",
 	"*/node_modules",
 	"*/.venv",
 	"*/venv",

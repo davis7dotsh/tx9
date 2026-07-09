@@ -414,6 +414,7 @@ write_manifest() {
     printf 'created_at=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
     printf 'base_image=%s\n' "${BASE_IMAGE:-unknown}"
     printf 'node=%s\n' "$(node --version 2>/dev/null || echo missing)"
+    printf 'vp=%s\n' "$(vp --version 2>/dev/null | sed -n 1p || echo missing)"
     printf 'claude=%s\n' "$(claude --version 2>/dev/null || echo missing)"
     printf 'codex=%s\n' "$(codex --version 2>/dev/null || echo missing)"
     printf 'hermes=%s\n' "$(hermes --version 2>/dev/null | head -1 || echo missing)"
@@ -447,6 +448,9 @@ status() {
 
 versions() {
   echo "node:     $(node --version 2>/dev/null || echo -)"
+  # sed -n 1p, not head -1: vp prints more after the version line, and head
+  # exiting early SIGPIPEs it — under pipefail that fails the whole pipeline.
+  echo "vp:       $(vp --version 2>/dev/null | sed -n 1p || echo -)"
   echo "uv:       $(uv --version 2>/dev/null || echo -)"
   echo "nvim:     $(nvim --version 2>/dev/null | head -1 || echo -)"
   echo "claude:   $(claude --version 2>/dev/null || echo -)"
@@ -476,7 +480,7 @@ _mcp_auth_works() {
 
 doctor() {
   local failed=0 cmd
-  for cmd in node uv nvim claude codex; do
+  for cmd in node vp uv nvim claude codex; do
     _check "$cmd installed" _command_exists "$cmd" || failed=1
   done
   if [[ "${INSTALL_HERMES:-0}" == 1 ]]; then _check "hermes installed" _command_exists hermes || failed=1; fi

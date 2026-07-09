@@ -61,9 +61,19 @@ grep -q '\. "$BOX_ENV"' guest/hb-workload
 grep -q '_stop_executor_bridge' guest/hb-workload
 
 # --- provisioning / config invariants ------------------------------------
-grep -q 'HERMES_INSTALLER_SHA256="[0-9a-f]\{64\}"' box.env
 grep -q 'tools) tools_only ;;' provision/provision.sh
 grep -q 'assets) assets_only ;;' provision/provision.sh
+# Node/npm come from Vite+ (managed LTS); claude and codex use their native
+# installers, not npm globals.
+grep -q 'vite-plus' guest/profile.sh
+grep -q 'env default lts' provision/provision.sh
+grep -q 'claude.ai/install.sh' provision/provision.sh
+grep -q 'chatgpt.com/codex/install.sh' provision/provision.sh
+grep -Fq -- '--dir | --dir=* | --hermes-home' provision/provision.sh
+if grep -q 'npm install -g' provision/provision.sh; then
+  echo "provision.sh still installs npm globals directly (use vp install -g)" >&2
+  exit 1
+fi
 
 # --- docker build assets --------------------------------------------------
 grep -q 'provision.sh tools' docker/Dockerfile

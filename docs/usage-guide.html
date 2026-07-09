@@ -38,7 +38,7 @@ smolvm machine ls</code></pre>
       <h3>1. Create and verify a box</h3>
       <pre><code>./box new alpha
 ./box doctor alpha</code></pre>
-      <p>Creation boots Ubuntu with configurable CPU, memory, and a 64 GiB default overlay, installs the toolchain and a full-SHA-pinned Hermes checkout, starts Executor, registers its authenticated HTTP MCP endpoint with Claude and Codex, and runs health checks. Hermes begins durably disabled until setup or a migration cutover is complete.</p>
+      <p>Creation boots Ubuntu with configurable CPU, memory, and a 64 GiB default overlay, installs the toolchain and the latest Hermes release through its official installer, starts Executor, registers its authenticated HTTP MCP endpoint with Claude and Codex, and runs health checks. Hermes begins durably disabled until setup or a migration cutover is complete.</p>
 
       <h3>2. Enter and authenticate</h3>
       <pre><code>./box enter alpha</code></pre>
@@ -102,7 +102,7 @@ hb cutover-ready</code></pre>
         <span class="ico" aria-hidden="true">!</span>
         <div class="body">
           <div class="title">Backups preserve state, not an exact machine</div>
-          <p>Hermes is pinned by full Git SHA and can be seeded from an ignored local Git bundle for a custom Eventide commit. Other OS and tool packages can still drift; this remains a state backup, not an offline VM image.</p>
+          <p>Hermes and the other tools are installed independently of box state and can change between image builds. This remains a state backup, not an offline VM image.</p>
         </div>
       </div>
     </section>
@@ -114,7 +114,7 @@ hb cutover-ready</code></pre>
       <p>Doctor performs a bounded, authenticated MCP handshake through the guest-local endpoint and, when web exposure is enabled, the forwarded host endpoint. It uses jq to validate the HTTP 200 JSON <code>initialize</code> result, negotiated protocol version, response content type, and session ID, sends the initialized notification, then closes the session best-effort. A bare listener, malformed result, 404, or HTTP 500 response fails health. Without an exposed port, doctor reports the host check as skipped.</p>
       <p>If managed tools, profiles, or MCP wiring need repair, re-run provisioning:</p>
       <pre><code>./box repair alpha</code></pre>
-      <p>Repair quiesces Hermes and Executor, refreshes packages and repository-owned guest assets, checks out the configured Hermes SHA exactly, resumes the prior service policy, repairs MCP wiring, and runs the doctor.</p>
+      <p>Repair quiesces Hermes and Executor, refreshes packages and repository-owned guest assets, preserves the installed Hermes layout, resumes the prior service policy, repairs MCP wiring, and runs the doctor.</p>
 
       <h3>Remove a box safely</h3>
       <pre><code>./box rm alpha</code></pre>
@@ -170,8 +170,8 @@ hb cutover-ready</code></pre>
       <h3>A restore fails before VM creation</h3>
       <p>The passphrase may be incorrect, or the decrypted archive may be corrupt or unsafe. This failure intentionally occurs before provisioning so it does not leave an orphan VM.</p>
 
-      <h3><code>box new</code> fails with a Hermes installer checksum error</h3>
-      <p>Upstream has rotated <code>install.sh</code> since <code>HERMES_INSTALLER_SHA256</code> in <code>box.env</code> was last pinned. Run <code>make check-hermes-pin</code> to confirm the drift and see the current upstream hash, review the new installer, then update <code>box.env</code> yourself.</p>
+      <h3><code>box new</code> fails while installing Hermes</h3>
+      <p>Provisioning uses Hermes's current official installer. Check the installer output and upstream release status, then retry once any upstream or network failure is resolved.</p>
 
       <h3>Validate the repository</h3>
       <pre><code>make check</code></pre>
