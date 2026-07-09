@@ -60,7 +60,7 @@ func cmdDoctor(args []string) error {
 		}
 		var publicProbeErr error
 		if b.ExecutorWebBaseURL != "" {
-			publicProbeErr = probeExecutorPublicURL(b.ExecutorWebBaseURL)
+			publicProbeErr = probeExecutorPublicURL(ctx, b.ExecutorWebBaseURL)
 			if publicProbeErr == nil {
 				fmt.Printf("ok   executor public URL reachable at %s\n", b.ExecutorWebBaseURL)
 			}
@@ -74,7 +74,7 @@ func cmdDoctor(args []string) error {
 	})
 }
 
-func probeExecutorPublicURL(baseURL string) error {
+func probeExecutorPublicURL(ctx context.Context, baseURL string) error {
 	u, err := url.Parse(baseURL)
 	if err != nil {
 		return fmt.Errorf("executor public URL %q is invalid: %w", baseURL, err)
@@ -85,7 +85,11 @@ func probeExecutorPublicURL(baseURL string) error {
 	u.Fragment = ""
 
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(u.String())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return fmt.Errorf("executor public health probe %s: %w", u, err)
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		return fmt.Errorf("executor public health probe %s: %w", u, err)
 	}

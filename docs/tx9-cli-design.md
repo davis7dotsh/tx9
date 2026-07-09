@@ -46,7 +46,7 @@ tx9 create
 | `tx9 start <box>` / `tx9 stop <box>` | Both containers together. Volumes persist. |
 | `tx9 backup <box>` (alias `export`) | Flags: `--path` (default `~/Downloads`), `--password`/env/prompt, `--no-encrypt`. Quiesce → archive agent /data → validate → (encrypt) → verify → `<box>-<timestamp>.tx9`. |
 | `tx9 import <file.tx9>` | Flags: `--name`, `--password`/env/prompt. Validate before creating anything; restore staged; arrive quiesced + gateway-disabled + fresh token; fail on name collision. |
-| `tx9 gateway <status|enable|disable> <box>` | Inspect or control the container-supervised Hermes gateway. Enable requires `--confirm-single-writer`. |
+| `tx9 gateway <status\|enable\|disable> <box>` | Inspect or control the container-supervised Hermes gateway. Enable requires `--confirm-single-writer`. |
 | `tx9 open <box>` | Print (or open) the authenticated dashboard URL (`?_token=`). |
 | `tx9 doctor <box>` | In-box `hb doctor` + host-side published-port probe. |
 | `tx9 upgrade [box]` | No args: self-update (re-run installer logic). With box: recreate containers on current image + readiness gate. |

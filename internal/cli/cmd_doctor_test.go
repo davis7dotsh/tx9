@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -15,7 +16,7 @@ func TestProbeExecutorPublicURL(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := probeExecutorPublicURL(server.URL); err != nil {
+	if err := probeExecutorPublicURL(context.Background(), server.URL); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -26,7 +27,7 @@ func TestProbeExecutorPublicURLRejectsBadHealth(t *testing.T) {
 	}))
 	defer server.Close()
 
-	if err := probeExecutorPublicURL(server.URL); err == nil {
+	if err := probeExecutorPublicURL(context.Background(), server.URL); err == nil {
 		t.Fatal("expected health probe error")
 	}
 }

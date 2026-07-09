@@ -122,12 +122,18 @@ func TestDashboardURL(t *testing.T) {
 
 func TestOpenURL(t *testing.T) {
 	t.Setenv("TX9_URL_HOST", "box.example.com")
-	got := OpenURL("32768", "sekret", "")
+	got, err := OpenURL("32768", "sekret", "")
+	if err != nil {
+		t.Fatal(err)
+	}
 	want := "http://box.example.com:32768/?_token=sekret"
 	if got != want {
 		t.Errorf("OpenURL() = %q, want %q", got, want)
 	}
-	got = OpenURL("32768", "secret with spaces", "https://box.example.ts.net")
+	got, err = OpenURL("32768", "secret with spaces", "https://box.example.ts.net")
+	if err != nil {
+		t.Fatal(err)
+	}
 	want = "https://box.example.ts.net/?_token=secret+with+spaces"
 	if got != want {
 		t.Errorf("OpenURL() = %q, want %q", got, want)

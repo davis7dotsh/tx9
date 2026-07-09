@@ -42,9 +42,15 @@ func cmdGateway(args []string) error {
 		if b.AgentState != "running" {
 			return fmt.Errorf("gateway %s %s: agent container is not running; run: tx9 start %s", action, name, name)
 		}
+		// status and disable never talk to the executor, so they must keep
+		// working on a box whose host-side token cache is missing — disable
+		// especially, since it's the recovery path.
 		token, err := box.Token(name)
 		if err != nil {
-			return fmt.Errorf("gateway %s %s: %w", action, name, err)
+			if action == "enable" {
+				return fmt.Errorf("gateway %s %s: %w", action, name, err)
+			}
+			token = ""
 		}
 		for _, hbArgs := range hbCommands {
 			if err := box.HB(ctx, cli, b, token, os.Stdout, os.Stderr, hbArgs...); err != nil {

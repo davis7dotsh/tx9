@@ -38,6 +38,8 @@ func TestParseExecutorConfigRejectsInvalidValues(t *testing.T) {
 		{name: "relative URL", webURL: "nexus.example.ts.net"},
 		{name: "URL path", webURL: "https://nexus.example.ts.net/executor"},
 		{name: "URL port", webURL: "https://nexus.example.ts.net:70000"},
+		{name: "URL trailing colon without port", webURL: "https://nexus.example.ts.net:"},
+		{name: "URL empty hostname", webURL: "https://:8443"},
 		{name: "publish hostname", publish: "localhost:32770"},
 		{name: "publish port", publish: "127.0.0.1:70000"},
 		{name: "DNS hostname", dns: "magicdns"},
@@ -107,5 +109,56 @@ func TestExecutorConfigPersistsAndEnvironmentOverrides(t *testing.T) {
 	}
 	if cfg.WebBaseURL != "" || cfg.PublishAddress() != "" || len(cfg.DNS) != 0 {
 		t.Errorf("cleared config = %#v", cfg)
+	}
+
+	// Saving the cleared config must delete the persisted keys on disk, not
+	// just return zero values.
+	if err := SaveExecutorConfig(name, "secret-token", cfg); err != nil {
+		t.Fatal(err)
+	}
+	env, err = state.ReadBoxEnv(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{ExecutorWebBaseURLEnv, ExecutorPublishEnv, ExecutorDNSEnv} {
+		if _, ok := env[key]; ok {
+			t.Errorf("cleared key %s still persisted", key)
+		}
+	}
+	if env["EXECUTOR_MCP_TOKEN"] != "secret-token" {
+		t.Error("executor token was not preserved through clear")
+	}
+}
+
+func TestLoadExecutorConfigIgnoreStored(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	name := "media-bot"
+	stored := ExecutorConfig{
+		WebBaseURL:  "https://stale.example.ts.net",
+		PublishIP:   "127.0.0.1",
+		PublishPort: "32770",
+	}
+	if err := SaveExecutorConfig(name, "stale-token", stored); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadExecutorConfig(name, ExecutorConfigOverrides{IgnoreStored: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebBaseURL != "" || cfg.PublishAddress() != "" || len(cfg.DNS) != 0 {
+		t.Errorf("IgnoreStored inherited persisted values: %#v", cfg)
+	}
+
+	// Explicit flags still win with IgnoreStored set.
+	cfg, err = LoadExecutorConfig(name, ExecutorConfigOverrides{
+		WebBaseURL:   "https://fresh.example.ts.net",
+		IgnoreStored: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.WebBaseURL != "https://fresh.example.ts.net" {
+		t.Errorf("WebBaseURL = %q", cfg.WebBaseURL)
 	}
 }

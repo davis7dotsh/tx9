@@ -38,6 +38,11 @@ type ExecutorConfigOverrides struct {
 	Publish    string
 	DNS        string
 	Clear      bool
+	// IgnoreStored skips the persisted box env fallback. create and import
+	// set it: any env file already sitting at ~/.tx9/boxes/<name>.env belongs
+	// to a previous box with the same name (deleted out-of-band, or a failed
+	// earlier create), and its settings must not leak into the new one.
+	IgnoreStored bool
 }
 
 // LoadExecutorConfig resolves per-box configuration with this precedence:
@@ -46,9 +51,13 @@ func LoadExecutorConfig(name string, overrides ExecutorConfigOverrides) (Executo
 	if overrides.Clear {
 		return parseExecutorConfig("", "", "")
 	}
-	stored, err := state.ReadBoxEnv(name)
-	if err != nil {
-		return ExecutorConfig{}, fmt.Errorf("box: executor config %s: %w", name, err)
+	stored := map[string]string{}
+	if !overrides.IgnoreStored {
+		var err error
+		stored, err = state.ReadBoxEnv(name)
+		if err != nil {
+			return ExecutorConfig{}, fmt.Errorf("box: executor config %s: %w", name, err)
+		}
 	}
 
 	webBaseURL := firstConfigured(
@@ -123,7 +132,7 @@ func normalizeWebBaseURL(raw string) (string, error) {
 		return "", nil
 	}
 	u, err := url.Parse(raw)
-	if err != nil || u.Host == "" || (u.Scheme != "http" && u.Scheme != "https") {
+	if err != nil || u.Hostname() == "" || (u.Scheme != "http" && u.Scheme != "https") {
 		return "", fmt.Errorf("executor web base URL must be an absolute http(s) origin: %q", raw)
 	}
 	if u.User != nil || u.RawQuery != "" || u.Fragment != "" || (u.Path != "" && u.Path != "/") {
@@ -134,6 +143,11 @@ func normalizeWebBaseURL(raw string) (string, error) {
 		if err != nil || portNumber < 1 || portNumber > 65535 {
 			return "", fmt.Errorf("executor web base URL port must be between 1 and 65535: %q", port)
 		}
+	} else if strings.HasSuffix(u.Host, ":") {
+		// url.Parse keeps a dangling "host:" (no port digits) in u.Host while
+		// u.Port() reports "" — it would round-trip into URLs like
+		// "https://example.com:/?_token=...".
+		return "", fmt.Errorf("executor web base URL has a colon but no port: %q", raw)
 	}
 	u.Path = ""
 	return strings.TrimSuffix(u.String(), "/"), nil

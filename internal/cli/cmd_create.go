@@ -53,7 +53,7 @@ func cmdCreate(args []string) error {
 	} else if err := names.Validate(name); err != nil {
 		return fmt.Errorf("create: %w", err)
 	}
-	executorConfig, err := executorFlags.load(name)
+	executorConfig, err := executorFlags.loadFresh(name)
 	if err != nil {
 		return fmt.Errorf("create %s: %w", name, err)
 	}

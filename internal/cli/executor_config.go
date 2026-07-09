@@ -39,15 +39,28 @@ func addExecutorConfigFlags(fs *flag.FlagSet) executorConfigFlags {
 	}
 }
 
+// load resolves the box's Executor configuration for upgrade: flags beat
+// TX9_EXECUTOR_* env vars beat the values persisted on the box.
 func (f executorConfigFlags) load(name string) (box.ExecutorConfig, error) {
+	return f.resolve(name, false)
+}
+
+// loadFresh is load for create/import: a leftover ~/.tx9/boxes/<name>.env
+// from a previous same-named box is ignored instead of silently inherited.
+func (f executorConfigFlags) loadFresh(name string) (box.ExecutorConfig, error) {
+	return f.resolve(name, true)
+}
+
+func (f executorConfigFlags) resolve(name string, ignoreStored bool) (box.ExecutorConfig, error) {
 	if *f.clear && (*f.webBaseURL != "" || *f.publish != "" || *f.dns != "") {
 		return box.ExecutorConfig{}, fmt.Errorf("--clear-executor-config cannot be combined with Executor configuration values")
 	}
 	return box.LoadExecutorConfig(name, box.ExecutorConfigOverrides{
-		WebBaseURL: *f.webBaseURL,
-		Publish:    *f.publish,
-		DNS:        *f.dns,
-		Clear:      *f.clear,
+		WebBaseURL:   *f.webBaseURL,
+		Publish:      *f.publish,
+		DNS:          *f.dns,
+		Clear:        *f.clear,
+		IgnoreStored: ignoreStored,
 	})
 }
 

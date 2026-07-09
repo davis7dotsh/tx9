@@ -297,15 +297,15 @@ func DashboardURL(port, webBaseURL string) string {
 // OpenURL is the box's authenticated dashboard URL, with the bearer token
 // embedded in the query string (dossier §4) — what `tx9 open` prints: a
 // one-shot secret, not meant for logs.
-func OpenURL(port, token, webBaseURL string) string {
+func OpenURL(port, token, webBaseURL string) (string, error) {
 	u, err := url.Parse(DashboardURL(port, webBaseURL))
 	if err != nil {
-		return ""
+		return "", fmt.Errorf("box: open URL: configured web base URL %q is invalid: %w", webBaseURL, err)
 	}
 	query := u.Query()
 	query.Set("_token", token)
 	u.RawQuery = query.Encode()
-	return u.String()
+	return u.String(), nil
 }
 
 // ensureNetwork returns the per-box network's ID, creating it if absent so

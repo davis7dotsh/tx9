@@ -78,7 +78,14 @@ func cmdUpgrade(args []string) error {
 			Name: name, Image: imageTag, Token: tok, Executor: executorConfig,
 		})
 		if err != nil {
-			return fmt.Errorf("upgrade %s: containers not recreated, box left without them: %w", name, err)
+			// Create returns the box when the containers exist but failed to
+			// start (e.g. a fixed --executor-publish port already bound).
+			// They are labeled, so retrying the upgrade removes and recreates
+			// them; no manual docker cleanup is needed either way.
+			if newB != nil {
+				return fmt.Errorf("upgrade %s: containers recreated but failed to start (fix the cause, then `tx9 start %s` or re-run the upgrade): %w", name, name, err)
+			}
+			return fmt.Errorf("upgrade %s: containers not recreated, box left without them (re-run the upgrade): %w", name, err)
 		}
 
 		fmt.Println("tx9: preparing runtime (executor reachability, MCP wiring, doctor)")
