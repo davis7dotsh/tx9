@@ -26,10 +26,13 @@ var animals = []string{
 // reserved names must never be generated or accepted, to avoid colliding
 // with CLI vocabulary or Docker/filesystem-sensitive words.
 var reserved = map[string]bool{
-	"create": true, "list": true, "enter": true, "ssh": true,
-	"start": true, "stop": true, "backup": true, "export": true,
-	"import": true, "open": true, "doctor": true, "upgrade": true,
-	"delete": true, "prune": true, "help": true, "version": true,
+	"create": true, "new": true, "list": true, "ls": true,
+	"enter": true, "ssh": true, "shell": true, "start": true, "stop": true,
+	"backup": true, "export": true, "save": true,
+	"import": true, "load": true, "restore": true,
+	"gateway": true, "open": true, "doctor": true, "upgrade": true, "update": true,
+	"delete": true, "rm": true, "remove": true, "prune": true,
+	"help": true, "version": true,
 	"all": true, "none": true, "default": true,
 }
 
