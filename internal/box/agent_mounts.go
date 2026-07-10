@@ -20,7 +20,12 @@ const (
 	// The value is JSON rather than a delimiter-separated list so paths with
 	// spaces round-trip without shell-style parsing.
 	AgentMountsEnv = "TX9_AGENT_MOUNTS"
-	agentUID       = 1001
+	// The image's provision.sh `useradd agent` allocates UID/GID 1001: ubuntu
+	// 24.04 ships its default user at 1000, and tools/assets create no other
+	// accounts first. Mirrored here because host-side Go code cannot ask the
+	// image without booting a container.
+	agentUID = 1001
+	agentGID = 1001
 )
 
 // AgentMount describes one host directory exposed to the agent container.
@@ -89,15 +94,15 @@ func SaveAgentMounts(name string, mounts []AgentMount) error {
 	if err != nil {
 		return fmt.Errorf("box: save agent mounts %s: %w", name, err)
 	}
-	if len(mounts) == 0 {
-		delete(env, AgentMountsEnv)
-	} else {
-		encoded, err := json.Marshal(mounts)
+	encoded := ""
+	if len(mounts) > 0 {
+		raw, err := json.Marshal(mounts)
 		if err != nil {
 			return fmt.Errorf("box: save agent mounts %s: %w", name, err)
 		}
-		env[AgentMountsEnv] = string(encoded)
+		encoded = string(raw)
 	}
+	setOrDelete(env, AgentMountsEnv, encoded)
 	if err := state.WriteBoxEnv(name, env); err != nil {
 		return fmt.Errorf("box: save agent mounts %s: %w", name, err)
 	}
@@ -212,18 +217,35 @@ func supplementalGroup(info os.FileInfo, readOnly bool) (string, error) {
 		needed = 0o7
 	}
 	permissions := uint32(info.Mode().Perm())
-	if stat.Uid == agentUID && (permissions>>6)&needed == needed {
-		return "", nil
-	}
-	if permissions&needed == needed {
-		return "", nil
-	}
-	if stat.Gid != 0 && (permissions>>3)&needed == needed {
-		return strconv.FormatUint(uint64(stat.Gid), 10), nil
-	}
 	mode := "read"
 	if !readOnly {
 		mode = "read/write"
+	}
+	// The kernel applies exactly one permission class by precedence — owner,
+	// then group, then other — so each case below is decided by its class
+	// alone; a later class can never compensate (mode 0577 denies writes to
+	// its owner even though "other" allows them).
+	if stat.Uid == agentUID {
+		if (permissions>>6)&needed == needed {
+			return "", nil
+		}
+		return "", fmt.Errorf("directory mode %04o does not give its owner (agent UID %d) %s access", info.Mode().Perm(), agentUID, mode)
+	}
+	if stat.Gid == agentGID {
+		// The agent's primary group applies without any supplemental group.
+		if (permissions>>3)&needed == needed {
+			return "", nil
+		}
+		return "", fmt.Errorf("directory mode %04o does not give its group (agent GID %d) %s access", info.Mode().Perm(), agentGID, mode)
+	}
+	if permissions&needed == needed {
+		// Not the owner and not in the directory's group: the other class
+		// governs, no supplemental group needed.
+		return "", nil
+	}
+	if stat.Gid != 0 && (permissions>>3)&needed == needed {
+		// Joining this group makes the group class govern the agent's access.
+		return strconv.FormatUint(uint64(stat.Gid), 10), nil
 	}
 	return "", fmt.Errorf("directory mode %04o does not give agent UID %d %s access through owner, group, or other bits", info.Mode().Perm(), agentUID, mode)
 }

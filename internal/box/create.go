@@ -169,10 +169,13 @@ func newAgentContainerSpec(name, image, token, ver, netID, agentVol string, exte
 // RecreateAgent replaces only the disposable agent container while keeping
 // the Executor container, network, and both durable volumes intact. Its image
 // and tx9 version label are inherited from the existing container so changing
-// mounts does not implicitly upgrade the box.
+// mounts does not implicitly upgrade the box. A stopped box stays stopped:
+// starting the agent as a side effect would run hb-workload's reconcile loop,
+// which can start the Hermes gateway on a box that was stopped precisely to
+// keep that gateway offline (single-writer discipline).
 func RecreateAgent(ctx context.Context, cli *docker.Client, b *Box, token string, mounts []AgentMount) (bool, error) {
 	if b.AgentID == "" {
-		return false, fmt.Errorf("box: recreate agent %s: agent container missing", b.Name)
+		return false, fmt.Errorf("box: recreate agent %s: agent container missing; run `tx9 upgrade %s` to recreate it", b.Name, b.Name)
 	}
 	externalBinds, supplementalGroups, err := prepareAgentMounts(mounts)
 	if err != nil {
@@ -187,6 +190,24 @@ func RecreateAgent(ctx context.Context, cli *docker.Client, b *Box, token string
 		return false, fmt.Errorf("box: recreate agent %s: existing container has no image reference", b.Name)
 	}
 
+	wasRunning := b.AgentState == "running"
+	// Current images register TX9_AGENT_MOUNT_GIDS in their entrypoint on
+	// every boot; only images predating that need an exec-based group setup
+	// against a running replacement. Detect which case this is before any
+	// destructive step, so an unsupportable combination (old image, stopped
+	// box) fails while the existing container is still intact — and so the
+	// CLI never races the entrypoint's own groupadd on current images.
+	entrypointConfiguresGroups := true
+	if len(supplementalGroups) > 0 {
+		entrypointConfiguresGroups, err = imageConfiguresMountGroups(ctx, cli, image)
+		if err != nil {
+			return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
+		}
+		if !entrypointConfiguresGroups && !wasRunning {
+			return false, fmt.Errorf("box: recreate agent %s: this box's image predates in-boot mount group setup and the box is stopped; start it (`tx9 start %s`) and re-run the mount command, or `tx9 upgrade %s`", b.Name, b.Name, b.Name)
+		}
+	}
+
 	netID, err := ensureNetwork(ctx, cli, NetworkName(b.Name), b.Name, b.Version)
 	if err != nil {
 		return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
@@ -196,7 +217,6 @@ func RecreateAgent(ctx context.Context, cli *docker.Client, b *Box, token string
 		return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
 	}
 
-	wasRunning := b.AgentState == "running"
 	if wasRunning {
 		if err := cli.ContainerStop(ctx, b.AgentID, nil); err != nil {
 			return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
@@ -209,39 +229,50 @@ func RecreateAgent(ctx context.Context, cli *docker.Client, b *Box, token string
 	spec := newAgentContainerSpec(b.Name, image, token, b.Version, netID, agentVol, externalBinds, supplementalGroups)
 	agentID, err := cli.ContainerCreate(ctx, spec)
 	if err != nil {
-		return false, fmt.Errorf("box: recreate agent %s: container removed but replacement creation failed; re-run the mount command after fixing the cause: %w", b.Name, err)
+		return false, fmt.Errorf("box: recreate agent %s: container removed but replacement creation failed; run `tx9 upgrade %s` to recreate it after fixing the cause: %w", b.Name, b.Name, err)
 	}
 	b.AgentID = agentID
 	b.AgentState = "created"
-	if wasRunning || len(supplementalGroups) > 0 {
+	if wasRunning {
 		if err := cli.ContainerStart(ctx, agentID); err != nil {
 			return wasRunning, fmt.Errorf("box: recreate agent %s: replacement created but failed to start: %w", b.Name, err)
 		}
 		b.AgentState = "running"
 	}
-	if len(supplementalGroups) > 0 {
+	if len(supplementalGroups) > 0 && !entrypointConfiguresGroups {
+		// Old image on a running box: register the groups via exec, then
+		// restart so runuser rebuilds every long-running agent process with
+		// the new group membership.
 		if err := configureAgentMountGroups(ctx, cli, agentID, supplementalGroups); err != nil {
-			if !wasRunning {
-				_ = cli.ContainerStop(ctx, agentID, nil)
-				b.AgentState = "exited"
-			}
 			return wasRunning, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
 		}
-		// Older images do not configure TX9_AGENT_MOUNT_GIDS in their
-		// entrypoint. Restart after updating /etc/group so runuser rebuilds
-		// every long-running agent process with the new group membership.
 		if err := cli.ContainerStop(ctx, agentID, nil); err != nil {
 			return wasRunning, fmt.Errorf("box: recreate agent %s: restart after mount group setup: %w", b.Name, err)
 		}
 		b.AgentState = "exited"
-		if wasRunning {
-			if err := cli.ContainerStart(ctx, agentID); err != nil {
-				return true, fmt.Errorf("box: recreate agent %s: mount groups configured but restart failed: %w", b.Name, err)
-			}
-			b.AgentState = "running"
+		if err := cli.ContainerStart(ctx, agentID); err != nil {
+			return true, fmt.Errorf("box: recreate agent %s: mount groups configured but restart failed: %w", b.Name, err)
 		}
+		b.AgentState = "running"
 	}
 	return wasRunning, nil
+}
+
+// imageConfiguresMountGroups reports whether image's entrypoint registers
+// TX9_AGENT_MOUNT_GIDS itself at boot. Grepping the shipped script is exact
+// regardless of how the image is tagged, and works for stopped boxes.
+func imageConfiguresMountGroups(ctx context.Context, cli *docker.Client, image string) (bool, error) {
+	exitCode, err := cli.RunEphemeral(ctx, docker.EphemeralOpts{
+		Image:      image,
+		Entrypoint: []string{"grep"},
+		Cmd:        []string{"-q", "TX9_AGENT_MOUNT_GIDS", "/opt/hermes-box/bin/entrypoint"},
+		Stdout:     io.Discard,
+		Stderr:     io.Discard,
+	})
+	if err != nil {
+		return false, fmt.Errorf("detect entrypoint mount group support in %s: %w", image, err)
+	}
+	return exitCode == 0, nil
 }
 
 const configureAgentMountGroupScript = `set -euo pipefail

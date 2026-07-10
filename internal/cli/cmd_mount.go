@@ -4,6 +4,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"path"
 	"text/tabwriter"
@@ -53,24 +54,21 @@ func cmdMountAdd(args []string) error {
 		if err != nil {
 			return fmt.Errorf("mount add %s: %w", name, err)
 		}
-		alreadyConfigured := false
 		for _, existing := range mounts {
 			if existing.Target != mount.Target {
 				continue
 			}
 			if existing == mount {
-				alreadyConfigured = true
-				break
+				// Idempotent no-op: recreating the agent here would kill
+				// in-flight agent work for zero configuration change.
+				fmt.Printf("tx9: mount already configured for %s; nothing to do\n", name)
+				return nil
 			}
 			return fmt.Errorf("mount add %s: target %s is already configured from %s; remove it first", name, mount.Target, existing.Source)
 		}
-		if alreadyConfigured {
-			fmt.Printf("tx9: mount already configured for %s; ensuring desired mounts are applied\n", name)
-		} else {
-			mounts = append(mounts, mount)
-			if err := box.SaveAgentMounts(name, mounts); err != nil {
-				return fmt.Errorf("mount add %s: %w", name, err)
-			}
+		mounts = append(mounts, mount)
+		if err := box.SaveAgentMounts(name, mounts); err != nil {
+			return fmt.Errorf("mount add %s: %w", name, err)
 		}
 		if err := applyAgentMounts(ctx, cli, b, mounts); err != nil {
 			return fmt.Errorf("mount add %s: desired mount was saved but agent recreation failed: %w", name, err)
@@ -138,21 +136,19 @@ func cmdMountRemove(args []string) error {
 			}
 			kept = append(kept, mount)
 		}
-		if found {
-			if err := box.SaveAgentMounts(name, kept); err != nil {
-				return fmt.Errorf("mount remove %s: %w", name, err)
-			}
-		} else {
-			fmt.Printf("tx9: no configured mount at %s; ensuring current desired mounts are applied\n", target)
+		if !found {
+			// Idempotent no-op (or a typo'd target): never recreate the
+			// agent when the desired mount set did not change.
+			fmt.Printf("tx9: no configured mount at %s; nothing to do\n", target)
+			return nil
+		}
+		if err := box.SaveAgentMounts(name, kept); err != nil {
+			return fmt.Errorf("mount remove %s: %w", name, err)
 		}
 		if err := applyAgentMounts(ctx, cli, b, kept); err != nil {
 			return fmt.Errorf("mount remove %s: desired mount removal was saved but agent recreation failed: %w", name, err)
 		}
-		if found {
-			fmt.Printf("tx9: removed mount at %s from %s\n", target, name)
-		} else {
-			fmt.Printf("tx9: current desired mounts reapplied to %s\n", name)
-		}
+		fmt.Printf("tx9: removed mount at %s from %s\n", target, name)
 		return nil
 	})
 }
@@ -167,6 +163,13 @@ func applyAgentMounts(ctx context.Context, cli *docker.Client, b *box.Box, mount
 		return err
 	}
 	if !wasRunning {
+		return nil
+	}
+	// A quiesced box (e.g. freshly imported, single-writer safety gate) must
+	// stay quiesced: PrepareRuntime runs `hb up`, which clears the quiesce
+	// marker and wires MCP — exactly what cmd_import deliberately avoids.
+	if err := box.HB(ctx, cli, b, token, io.Discard, io.Discard, "is-paused"); err == nil {
+		fmt.Println("tx9: box is quiesced; skipping runtime preparation (run `hb resume` inside the box when ready)")
 		return nil
 	}
 	fmt.Println("tx9: preparing recreated agent runtime")

@@ -45,10 +45,13 @@ Read/write mounts let the agent modify or delete host data, so use
 
 ## NAS safety and permissions
 
-Use `--require-mountpoint` for network storage. Before every add or upgrade,
-TX9 verifies that the exact source path appears in the host's mount table. If
-the NAS is unavailable, TX9 stops before removing a container instead of
-binding the empty directory underneath the missing mount.
+Use `--require-mountpoint` for network storage. Before every add, remove, or
+upgrade, TX9 verifies that the exact source path appears in the host's mount
+table. If the NAS is unavailable, TX9 stops before removing a container
+instead of binding the empty directory underneath the missing mount. Because
+`mount remove` recreates the agent with the remaining desired mounts, an
+offline `--require-mountpoint` source can also block removing a *different*
+mount until the share is back (or removed first).
 
 NAS mounts commonly map all files to the host user's numeric group. TX9 checks
 the source directory permissions and adds the required non-root host GID as a

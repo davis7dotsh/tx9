@@ -128,6 +128,14 @@ func TestSupplementalGroup(t *testing.T) {
 		{name: "world readable", uid: 1000, gid: 1000, mode: 0o755, readOnly: true},
 		{name: "read-only uses rx", uid: 1000, gid: 2000, mode: 0o750, readOnly: true, want: "2000"},
 		{name: "root group is not injected", uid: 0, gid: 0, mode: 0o770, wantErr: true},
+		// Owner class governs exclusively: mode 0577's other bits cannot
+		// compensate for the owner's missing write bit.
+		{name: "agent-owned dir with restrictive owner bits", uid: agentUID, gid: 1000, mode: 0o577, wantErr: true},
+		{name: "agent primary group grants ro", uid: 1000, gid: agentGID, mode: 0o750, readOnly: true},
+		// Group class governs exclusively for the agent's primary group:
+		// other bits cannot compensate.
+		{name: "agent primary group denies despite other bits", uid: 1000, gid: agentGID, mode: 0o705, readOnly: true, wantErr: true},
+		{name: "other bits suffice without joining the group", uid: 1000, gid: 2000, mode: 0o707},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
