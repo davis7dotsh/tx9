@@ -12,7 +12,10 @@ if [ -r "$XDG_CONFIG_HOME/hermes-box/executor-mcp.env" ]; then
   . "$XDG_CONFIG_HOME/hermes-box/executor-mcp.env"
 fi
 
-# Attach (or create) the persistent 'main' session — skip if already inside tmux.
-if [ -z "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
+# Attach (or create) the persistent 'main' session only for an interactive
+# login. Hermes' local terminal backend intentionally uses non-interactive
+# `bash -l -c`; launching tmux there fails with "open terminal failed: not a
+# terminal" and prevents every agent terminal/file operation from running.
+if [ -t 0 ] && [ -t 1 ] && [ -z "${TMUX:-}" ] && command -v tmux >/dev/null 2>&1; then
   exec tmux -f /opt/hermes-box/tmux.conf new-session -A -s main
 fi

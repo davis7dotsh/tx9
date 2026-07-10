@@ -331,6 +331,33 @@ fi
   [[ ! -e "$WIRED" && ! -e "$TOKEN_ENV" ]]
 )
 
+# Enabled MCP wiring registers the authenticated Executor endpoint for Hermes
+# as well as Claude and Codex. The secret stays in the managed token env; the
+# Hermes config receives only an environment placeholder.
+(
+  HB_DATA="$tmp/enabled-wire-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  CODEX_HOME="$AGENT_HOME/.codex"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$CODEX_HOME" "$HERMES_HOME"
+  up() { :; }
+  executor_token() { printf 'test-token\n'; }
+  _unwire_legacy() { :; }
+  _record_tool() {
+    local tool="$1"
+    shift
+    { printf '%s' "$tool"; printf ' <%s>' "$@"; printf '\n'; } >>"$tmp/enabled-wire.events"
+  }
+  claude() { _record_tool claude "$@"; }
+  codex() { _record_tool codex "$@"; }
+  hermes() { _record_tool hermes "$@"; }
+  EXECUTOR_HOST=executor WIRE_EXECUTOR_MCP=1 wire_mcp >/dev/null
+  grep -Fq 'hermes <config> <set> <mcp_servers.executor.url> <http://executor:4788/mcp>' "$tmp/enabled-wire.events"
+  grep -Fq 'hermes <config> <set> <mcp_servers.executor.headers.Authorization> <Bearer ${EXECUTOR_MCP_TOKEN}>' "$tmp/enabled-wire.events"
+  [[ "$(cat "$WIRED")" == http-v2 ]]
+)
+
 # The daemon lock (_acquire_daemon_lock/_release_daemon_lock, shared by
 # _start_gateway and _executor_up) must serialize concurrent contenders, and
 # a process spawned via _spawn_without_lock_fd must not inherit the lock's

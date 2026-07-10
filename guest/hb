@@ -17,7 +17,7 @@ GATEWAY_POLICY="$STATE_DIR/gateway-policy-initialized"
 GATEWAY_PID="$STATE_DIR/gateway.pid"
 GATEWAY_LOCK="$STATE_DIR/gateway.lock"
 EXECUTOR_LOCK="$STATE_DIR/executor.lock"
-WIRE_VERSION=http-v1
+WIRE_VERSION=http-v2
 WIRED="$AGENT_HOME/.hermes-box-wired"
 TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
 TOKEN_ENV="$AGENT_HOME/.config/hermes-box/executor-mcp.env"
@@ -349,6 +349,7 @@ _unwire_legacy() {
     claude mcp remove executor -s user >/dev/null 2>&1 || true
   fi
   command -v codex >/dev/null 2>&1 && codex mcp remove executor >/dev/null 2>&1 || true
+  command -v hermes >/dev/null 2>&1 && hermes mcp remove executor >/dev/null 2>&1 || true
 }
 
 wire_mcp() {
@@ -384,9 +385,24 @@ wire_mcp() {
       failed=1
     }
   fi
+  if command -v hermes >/dev/null 2>&1; then
+    if ! hermes config set mcp_servers.executor.url "$url" >/dev/null 2>&1 ||
+      ! hermes config set mcp_servers.executor.headers.Authorization "Bearer \${EXECUTOR_MCP_TOKEN}" >/dev/null 2>&1 ||
+      ! hermes config set mcp_servers.executor.enabled true >/dev/null 2>&1; then
+      echo "hermes: failed to register Executor HTTP MCP" >&2
+      failed=1
+    fi
+  fi
   [[ "$failed" == 0 ]] || return 1
   printf '%s\n' "$WIRE_VERSION" >"$WIRED"
-  echo "executor HTTP MCP registered for claude and codex"
+  echo "executor HTTP MCP registered for claude, codex, and hermes"
+}
+
+_hermes_http_config() {
+  command -v hermes >/dev/null 2>&1 || return 0
+  local config="${HERMES_HOME:-$AGENT_HOME/.hermes}/config.yaml"
+  grep -Fq "$(_executor_url)" "$config" 2>/dev/null &&
+    grep -Fq "Bearer \${EXECUTOR_MCP_TOKEN}" "$config" 2>/dev/null
 }
 
 wire_once() {
@@ -395,11 +411,13 @@ wire_once() {
   token="$(executor_token 2>/dev/null || true)"
   url="$(_executor_url)"
   # Freshness = version marker + current token in TOKEN_ENV + current URL in
-  # the codex config. The URL check catches restores that carry wiring from
-  # a box with a different executor host (e.g. loopback -> compose remote).
+  # the Codex and Hermes configs. The URL checks catch restores that carry
+  # wiring from a box with a different executor host (e.g. loopback -> compose
+  # remote).
   if [[ -f "$WIRED" && "$(cat "$WIRED")" == "$WIRE_VERSION" && -r "$TOKEN_ENV" && -n "$token" ]] &&
     grep -Fq "$token" "$TOKEN_ENV" &&
-    grep -qF "url = \"$url\"" "$CODEX_HOME/config.toml" 2>/dev/null; then return 0; fi
+    grep -qF "url = \"$url\"" "$CODEX_HOME/config.toml" 2>/dev/null &&
+    _hermes_http_config; then return 0; fi
   wire_mcp
 }
 
@@ -516,6 +534,7 @@ doctor() {
     _check "MCP token environment" test -r "$TOKEN_ENV" || failed=1
     _check "Claude HTTP MCP config" _claude_http_config || failed=1
     _check "Codex HTTP MCP config" grep -qF "url = \"$(_executor_url)\"" "$CODEX_HOME/config.toml" || failed=1
+    _check "Hermes HTTP MCP config" _hermes_http_config || failed=1
   fi
   [[ "$failed" == 0 ]]
 }
