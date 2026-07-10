@@ -16,8 +16,10 @@ GATEWAY_DISABLED="$STATE_DIR/gateway-disabled"
 GATEWAY_POLICY="$STATE_DIR/gateway-policy-initialized"
 GATEWAY_PID="$STATE_DIR/gateway.pid"
 GATEWAY_LOCK="$STATE_DIR/gateway.lock"
+GATEWAY_RELOAD_REQUESTS="$STATE_DIR/gateway-reload-requests"
+GATEWAY_RELOAD_LOCK="$STATE_DIR/gateway-reload.lock"
 EXECUTOR_LOCK="$STATE_DIR/executor.lock"
-WIRE_VERSION=http-v2
+WIRE_VERSION=http-v3
 WIRED="$AGENT_HOME/.hermes-box-wired"
 TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
 TOKEN_ENV="$AGENT_HOME/.config/hermes-box/executor-mcp.env"
@@ -116,14 +118,19 @@ _release_daemon_lock() {
 # explicitly released it; with it, a fresh acquire attempt succeeded in
 # milliseconds right after spawning.
 _spawn_without_lock_fd() {
-  local lock="$1" logfile="$2"
-  shift 2
-  local fd="${_DAEMON_LOCK_FDS[$lock]:-}"
-  if [[ -n "$fd" ]]; then
-    ( eval "exec ${fd}>&-"; exec nohup "$@" >>"$logfile" 2>&1 ) &
-  else
-    ( exec nohup "$@" >>"$logfile" 2>&1 ) &
-  fi
+  shift
+  local logfile="$1" fd
+  shift
+  # A daemon start can occur while a higher-level coordination lock is also
+  # held (for example, the MCP reload lock around a gateway restart). Close
+  # every tracked lock fd in the child so no long-lived daemon inherits and
+  # pins any of them after the spawning shell releases its copies.
+  (
+    for fd in "${_DAEMON_LOCK_FDS[@]}"; do
+      eval "exec ${fd}>&-"
+    done
+    exec nohup "$@" >>"$logfile" 2>&1
+  ) &
 }
 
 _executor_up() {
@@ -156,6 +163,15 @@ _gateway_running() {
   pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' >/dev/null 2>&1
 }
 
+_load_executor_mcp_env() {
+  if [[ "${WIRE_EXECUTOR_MCP:-0}" == 1 && -r "$TOKEN_ENV" ]]; then
+    # shellcheck disable=SC1090
+    . "$TOKEN_ENV"
+  else
+    unset EXECUTOR_MCP_TOKEN
+  fi
+}
+
 # Returns 0 on success, 1 on a real failure, 2 if the lock couldn't be
 # acquired (someone else is mid-operation — not necessarily broken). Callers
 # must not react to 2 the same way as 1: stopping the gateway because *this*
@@ -179,6 +195,7 @@ _start_gateway() {
     return 0
   fi
   rm -f "$GATEWAY_PID"
+  _load_executor_mcp_env
   _spawn_without_lock_fd "$GATEWAY_LOCK" "$LOGS/hermes-gateway.log" hermes gateway run --replace
   printf '%s\n' "$!" >"$GATEWAY_PID"
   _release_daemon_lock "$GATEWAY_LOCK"
@@ -349,7 +366,53 @@ _unwire_legacy() {
     claude mcp remove executor -s user >/dev/null 2>&1 || true
   fi
   command -v codex >/dev/null 2>&1 && codex mcp remove executor >/dev/null 2>&1 || true
-  command -v hermes >/dev/null 2>&1 && hermes mcp remove executor >/dev/null 2>&1 || true
+  if command -v hermes >/dev/null 2>&1; then
+    # Hermes confirms removals interactively. Rewiring runs from the login
+    # profile with output hidden, so answer explicitly instead of leaving an
+    # invisible prompt attached to the user's terminal.
+    printf 'y\n' | hermes mcp remove executor >/dev/null 2>&1 || return 1
+  fi
+}
+
+_request_gateway_reload() {
+  mkdir -p "$GATEWAY_RELOAD_REQUESTS"
+  mktemp "$GATEWAY_RELOAD_REQUESTS/request.XXXXXX"
+}
+
+_hermes_config_fingerprint() {
+  local config="${HERMES_HOME:-$AGENT_HOME/.hermes}/config.yaml"
+  if [[ -r "$config" ]]; then
+    cksum <"$config"
+  else
+    printf 'missing\n'
+  fi
+}
+
+gateway_reload_if_requested() {
+  local requests=()
+  _acquire_daemon_lock "$GATEWAY_RELOAD_LOCK" || return 1
+  if [[ ! -d "$GATEWAY_RELOAD_REQUESTS" ]]; then
+    _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+    return 0
+  fi
+  mapfile -t requests < <(find "$GATEWAY_RELOAD_REQUESTS" -maxdepth 1 -type f -name 'request.*' -print)
+  if ((${#requests[@]} == 0)); then
+    _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+    return 0
+  fi
+  if ! _gateway_running; then
+    rm -f "${requests[@]}"
+    _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+    return 0
+  fi
+  if ! _stop_gateway || ! _start_gateway; then
+    _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+    return 1
+  fi
+  # Remove only the generation just processed. Requests created while the
+  # restart was in flight remain queued for the next reconciliation.
+  rm -f "${requests[@]}"
+  _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
 }
 
 wire_mcp() {
@@ -358,9 +421,32 @@ wire_mcp() {
     return 1
   }
   if [[ "${WIRE_EXECUTOR_MCP:-0}" != 1 ]]; then
+    local config_before='' config_after='' reload_request='' reload_lock_held=0
     echo "executor MCP wiring disabled"
-    _unwire_legacy
+    if command -v hermes >/dev/null 2>&1 && _gateway_running; then
+      _acquire_daemon_lock "$GATEWAY_RELOAD_LOCK" || {
+        echo "hermes: could not acquire gateway reload lock before MCP removal" >&2
+        return 1
+      }
+      reload_lock_held=1
+      config_before="$(_hermes_config_fingerprint)"
+      if ! reload_request="$(_request_gateway_reload)"; then
+        _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+        echo "hermes: failed to request gateway reload before MCP removal" >&2
+        return 1
+      fi
+    fi
+    if ! _unwire_legacy; then
+      [[ "$reload_lock_held" == 0 ]] || _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+      echo "hermes: failed to remove Executor MCP configuration" >&2
+      return 1
+    fi
     rm -f "$WIRED" "$TOKEN_ENV"
+    if [[ "$reload_lock_held" == 1 ]]; then
+      config_after="$(_hermes_config_fingerprint)"
+      [[ "$config_before" != "$config_after" ]] || rm -f "$reload_request"
+      _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+    fi
     return 0
   fi
   _exec_remote || command -v executor >/dev/null 2>&1 || { echo "executor not installed" >&2; return 1; }
@@ -371,7 +457,7 @@ wire_mcp() {
   [[ -n "$token" ]] || { echo "executor token unavailable" >&2; return 1; }
   _write_token_env "$token"
   export EXECUTOR_MCP_TOKEN="$token"
-  _unwire_legacy
+  _unwire_legacy || { echo "failed to remove existing MCP configuration" >&2; return 1; }
 
   if command -v claude >/dev/null 2>&1; then
     claude mcp add executor "$url" -s user -t http -H "Authorization: Bearer $token" >/dev/null 2>&1 || {
@@ -394,15 +480,35 @@ wire_mcp() {
     fi
   fi
   [[ "$failed" == 0 ]] || return 1
+  if command -v hermes >/dev/null 2>&1 && _gateway_running; then
+    # The persistent workload owns gateway lifecycle. Ask it to reload on its
+    # next reconciliation instead of stopping the parent gateway from a login
+    # shell that the gateway itself may have launched.
+    _request_gateway_reload >/dev/null || { echo "hermes: failed to request gateway reload after MCP registration" >&2; return 1; }
+  fi
   printf '%s\n' "$WIRE_VERSION" >"$WIRED"
   echo "executor HTTP MCP registered for claude, codex, and hermes"
 }
 
+_hermes_executor_config() {
+  local config="${HERMES_HOME:-$AGENT_HOME/.hermes}/config.yaml"
+  awk '
+    /^mcp_servers:[[:space:]]*$/ { in_servers = 1; next }
+    in_servers && /^[^[:space:]]/ { exit }
+    in_servers && /^  executor:[[:space:]]*$/ { in_executor = 1; found = 1; next }
+    in_executor && /^  [^[:space:]]/ { exit }
+    in_executor { print }
+    END { exit found ? 0 : 1 }
+  ' "$config" 2>/dev/null
+}
+
 _hermes_http_config() {
   command -v hermes >/dev/null 2>&1 || return 0
-  local config="${HERMES_HOME:-$AGENT_HOME/.hermes}/config.yaml"
-  grep -Fq "$(_executor_url)" "$config" 2>/dev/null &&
-    grep -Fq "Bearer \${EXECUTOR_MCP_TOKEN}" "$config" 2>/dev/null
+  local executor_config
+  executor_config="$(_hermes_executor_config)" || return 1
+  grep -Fq "$(_executor_url)" <<<"$executor_config" &&
+    grep -Fq "Bearer \${EXECUTOR_MCP_TOKEN}" <<<"$executor_config" &&
+    grep -Eq '^    enabled:[[:space:]]+true[[:space:]]*$' <<<"$executor_config"
 }
 
 wire_once() {
@@ -556,6 +662,7 @@ main() {
     gateway-is-disabled) gateway_is_disabled ;;
     gateway-enable) shift; gateway_enable "$@" ;;
     gateway-disable) gateway_disable ;;
+    gateway-reload-if-requested) gateway_reload_if_requested ;;
     verify-state) shift; verify_state "$@" ;;
     acknowledge-active-paths) acknowledge_active_paths ;;
     cutover-ready) cutover_ready ;;
