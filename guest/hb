@@ -387,10 +387,12 @@ _request_gateway_reload() {
 
 _hermes_config_fingerprint() {
   local config="${HERMES_HOME:-$AGENT_HOME/.hermes}/config.yaml"
-  if [[ -r "$config" ]]; then
+  if [[ ! -e "$config" ]]; then
+    printf 'missing\n'
+  elif [[ -r "$config" ]]; then
     cksum <"$config"
   else
-    printf 'missing\n'
+    return 1
   fi
 }
 
@@ -446,7 +448,7 @@ wire_mcp() {
     return 1
   }
   if [[ "${WIRE_EXECUTOR_MCP:-0}" != 1 ]]; then
-    local config_before='' config_after='' reload_request='' reload_lock_held=0
+    local config_before='' config_after='' reload_request='' reload_lock_held=0 fingerprint_before_valid=0
     echo "executor MCP wiring disabled"
     if command -v hermes >/dev/null 2>&1 && _gateway_running; then
       _acquire_daemon_lock "$GATEWAY_RELOAD_LOCK" || {
@@ -454,7 +456,7 @@ wire_mcp() {
         return 1
       }
       reload_lock_held=1
-      config_before="$(_hermes_config_fingerprint)"
+      if config_before="$(_hermes_config_fingerprint)"; then fingerprint_before_valid=1; fi
       if ! reload_request="$(_request_gateway_reload)"; then
         _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
         echo "hermes: failed to request gateway reload before MCP removal" >&2
@@ -462,14 +464,22 @@ wire_mcp() {
       fi
     fi
     if ! _unwire_legacy; then
-      [[ "$reload_lock_held" == 0 ]] || _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+      if [[ "$reload_lock_held" == 1 ]]; then
+        if [[ "$fingerprint_before_valid" == 1 ]] && config_after="$(_hermes_config_fingerprint)" &&
+          [[ "$config_before" == "$config_after" ]]; then
+          rm -f "$reload_request"
+        fi
+        _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+      fi
       echo "hermes: failed to remove Executor MCP configuration" >&2
       return 1
     fi
     rm -f "$WIRED" "$TOKEN_ENV"
     if [[ "$reload_lock_held" == 1 ]]; then
-      config_after="$(_hermes_config_fingerprint)"
-      [[ "$config_before" != "$config_after" ]] || rm -f "$reload_request"
+      if [[ "$fingerprint_before_valid" == 1 ]] && config_after="$(_hermes_config_fingerprint)" &&
+        [[ "$config_before" == "$config_after" ]]; then
+        rm -f "$reload_request"
+      fi
       _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
     fi
     return 0

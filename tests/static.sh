@@ -51,7 +51,8 @@ grep -q 'LEGACY_QUIESCE_FILE' guest/hb guest/hb-workload
 grep -q 'BOXD_EXECUTOR_TOKEN' guest/hb
 grep -q 'mcp_servers.executor.headers.Authorization' guest/hb
 grep -q 'WIRE_VERSION=http-v3' guest/hb
-grep -q 'gateway-reload-if-requested' guest/hb guest/hb-workload
+grep -q 'gateway-reload-if-requested' guest/hb
+grep -q 'gateway-reload-if-requested' guest/hb-workload
 grep -q 'gateway-reload-if-requested.*verify-state' guest/hb
 
 # --- guest/hb-workload invariants ----------------------------------------

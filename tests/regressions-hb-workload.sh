@@ -402,8 +402,8 @@ EOF
   _hermes_executor_config >/dev/null
 )
 
-# A failed Hermes removal keeps credentials and the durable reload request so
-# a retry cannot publish a disabled state while config still enables Executor.
+# A failed Hermes removal keeps credentials and config, but discards the
+# provisional reload request so the workload cannot apply a partial mutation.
 (
   HB_DATA="$tmp/disabled-removal-failure-data"
   # shellcheck disable=SC1090
@@ -417,6 +417,8 @@ mcp_servers:
 EOF
   printf 'stale\n' >"$WIRED"
   printf 'stale\n' >"$TOKEN_ENV"
+  claude() { :; }
+  codex() { :; }
   hermes() { return 1; }
   _gateway_running() { return 0; }
   if WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1; then
@@ -425,6 +427,90 @@ EOF
   fi
   [[ -e "$WIRED" && -e "$TOKEN_ENV" ]]
   _hermes_executor_config >/dev/null
+  [[ -z "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
+)
+
+# If Hermes publishes the removal and then exits nonzero, credentials remain
+# for retry but the write-ahead reload request must survive so the live gateway
+# cannot retain the configuration that was successfully removed on disk.
+(
+  HB_DATA="$tmp/disabled-partial-removal-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME" "$(dirname "$TOKEN_ENV")"
+  cat >"$HERMES_HOME/config.yaml" <<'EOF'
+mcp_servers:
+  executor:
+    enabled: true
+EOF
+  printf 'stale\n' >"$WIRED"
+  printf 'stale\n' >"$TOKEN_ENV"
+  claude() { :; }
+  codex() { :; }
+  hermes() {
+    printf 'mcp_servers: {}\n' >"$HERMES_HOME/config.yaml"
+    return 1
+  }
+  _gateway_running() { return 0; }
+  if WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1; then
+    echo "disabled wiring ignored a post-write Hermes removal failure" >&2
+    exit 1
+  fi
+  [[ -e "$WIRED" && -e "$TOKEN_ENV" ]]
+  [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
+)
+
+# Unknown fingerprints fail safe: even if Hermes exits nonzero after changing
+# config, an unavailable checksum cannot make the write-ahead request look like
+# a confirmed no-op.
+(
+  HB_DATA="$tmp/disabled-fingerprint-failure-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME" "$(dirname "$TOKEN_ENV")"
+  printf 'mcp_servers:\n  executor:\n    enabled: true\n' >"$HERMES_HOME/config.yaml"
+  printf 'stale\n' >"$WIRED"
+  printf 'stale\n' >"$TOKEN_ENV"
+  claude() { :; }
+  codex() { :; }
+  cksum() { return 1; }
+  hermes() {
+    printf 'mcp_servers: {}\n' >"$HERMES_HOME/config.yaml"
+    return 1
+  }
+  _gateway_running() { return 0; }
+  WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1 || true
+  [[ -e "$WIRED" && -e "$TOKEN_ENV" ]]
+  [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
+)
+
+# An existing but unreadable config is not equivalent to a missing config.
+# Preserve reload intent when Hermes changes such a file and still exits with
+# an error, because neither side can be fingerprinted reliably.
+(
+  HB_DATA="$tmp/disabled-unreadable-fingerprint-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME" "$(dirname "$TOKEN_ENV")"
+  printf 'mcp_servers:\n  executor:\n    enabled: true\n' >"$HERMES_HOME/config.yaml"
+  chmod 000 "$HERMES_HOME/config.yaml"
+  printf 'stale\n' >"$WIRED"
+  printf 'stale\n' >"$TOKEN_ENV"
+  claude() { :; }
+  codex() { :; }
+  hermes() {
+    chmod 600 "$HERMES_HOME/config.yaml"
+    printf 'mcp_servers: {}\n' >"$HERMES_HOME/config.yaml"
+    chmod 000 "$HERMES_HOME/config.yaml"
+    return 1
+  }
+  _gateway_running() { return 0; }
+  WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1 || true
+  chmod 600 "$HERMES_HOME/config.yaml"
+  [[ -e "$WIRED" && -e "$TOKEN_ENV" ]]
   [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
 )
 
