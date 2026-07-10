@@ -486,13 +486,25 @@ wire_mcp() {
   fi
   _exec_remote || command -v executor >/dev/null 2>&1 || { echo "executor not installed" >&2; return 1; }
   up >/dev/null
-  local token url failed=0
+  local token url failed=0 hermes_installed=0 hermes_reload_lock_held=0
   url="$(_executor_url)"
   token="$(executor_token)"
   [[ -n "$token" ]] || { echo "executor token unavailable" >&2; return 1; }
   _write_token_env "$token"
   export EXECUTOR_MCP_TOKEN="$token"
-  _unwire_legacy || { echo "failed to remove existing MCP configuration" >&2; return 1; }
+  if command -v hermes >/dev/null 2>&1; then
+    hermes_installed=1
+    _acquire_daemon_lock "$GATEWAY_RELOAD_LOCK" || {
+      echo "hermes: could not acquire gateway reload lock before MCP registration" >&2
+      return 1
+    }
+    hermes_reload_lock_held=1
+  fi
+  if ! _unwire_legacy; then
+    [[ "$hermes_reload_lock_held" == 0 ]] || _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+    echo "failed to remove existing MCP configuration" >&2
+    return 1
+  fi
 
   if command -v claude >/dev/null 2>&1; then
     claude mcp add executor "$url" -s user -t http -H "Authorization: Bearer $token" >/dev/null 2>&1 || {
@@ -506,7 +518,7 @@ wire_mcp() {
       failed=1
     }
   fi
-  if command -v hermes >/dev/null 2>&1; then
+  if [[ "$hermes_installed" == 1 ]]; then
     if ! hermes config set mcp_servers.executor.url "$url" >/dev/null 2>&1 ||
       ! hermes config set mcp_servers.executor.headers.Authorization "Bearer \${EXECUTOR_MCP_TOKEN}" >/dev/null 2>&1 ||
       ! hermes config set mcp_servers.executor.enabled true >/dev/null 2>&1; then
@@ -514,13 +526,21 @@ wire_mcp() {
       failed=1
     fi
   fi
-  [[ "$failed" == 0 ]] || return 1
-  if command -v hermes >/dev/null 2>&1 && _gateway_running; then
+  if [[ "$failed" != 0 ]]; then
+    [[ "$hermes_reload_lock_held" == 0 ]] || _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+    return 1
+  fi
+  if [[ "$hermes_installed" == 1 ]] && _gateway_running; then
     # The persistent workload owns gateway lifecycle. Ask it to reload on its
     # next reconciliation instead of stopping the parent gateway from a login
     # shell that the gateway itself may have launched.
-    _request_gateway_reload >/dev/null || { echo "hermes: failed to request gateway reload after MCP registration" >&2; return 1; }
+    if ! _request_gateway_reload >/dev/null; then
+      _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+      echo "hermes: failed to request gateway reload after MCP registration" >&2
+      return 1
+    fi
   fi
+  [[ "$hermes_reload_lock_held" == 0 ]] || _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
   printf '%s\n' "$WIRE_VERSION" >"$WIRED"
   echo "executor HTTP MCP registered for claude, codex, and hermes"
 }

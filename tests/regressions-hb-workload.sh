@@ -398,7 +398,8 @@ EOF
     exit 1
   fi
   [[ ! -e "$tmp/disabled-request-failure-unwired" ]]
-  [[ -e "$WIRED" && -e "$TOKEN_ENV" ]]
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
   _hermes_executor_config >/dev/null
 )
 
@@ -425,7 +426,8 @@ EOF
     echo "disabled wiring ignored failed Hermes config removal" >&2
     exit 1
   fi
-  [[ -e "$WIRED" && -e "$TOKEN_ENV" ]]
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
   _hermes_executor_config >/dev/null
   [[ -z "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
 )
@@ -457,7 +459,8 @@ EOF
     echo "disabled wiring ignored a post-write Hermes removal failure" >&2
     exit 1
   fi
-  [[ -e "$WIRED" && -e "$TOKEN_ENV" ]]
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
   [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
 )
 
@@ -482,7 +485,8 @@ EOF
   }
   _gateway_running() { return 0; }
   WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1 || true
-  [[ -e "$WIRED" && -e "$TOKEN_ENV" ]]
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
   [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
 )
 
@@ -510,7 +514,8 @@ EOF
   _gateway_running() { return 0; }
   WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1 || true
   chmod 600 "$HERMES_HOME/config.yaml"
-  [[ -e "$WIRED" && -e "$TOKEN_ENV" ]]
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
   [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
 )
 
@@ -621,7 +626,13 @@ EOF
   }
   claude() { _record_tool claude "$@"; }
   codex() { _record_tool codex "$@"; }
-  hermes() { _record_tool hermes "$@"; }
+  hermes() {
+    if [[ "$*" == config\ set* ]] && flock -n "$GATEWAY_RELOAD_LOCK" -c true; then
+      echo "Hermes config changed without holding the gateway reload lock" >&2
+      return 1
+    fi
+    _record_tool hermes "$@"
+  }
   _gateway_running() { return 0; }
   _stop_gateway() { echo "enabled wiring stopped its parent gateway" >&2; return 1; }
   _start_gateway() { echo "enabled wiring restarted its parent gateway" >&2; return 1; }
@@ -631,6 +642,7 @@ EOF
   grep -Fq 'hermes <config> <set> <mcp_servers.executor.enabled> <true>' "$tmp/enabled-wire.events"
   [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
   [[ "$(cat "$WIRED")" == http-v3 ]]
+  flock -n "$GATEWAY_RELOAD_LOCK" -c true
 )
 
 # Failed client configuration must leave an already-running gateway alone and
