@@ -46,6 +46,7 @@ tx9 create
 | `tx9 start <box>` / `tx9 stop <box>` | Both containers together. Volumes persist. |
 | `tx9 backup <box>` (aliases `export`, `save`) | Flags: `--path` (default `~/Downloads`), `--password`/env/prompt, `--no-encrypt`. Quiesce → archive agent /data → validate → (encrypt) → verify → `<box>-<timestamp>.tx9`. |
 | `tx9 import <file.tx9>` (aliases `load`, `restore`) | Flags: `--name`, `--password`/env/prompt. Validate before creating anything; restore staged; arrive quiesced + gateway-disabled + fresh token; fail on name collision. |
+| `tx9 mount <add\|list\|remove> ...` | Persist host-directory bind mounts for an agent and recreate only its disposable container. Targets must be below `/mnt`, outside the portable `/data` volume. `add` supports `--read-only` and `--require-mountpoint`. |
 | `tx9 gateway <status\|enable\|disable> <box>` | Inspect or control the container-supervised Hermes gateway. Enable requires `--confirm-single-writer`. |
 | `tx9 open <box>` | Print (or open) the authenticated dashboard URL (`?_token=`). |
 | `tx9 doctor <box>` | In-box `hb doctor` + host-side published-port probe. |
@@ -78,6 +79,13 @@ the port:
   from bash+python to Go. Validate before create on import; validate after
   tar on backup. Restores stage-then-promote in a throwaway container and
   re-arm quiesce + gateway-disabled markers.
+- **External host mounts**: per-box bind mounts are host-local desired state,
+  persisted in `~/.tx9/boxes/<name>.env` and reapplied during upgrades. Their
+  targets stay below `/mnt` so backups of `/data` never traverse NAS or other
+  external content. Mount sources are preflighted before container removal;
+  `--require-mountpoint` refuses to bind an empty underlying directory when a
+  host share is offline. Required non-root source GIDs are added to the agent
+  container automatically.
 - **Gateway single-writer**: restored boxes never auto-enable the Hermes
   gateway. `tx9 gateway enable <box> --confirm-single-writer` delegates to
   `hb gateway-enable` and stays the only host-side path.

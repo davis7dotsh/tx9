@@ -34,11 +34,12 @@ const (
 
 // CreateOpts parameterizes Create.
 type CreateOpts struct {
-	Name     string
-	Image    string // e.g. "tx9-box:dev"
-	Token    string
-	Executor ExecutorConfig
-	NoStart  bool // create network/volumes/containers but do not start them (import path)
+	Name        string
+	Image       string // e.g. "tx9-box:dev"
+	Token       string
+	Executor    ExecutorConfig
+	AgentMounts []AgentMount
+	NoStart     bool // create network/volumes/containers but do not start them (import path)
 }
 
 // Create materializes a box's network, volumes, and both containers per the
@@ -49,10 +50,14 @@ type CreateOpts struct {
 // first) are created fresh each time.
 func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, error) {
 	name := opts.Name
-	agentName, executorName := ContainerNames(name)
+	_, executorName := ContainerNames(name)
 	netName := NetworkName(name)
 	agentVol, execVol := VolumeNames(name)
 	ver := version.Version
+	externalBinds, supplementalGroups, err := prepareAgentMounts(opts.AgentMounts)
+	if err != nil {
+		return nil, fmt.Errorf("box: create %s: %w", name, err)
+	}
 
 	netID, err := ensureNetwork(ctx, cli, netName, name, ver)
 	if err != nil {
@@ -65,24 +70,7 @@ func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, err
 		return nil, fmt.Errorf("box: create %s: %w", name, err)
 	}
 
-	agentSpec := docker.ContainerSpec{
-		Name:       agentName,
-		Image:      opts.Image,
-		Entrypoint: []string{"/opt/hermes-box/bin/entrypoint"},
-		Env: []string{
-			"EXECUTOR_HOST=executor",
-			"BOXD_EXECUTOR_TOKEN=" + opts.Token,
-			"BOX_EXECUTOR_BRIDGE_PORT=4788",
-			"BOX_HERMES_BRIDGE_PORT=0",
-		},
-		Labels:         docker.BoxLabels(name, ver, docker.RoleAgent),
-		NetworkID:      netID,
-		NetworkAliases: []string{"agent"},
-		Binds:          []string{agentVol + ":/data"},
-		Sysctls:        ipv6DisableSysctl,
-		NanoCPUs:       agentNanoCPUs,
-		MemoryBytes:    agentMemoryBytes,
-	}
+	agentSpec := newAgentContainerSpec(name, opts.Image, opts.Token, ver, netID, agentVol, externalBinds, supplementalGroups)
 	agentID, err := cli.ContainerCreate(ctx, agentSpec)
 	if err != nil {
 		return nil, fmt.Errorf("box: create %s: agent: %w", name, err)
@@ -148,6 +136,137 @@ func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, err
 		b.ExecutorState = "running"
 	}
 	return b, nil
+}
+
+func newAgentContainerSpec(name, image, token, ver, netID, agentVol string, externalBinds, supplementalGroups []string) docker.ContainerSpec {
+	binds := append([]string{agentVol + ":/data"}, externalBinds...)
+	agentName, _ := ContainerNames(name)
+	env := []string{
+		"EXECUTOR_HOST=executor",
+		"BOXD_EXECUTOR_TOKEN=" + token,
+		"BOX_EXECUTOR_BRIDGE_PORT=4788",
+		"BOX_HERMES_BRIDGE_PORT=0",
+	}
+	if len(supplementalGroups) > 0 {
+		env = append(env, "TX9_AGENT_MOUNT_GIDS="+strings.Join(supplementalGroups, ","))
+	}
+	return docker.ContainerSpec{
+		Name:           agentName,
+		Image:          image,
+		Entrypoint:     []string{"/opt/hermes-box/bin/entrypoint"},
+		Env:            env,
+		Labels:         docker.BoxLabels(name, ver, docker.RoleAgent),
+		NetworkID:      netID,
+		NetworkAliases: []string{"agent"},
+		Binds:          binds,
+		GroupAdd:       supplementalGroups,
+		Sysctls:        ipv6DisableSysctl,
+		NanoCPUs:       agentNanoCPUs,
+		MemoryBytes:    agentMemoryBytes,
+	}
+}
+
+// RecreateAgent replaces only the disposable agent container while keeping
+// the Executor container, network, and both durable volumes intact. Its image
+// and tx9 version label are inherited from the existing container so changing
+// mounts does not implicitly upgrade the box.
+func RecreateAgent(ctx context.Context, cli *docker.Client, b *Box, token string, mounts []AgentMount) (bool, error) {
+	if b.AgentID == "" {
+		return false, fmt.Errorf("box: recreate agent %s: agent container missing", b.Name)
+	}
+	externalBinds, supplementalGroups, err := prepareAgentMounts(mounts)
+	if err != nil {
+		return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
+	}
+	inspect, err := cli.ContainerInspect(ctx, b.AgentID)
+	if err != nil {
+		return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
+	}
+	image := inspect.Config.Image
+	if image == "" {
+		return false, fmt.Errorf("box: recreate agent %s: existing container has no image reference", b.Name)
+	}
+
+	netID, err := ensureNetwork(ctx, cli, NetworkName(b.Name), b.Name, b.Version)
+	if err != nil {
+		return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
+	}
+	agentVol, _ := VolumeNames(b.Name)
+	if _, err := ensureVolume(ctx, cli, agentVol, b.Name, b.Version); err != nil {
+		return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
+	}
+
+	wasRunning := b.AgentState == "running"
+	if wasRunning {
+		if err := cli.ContainerStop(ctx, b.AgentID, nil); err != nil {
+			return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
+		}
+	}
+	if err := cli.ContainerRemove(ctx, b.AgentID, true); err != nil {
+		return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
+	}
+
+	spec := newAgentContainerSpec(b.Name, image, token, b.Version, netID, agentVol, externalBinds, supplementalGroups)
+	agentID, err := cli.ContainerCreate(ctx, spec)
+	if err != nil {
+		return false, fmt.Errorf("box: recreate agent %s: container removed but replacement creation failed; re-run the mount command after fixing the cause: %w", b.Name, err)
+	}
+	b.AgentID = agentID
+	b.AgentState = "created"
+	if wasRunning || len(supplementalGroups) > 0 {
+		if err := cli.ContainerStart(ctx, agentID); err != nil {
+			return wasRunning, fmt.Errorf("box: recreate agent %s: replacement created but failed to start: %w", b.Name, err)
+		}
+		b.AgentState = "running"
+	}
+	if len(supplementalGroups) > 0 {
+		if err := configureAgentMountGroups(ctx, cli, agentID, supplementalGroups); err != nil {
+			if !wasRunning {
+				_ = cli.ContainerStop(ctx, agentID, nil)
+				b.AgentState = "exited"
+			}
+			return wasRunning, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
+		}
+		// Older images do not configure TX9_AGENT_MOUNT_GIDS in their
+		// entrypoint. Restart after updating /etc/group so runuser rebuilds
+		// every long-running agent process with the new group membership.
+		if err := cli.ContainerStop(ctx, agentID, nil); err != nil {
+			return wasRunning, fmt.Errorf("box: recreate agent %s: restart after mount group setup: %w", b.Name, err)
+		}
+		b.AgentState = "exited"
+		if wasRunning {
+			if err := cli.ContainerStart(ctx, agentID); err != nil {
+				return true, fmt.Errorf("box: recreate agent %s: mount groups configured but restart failed: %w", b.Name, err)
+			}
+			b.AgentState = "running"
+		}
+	}
+	return wasRunning, nil
+}
+
+const configureAgentMountGroupScript = `set -euo pipefail
+gid="$1"
+group="$(getent group "$gid" | cut -d: -f1 || true)"
+if [ -z "$group" ]; then
+  group="tx9-mount-$gid"
+  groupadd --gid "$gid" "$group"
+fi
+usermod --append --groups "$group" agent
+`
+
+func configureAgentMountGroups(ctx context.Context, cli *docker.Client, containerID string, groups []string) error {
+	for _, group := range groups {
+		res, err := cli.Exec(ctx, containerID, []string{
+			"bash", "-c", configureAgentMountGroupScript, "tx9-mount-group", group,
+		}, nil, "root")
+		if err != nil {
+			return fmt.Errorf("configure mount group %s: %w", group, err)
+		}
+		if res.ExitCode != 0 {
+			return fmt.Errorf("configure mount group %s: exit %d: %s", group, res.ExitCode, strings.TrimSpace(res.Stderr))
+		}
+	}
+	return nil
 }
 
 // HB runs `hb <args...>` inside the agent container, exactly replicating

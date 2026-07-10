@@ -133,6 +133,9 @@ func cmdImport(args []string) error {
 		if err := box.SaveExecutorConfig(name, tok, executorConfig); err != nil {
 			return fmt.Errorf("import %s: %w", name, err)
 		}
+		if err := box.SaveAgentMounts(name, nil); err != nil {
+			return fmt.Errorf("import %s: %w", name, err)
+		}
 
 		imageTag := fmt.Sprintf("tx9-box:%s", version.Version)
 		if err := ensureBoxImage(ctx, cli, imageTag); err != nil {

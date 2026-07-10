@@ -54,6 +54,13 @@ func cmdUpgrade(args []string) error {
 		if err != nil {
 			return fmt.Errorf("upgrade %s: %w", name, err)
 		}
+		agentMounts, err := box.LoadAgentMounts(name)
+		if err != nil {
+			return fmt.Errorf("upgrade %s: %w", name, err)
+		}
+		if err := box.PreflightAgentMounts(agentMounts); err != nil {
+			return fmt.Errorf("upgrade %s: agent mount preflight: %w", name, err)
+		}
 
 		imageTag := fmt.Sprintf("tx9-box:%s", version.Version)
 		if err := ensureBoxImage(ctx, cli, imageTag); err != nil {
@@ -75,7 +82,7 @@ func cmdUpgrade(args []string) error {
 
 		fmt.Printf("tx9: recreating %s on %s\n", name, imageTag)
 		newB, err := box.Create(ctx, cli, box.CreateOpts{
-			Name: name, Image: imageTag, Token: tok, Executor: executorConfig,
+			Name: name, Image: imageTag, Token: tok, Executor: executorConfig, AgentMounts: agentMounts,
 		})
 		if err != nil {
 			// Create returns the box when the containers exist but failed to
