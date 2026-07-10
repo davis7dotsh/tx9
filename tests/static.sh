@@ -49,6 +49,11 @@ grep -q 'LEGACY_QUIESCE_FILE' guest/hb guest/hb-workload
 # The remote-executor override must outrank the on-disk token env, which a
 # restore can carry stale from the source box.
 grep -q 'BOXD_EXECUTOR_TOKEN' guest/hb
+grep -q 'mcp_servers.executor.headers.Authorization' guest/hb
+grep -q 'WIRE_VERSION=http-v3' guest/hb
+grep -q 'gateway-reload-if-requested' guest/hb
+grep -q 'gateway-reload-if-requested' guest/hb-workload
+grep -q 'gateway-reload-if-requested.*verify-state' guest/hb
 
 # --- guest/hb-workload invariants ----------------------------------------
 grep -q 'EXECUTOR_TARGET_PORT="${EXECUTOR_PORT:-4788}"' guest/hb-workload
@@ -80,6 +85,7 @@ grep -q 'provision.sh tools' docker/Dockerfile
 grep -q 'provision.sh assets' docker/Dockerfile
 grep -q 'EXECUTOR_MCP_TOKEN' docker/executor-entrypoint.sh
 grep -q -- '--hostname 0.0.0.0' docker/executor-entrypoint.sh
+grep -Fq '[ -t 0 ] && [ -t 1 ]' guest/agent-bash-profile.sh
 
 grep -qi 'networking is always enabled' README.md
 

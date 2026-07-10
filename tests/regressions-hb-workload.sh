@@ -81,6 +81,29 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
   chmod 0700 "$migration_failure"
 )
 
+# A pending gateway reload is handed to the persistent workload before normal
+# reconciliation, keeping login shells out of their parent gateway's lifecycle.
+(
+  HOME="$tmp/workload-reload-home"
+  mkdir -p "$HOME/.config/hermes-box" "$tmp/workload-reload-logs"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb-workload"
+  PORT=4788
+  HERMES_BRIDGE_PORT=0
+  LOGS="$tmp/workload-reload-logs"
+  BOX_ENV="$tmp/workload-reload-box.env"
+  LEGACY_QUIESCE_FILE="$tmp/workload-reload-legacy-paused"
+  printf 'EXECUTOR_PORT=4788\nHERMES_API_PORT=8642\n' >"$BOX_ENV"
+  mkdir -p "$GATEWAY_RELOAD_REQUESTS"
+  touch "$GATEWAY_RELOAD_REQUESTS/request.test"
+  hb() {
+    printf '%s\n' "$*" >>"$tmp/workload-reload.events"
+    [[ "$*" != gateway-reload-if-requested ]] || rm -f "$GATEWAY_RELOAD_REQUESTS"/request.*
+  }
+  reconcile_once
+  [[ "$(cat "$tmp/workload-reload.events")" == $'gateway-reload-if-requested\nreconcile' ]]
+)
+
 # The bridge-presence checks must match on "socat TCP-LISTEN:<port>,", not a
 # bare "TCP-LISTEN:<port>," substring — otherwise an unrelated process whose
 # argv happens to contain that text is mistaken for the real socat bridge,
@@ -319,16 +342,361 @@ fi
 [[ -e "$wire_quiesced/home/agent/.config/hermes-box/quiesced" ]]
 
 # wire-once must execute its disabled cleanup path without requiring Executor.
+# When removal changes a live Hermes gateway, it queues the persistent workload
+# to reload it instead of killing the gateway from its own login shell.
 (
   HB_DATA="$tmp/disabled-wire-data"
   # shellcheck disable=SC1090
   source "$PROJECT_ROOT/guest/hb"
-  _unwire_legacy() { :; }
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME"
+  cat >"$HERMES_HOME/config.yaml" <<'EOF'
+mcp_servers:
+    executor:
+        enabled: true
+EOF
+  _unwire_legacy() {
+    printf 'unwire\n' >>"$tmp/disabled-wire.events"
+    printf 'mcp_servers: {}\n' >"$HERMES_HOME/config.yaml"
+  }
+  hermes() { :; }
+  _gateway_running() { return 0; }
+  _stop_gateway() { echo "disabled wiring stopped its parent gateway" >&2; return 1; }
+  _start_gateway() { echo "disabled wiring restarted its parent gateway" >&2; return 1; }
   mkdir -p "$(dirname "$TOKEN_ENV")"
   printf 'stale\n' >"$WIRED"
   printf 'stale\n' >"$TOKEN_ENV"
+  export EXECUTOR_MCP_TOKEN=stale
   WIRE_EXECUTOR_MCP=0 wire_once >/dev/null
   [[ ! -e "$WIRED" && ! -e "$TOKEN_ENV" ]]
+  [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
+  [[ "$(cat "$tmp/disabled-wire.events")" == unwire ]]
+)
+
+# Disable cleanup must persist reload intent before changing live Hermes state.
+# A transient request-write failure leaves config and credentials intact so the
+# next login can retry instead of permanently losing the reload requirement.
+(
+  HB_DATA="$tmp/disabled-request-failure-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME" "$(dirname "$TOKEN_ENV")"
+  cat >"$HERMES_HOME/config.yaml" <<'EOF'
+mcp_servers:
+  executor:
+    enabled: true
+EOF
+  printf 'stale\n' >"$WIRED"
+  printf 'stale\n' >"$TOKEN_ENV"
+  hermes() { :; }
+  _gateway_running() { return 0; }
+  _request_gateway_reload() { return 1; }
+  _unwire_legacy() { touch "$tmp/disabled-request-failure-unwired"; }
+  if WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1; then
+    echo "disabled wiring ignored a failed gateway reload request" >&2
+    exit 1
+  fi
+  [[ ! -e "$tmp/disabled-request-failure-unwired" ]]
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
+  _hermes_executor_config >/dev/null
+)
+
+# A failed Hermes removal keeps credentials and config, but discards the
+# provisional reload request so the workload cannot apply a partial mutation.
+(
+  HB_DATA="$tmp/disabled-removal-failure-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME" "$(dirname "$TOKEN_ENV")"
+  cat >"$HERMES_HOME/config.yaml" <<'EOF'
+mcp_servers:
+  executor:
+    enabled: true
+EOF
+  printf 'stale\n' >"$WIRED"
+  printf 'stale\n' >"$TOKEN_ENV"
+  claude() { :; }
+  codex() { :; }
+  hermes() { return 1; }
+  _gateway_running() { return 0; }
+  if WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1; then
+    echo "disabled wiring ignored failed Hermes config removal" >&2
+    exit 1
+  fi
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
+  _hermes_executor_config >/dev/null
+  [[ -z "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
+)
+
+# If Hermes publishes the removal and then exits nonzero, credentials remain
+# for retry but the write-ahead reload request must survive so the live gateway
+# cannot retain the configuration that was successfully removed on disk.
+(
+  HB_DATA="$tmp/disabled-partial-removal-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME" "$(dirname "$TOKEN_ENV")"
+  cat >"$HERMES_HOME/config.yaml" <<'EOF'
+mcp_servers:
+  executor:
+    enabled: true
+EOF
+  printf 'stale\n' >"$WIRED"
+  printf 'stale\n' >"$TOKEN_ENV"
+  claude() { :; }
+  codex() { :; }
+  hermes() {
+    printf 'mcp_servers: {}\n' >"$HERMES_HOME/config.yaml"
+    return 1
+  }
+  _gateway_running() { return 0; }
+  if WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1; then
+    echo "disabled wiring ignored a post-write Hermes removal failure" >&2
+    exit 1
+  fi
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
+  [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
+)
+
+# Unknown fingerprints fail safe: even if Hermes exits nonzero after changing
+# config, an unavailable checksum cannot make the write-ahead request look like
+# a confirmed no-op.
+(
+  HB_DATA="$tmp/disabled-fingerprint-failure-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME" "$(dirname "$TOKEN_ENV")"
+  printf 'mcp_servers:\n  executor:\n    enabled: true\n' >"$HERMES_HOME/config.yaml"
+  printf 'stale\n' >"$WIRED"
+  printf 'stale\n' >"$TOKEN_ENV"
+  claude() { :; }
+  codex() { :; }
+  cksum() { return 1; }
+  hermes() {
+    printf 'mcp_servers: {}\n' >"$HERMES_HOME/config.yaml"
+    return 1
+  }
+  _gateway_running() { return 0; }
+  WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1 || true
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
+  [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
+)
+
+# An existing but unreadable config is not equivalent to a missing config.
+# Preserve reload intent when Hermes changes such a file and still exits with
+# an error, because neither side can be fingerprinted reliably.
+(
+  HB_DATA="$tmp/disabled-unreadable-fingerprint-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME" "$(dirname "$TOKEN_ENV")"
+  printf 'mcp_servers:\n  executor:\n    enabled: true\n' >"$HERMES_HOME/config.yaml"
+  chmod 000 "$HERMES_HOME/config.yaml"
+  printf 'stale\n' >"$WIRED"
+  printf 'stale\n' >"$TOKEN_ENV"
+  claude() { :; }
+  codex() { :; }
+  hermes() {
+    chmod 600 "$HERMES_HOME/config.yaml"
+    printf 'mcp_servers: {}\n' >"$HERMES_HOME/config.yaml"
+    chmod 000 "$HERMES_HOME/config.yaml"
+    return 1
+  }
+  _gateway_running() { return 0; }
+  WIRE_EXECUTOR_MCP=0 wire_mcp >/dev/null 2>&1 || true
+  chmod 600 "$HERMES_HOME/config.yaml"
+  [[ "$(cat "$WIRED")" == stale ]]
+  [[ "$(cat "$TOKEN_ENV")" == stale ]]
+  [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
+)
+
+# The workload-facing reload command stops and starts a live gateway once,
+# then consumes its durable request marker. Gateway startup sanitizes the
+# Executor token when wiring is disabled.
+(
+  HB_DATA="$tmp/gateway-reload-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  rm -f "$GATEWAY_DISABLED"
+  mkdir -p "$GATEWAY_RELOAD_REQUESTS"
+  touch "$GATEWAY_RELOAD_REQUESTS/request.initial"
+  export EXECUTOR_MCP_TOKEN=stale
+  _gateway_running() { return 0; }
+  _stop_gateway() { printf 'gateway-stop\n' >>"$tmp/gateway-reload.events"; }
+  _start_gateway() {
+    _load_executor_mcp_env
+    [[ -z "${EXECUTOR_MCP_TOKEN:-}" ]]
+    printf 'gateway-start\n' >>"$tmp/gateway-reload.events"
+    touch "$GATEWAY_RELOAD_REQUESTS/request.concurrent"
+  }
+  WIRE_EXECUTOR_MCP=0 gateway_reload_if_requested
+  [[ ! -e "$GATEWAY_RELOAD_REQUESTS/request.initial" ]]
+  [[ -e "$GATEWAY_RELOAD_REQUESTS/request.concurrent" ]]
+  [[ "$(cat "$tmp/gateway-reload.events")" == $'gateway-stop\ngateway-start' ]]
+)
+
+# A gateway restart preserves the freshest runtime-injected remote token,
+# falls back to an existing exported token, and only then reads the managed
+# on-disk token. Disabling wiring clears every inherited credential.
+(
+  HB_DATA="$tmp/gateway-token-precedence-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  mkdir -p "$(dirname "$TOKEN_ENV")"
+  printf "export EXECUTOR_MCP_TOKEN='disk-token'\n" >"$TOKEN_ENV"
+  WIRE_EXECUTOR_MCP=1
+  export EXECUTOR_MCP_TOKEN=old-process-token
+  BOXD_EXECUTOR_TOKEN=runtime-token
+  _load_executor_mcp_env
+  [[ "$EXECUTOR_MCP_TOKEN" == runtime-token ]]
+  unset BOXD_EXECUTOR_TOKEN
+  EXECUTOR_MCP_TOKEN=live-token
+  _load_executor_mcp_env
+  [[ "$EXECUTOR_MCP_TOKEN" == live-token ]]
+  unset EXECUTOR_MCP_TOKEN
+  _load_executor_mcp_env
+  [[ "$EXECUTOR_MCP_TOKEN" == disk-token ]]
+  WIRE_EXECUTOR_MCP=0
+  _load_executor_mcp_env
+  [[ -z "${EXECUTOR_MCP_TOKEN:-}" ]]
+)
+
+# If a concurrent process owns the gateway lock after the old gateway stops,
+# reload succeeds only when that contender has actually started a replacement.
+(
+  HB_DATA="$tmp/gateway-reload-race-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  mkdir -p "$GATEWAY_RELOAD_REQUESTS"
+  touch "$GATEWAY_RELOAD_REQUESTS/request.race"
+  _gateway_running() { return 0; }
+  _stop_gateway() { :; }
+  _start_gateway() { return 2; }
+  gateway_reload_if_requested
+  [[ ! -e "$GATEWAY_RELOAD_REQUESTS/request.race" ]]
+)
+
+# Hermes removal prompts for confirmation. Legacy cleanup must provide its
+# answer rather than invisibly reading from the login terminal before tmux.
+(
+  HB_DATA="$tmp/unwire-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  mkdir -p "$AGENT_HOME/workspace"
+  claude() { :; }
+  codex() { :; }
+  hermes() {
+    [[ "$*" == 'mcp remove executor' ]]
+    read -r answer
+    [[ "$answer" == y ]]
+    touch "$tmp/hermes-remove-confirmed"
+  }
+  _unwire_legacy
+  [[ -e "$tmp/hermes-remove-confirmed" ]]
+)
+
+# Enabled MCP wiring registers the authenticated Executor endpoint for Hermes
+# as well as Claude and Codex. The secret stays in the managed token env; the
+# Hermes config receives only an environment placeholder.
+(
+  HB_DATA="$tmp/enabled-wire-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  CODEX_HOME="$AGENT_HOME/.codex"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$CODEX_HOME" "$HERMES_HOME"
+  up() { :; }
+  executor_token() { printf 'test-token\n'; }
+  _unwire_legacy() { :; }
+  _record_tool() {
+    local tool="$1"
+    shift
+    { printf '%s' "$tool"; printf ' <%s>' "$@"; printf '\n'; } >>"$tmp/enabled-wire.events"
+  }
+  claude() { _record_tool claude "$@"; }
+  codex() { _record_tool codex "$@"; }
+  hermes() {
+    if [[ "$*" == config\ set* ]] && flock -n "$GATEWAY_RELOAD_LOCK" -c true; then
+      echo "Hermes config changed without holding the gateway reload lock" >&2
+      return 1
+    fi
+    _record_tool hermes "$@"
+  }
+  _gateway_running() { return 0; }
+  _stop_gateway() { echo "enabled wiring stopped its parent gateway" >&2; return 1; }
+  _start_gateway() { echo "enabled wiring restarted its parent gateway" >&2; return 1; }
+  EXECUTOR_HOST=executor WIRE_EXECUTOR_MCP=1 wire_mcp >/dev/null
+  grep -Fq 'hermes <config> <set> <mcp_servers.executor.url> <http://executor:4788/mcp>' "$tmp/enabled-wire.events"
+  grep -Fq 'hermes <config> <set> <mcp_servers.executor.headers.Authorization> <Bearer ${EXECUTOR_MCP_TOKEN}>' "$tmp/enabled-wire.events"
+  grep -Fq 'hermes <config> <set> <mcp_servers.executor.enabled> <true>' "$tmp/enabled-wire.events"
+  [[ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -type f -name 'request.*' -print -quit)" ]]
+  [[ "$(cat "$WIRED")" == http-v3 ]]
+  flock -n "$GATEWAY_RELOAD_LOCK" -c true
+)
+
+# Failed client configuration must leave an already-running gateway alone and
+# must not publish the wiring marker.
+(
+  HB_DATA="$tmp/failed-wire-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  up() { :; }
+  executor_token() { printf 'test-token\n'; }
+  _unwire_legacy() { :; }
+  claude() { :; }
+  codex() { :; }
+  hermes() { return 1; }
+  _gateway_running() { return 0; }
+  _stop_gateway() { touch "$tmp/failed-wire-gateway-stopped"; }
+  _start_gateway() { touch "$tmp/failed-wire-gateway-started"; }
+  if EXECUTOR_HOST=executor WIRE_EXECUTOR_MCP=1 wire_mcp >/dev/null 2>&1; then
+    echo "failed Hermes registration unexpectedly succeeded" >&2
+    exit 1
+  fi
+  [[ ! -e "$tmp/failed-wire-gateway-stopped" ]]
+  [[ ! -e "$tmp/failed-wire-gateway-started" ]]
+  [[ ! -d "$GATEWAY_RELOAD_REQUESTS" ]]
+  [[ ! -e "$WIRED" ]]
+)
+
+# Freshness and doctor validation require the Executor entry itself to be
+# enabled; an unrelated enabled server must not hide a disabled Executor.
+(
+  HB_DATA="$tmp/hermes-config-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HERMES_HOME="$AGENT_HOME/.hermes"
+  mkdir -p "$HERMES_HOME"
+  hermes() { :; }
+  cat >"$HERMES_HOME/config.yaml" <<'EOF'
+mcp_servers:
+  other:
+    enabled: true
+  executor:
+    url: http://executor:4788/mcp
+    headers:
+      Authorization: Bearer ${EXECUTOR_MCP_TOKEN}
+    sampling:
+      enabled: true
+    enabled: false
+EOF
+  if EXECUTOR_HOST=executor _hermes_http_config; then
+    echo "Hermes config accepted a disabled Executor MCP server" >&2
+    exit 1
+  fi
+  sed -i 's/enabled: false/enabled: true/' "$HERMES_HOME/config.yaml"
+  EXECUTOR_HOST=executor _hermes_http_config
 )
 
 # The daemon lock (_acquire_daemon_lock/_release_daemon_lock, shared by
@@ -340,6 +708,7 @@ lock_test_data="$tmp/daemon-lock-data"
 HB_DATA="$lock_test_data" "$PROJECT_ROOT/guest/hb" init >/dev/null
 lock_state_dir="$lock_test_data/home/agent/.config/hermes-box"
 lock_path="$lock_state_dir/test.lock"
+outer_lock_path="$lock_state_dir/outer.lock"
 marker="$lock_state_dir/marker"
 for _ in 1 2 3 4 5 6 7 8; do
   (
@@ -362,10 +731,13 @@ wait
   # shellcheck disable=SC1090
   source "$PROJECT_ROOT/guest/hb"
   rm -f "$lock_path"
+  rm -f "$outer_lock_path"
+  _acquire_daemon_lock "$outer_lock_path" || exit 1
   _acquire_daemon_lock "$lock_path" || exit 1
   _spawn_without_lock_fd "$lock_path" "$tmp/spawned-daemon.log" sleep 30
   spawned_pid=$!
   _release_daemon_lock "$lock_path"
+  _release_daemon_lock "$outer_lock_path"
   echo "$spawned_pid" >"$tmp/spawned.pid"
 )
 [[ -s "$tmp/spawned.pid" ]]
@@ -373,6 +745,11 @@ spawned_pid="$(cat "$tmp/spawned.pid")"
 kill -0 "$spawned_pid" 2>/dev/null || { echo "spawned daemon did not survive its spawning subshell" >&2; exit 1; }
 if ! flock -w 2 "$lock_path" -c 'exit 0' 2>/dev/null; then
   echo "daemon lock was not released — the spawned process likely inherited its fd" >&2
+  kill -9 "$spawned_pid" 2>/dev/null
+  exit 1
+fi
+if ! flock -w 2 "$outer_lock_path" -c 'exit 0' 2>/dev/null; then
+  echo "outer daemon lock was not released — the spawned process inherited an unrelated coordination fd" >&2
   kill -9 "$spawned_pid" 2>/dev/null
   exit 1
 fi
