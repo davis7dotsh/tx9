@@ -21,3 +21,6 @@ __pycache__/
 /bin/
 /tx9
 /dist/
+
+# Wrangler local cache.
+/.wrangler/
