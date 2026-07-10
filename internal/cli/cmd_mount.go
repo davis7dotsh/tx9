@@ -67,11 +67,8 @@ func cmdMountAdd(args []string) error {
 			return fmt.Errorf("mount add %s: target %s is already configured from %s; remove it first", name, mount.Target, existing.Source)
 		}
 		mounts = append(mounts, mount)
-		if err := box.SaveAgentMounts(name, mounts); err != nil {
+		if err := applyAgentMounts(ctx, cli, b, name, mounts); err != nil {
 			return fmt.Errorf("mount add %s: %w", name, err)
-		}
-		if err := applyAgentMounts(ctx, cli, b, mounts); err != nil {
-			return fmt.Errorf("mount add %s: desired mount was saved but agent recreation failed: %w", name, err)
 		}
 		fmt.Printf("tx9: mounted %s at %s in %s (%s)\n", mount.Source, mount.Target, name, mountMode(mount))
 		return nil
@@ -142,18 +139,20 @@ func cmdMountRemove(args []string) error {
 			fmt.Printf("tx9: no configured mount at %s; nothing to do\n", target)
 			return nil
 		}
-		if err := box.SaveAgentMounts(name, kept); err != nil {
+		if err := applyAgentMounts(ctx, cli, b, name, kept); err != nil {
 			return fmt.Errorf("mount remove %s: %w", name, err)
-		}
-		if err := applyAgentMounts(ctx, cli, b, kept); err != nil {
-			return fmt.Errorf("mount remove %s: desired mount removal was saved but agent recreation failed: %w", name, err)
 		}
 		fmt.Printf("tx9: removed mount at %s from %s\n", target, name)
 		return nil
 	})
 }
 
-func applyAgentMounts(ctx context.Context, cli *docker.Client, b *box.Box, mounts []box.AgentMount) error {
+// applyAgentMounts recreates the agent with the desired mount set and only
+// then persists it, so state and container cannot diverge in a way a retry
+// of the same command would skip: a recreation failure leaves the old state
+// (the retry is not an idempotent no-op), and a persisted set always
+// describes a container that actually carried it.
+func applyAgentMounts(ctx context.Context, cli *docker.Client, b *box.Box, name string, mounts []box.AgentMount) error {
 	token, err := box.Token(b.Name)
 	if err != nil {
 		return err
@@ -161,6 +160,9 @@ func applyAgentMounts(ctx context.Context, cli *docker.Client, b *box.Box, mount
 	wasRunning, err := box.RecreateAgent(ctx, cli, b, token, mounts)
 	if err != nil {
 		return err
+	}
+	if err := box.SaveAgentMounts(name, mounts); err != nil {
+		return fmt.Errorf("agent was recreated with the desired mounts but persisting them failed; re-run the command: %w", err)
 	}
 	if !wasRunning {
 		return nil

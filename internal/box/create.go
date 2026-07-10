@@ -272,7 +272,16 @@ func imageConfiguresMountGroups(ctx context.Context, cli *docker.Client, image s
 	if err != nil {
 		return false, fmt.Errorf("detect entrypoint mount group support in %s: %w", image, err)
 	}
-	return exitCode == 0, nil
+	switch exitCode {
+	case 0:
+		return true, nil
+	case 1:
+		return false, nil
+	default:
+		// grep exits 2 when the entrypoint file itself is missing or
+		// unreadable — an inspection failure, not an old image.
+		return false, fmt.Errorf("detect entrypoint mount group support in %s: grep exited %d reading the image entrypoint", image, exitCode)
+	}
 }
 
 const configureAgentMountGroupScript = `set -euo pipefail

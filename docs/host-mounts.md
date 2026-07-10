@@ -59,6 +59,10 @@ supplemental group inside the agent container. This is why a share owned by
 host GID 1000 remains accessible to TX9's agent user even though the agent's
 primary UID/GID is 1001.
 
+The permission check reads only the classic owner/group/other mode bits.
+Directories whose access is granted purely through POSIX ACLs are rejected;
+grant access through a group bit (e.g. `chgrp` + `chmod g+rwx`) instead.
+
 The host mount itself must persist across reboots and be available before the
 agent container starts. On Linux, a systemd `.mount`/`.automount` unit or an
 equivalent `_netdev` mount is preferable to an interactive desktop mount.
