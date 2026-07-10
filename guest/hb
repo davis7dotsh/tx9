@@ -164,7 +164,13 @@ _gateway_running() {
 }
 
 _load_executor_mcp_env() {
-  if [[ "${WIRE_EXECUTOR_MCP:-0}" == 1 && -r "$TOKEN_ENV" ]]; then
+  if [[ "${WIRE_EXECUTOR_MCP:-0}" != 1 ]]; then
+    unset EXECUTOR_MCP_TOKEN
+  elif [[ -n "${BOXD_EXECUTOR_TOKEN:-}" ]]; then
+    export EXECUTOR_MCP_TOKEN="$BOXD_EXECUTOR_TOKEN"
+  elif [[ -n "${EXECUTOR_MCP_TOKEN:-}" ]]; then
+    export EXECUTOR_MCP_TOKEN
+  elif [[ -r "$TOKEN_ENV" ]]; then
     # shellcheck disable=SC1090
     . "$TOKEN_ENV"
   else
@@ -388,6 +394,25 @@ _hermes_config_fingerprint() {
   fi
 }
 
+_start_gateway_after_reload() {
+  local status attempt
+  _start_gateway
+  status=$?
+  [[ "$status" == 2 ]] || return "$status"
+  # Another starter can briefly own GATEWAY_LOCK after the old process stops.
+  # Accept the race only once that contender actually starts the gateway;
+  # otherwise retry and preserve the reload request on a real failure.
+  for attempt in 1 2 3 4 5; do
+    _gateway_running && return 0
+    sleep 1
+    _start_gateway
+    status=$?
+    [[ "$status" == 0 ]] && return 0
+    [[ "$status" == 2 ]] || return "$status"
+  done
+  return 2
+}
+
 gateway_reload_if_requested() {
   local requests=()
   _acquire_daemon_lock "$GATEWAY_RELOAD_LOCK" || return 1
@@ -405,7 +430,7 @@ gateway_reload_if_requested() {
     _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
     return 0
   fi
-  if ! _stop_gateway || ! _start_gateway; then
+  if ! _stop_gateway || ! _start_gateway_after_reload; then
     _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
     return 1
   fi
@@ -675,7 +700,7 @@ main() {
     status) status ;;
     versions) versions ;;
     logs) shift; logs "${1:-executor}" ;;
-    *) echo "usage: hb {init|up|reconcile|down|pause|resume|gateway-enable|gateway-disable|verify-state|acknowledge-active-paths|cutover-ready|web|wire-mcp|doctor|status|versions|logs}"; return 1 ;;
+    *) echo "usage: hb {init|up|reconcile|down|pause|resume|gateway-enable|gateway-disable|gateway-reload-if-requested|verify-state|acknowledge-active-paths|cutover-ready|web|wire-mcp|doctor|status|versions|logs}"; return 1 ;;
   esac
 }
 

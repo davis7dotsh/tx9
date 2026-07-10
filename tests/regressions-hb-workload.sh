@@ -454,6 +454,48 @@ EOF
   [[ "$(cat "$tmp/gateway-reload.events")" == $'gateway-stop\ngateway-start' ]]
 )
 
+# A gateway restart preserves the freshest runtime-injected remote token,
+# falls back to an existing exported token, and only then reads the managed
+# on-disk token. Disabling wiring clears every inherited credential.
+(
+  HB_DATA="$tmp/gateway-token-precedence-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  mkdir -p "$(dirname "$TOKEN_ENV")"
+  printf "export EXECUTOR_MCP_TOKEN='disk-token'\n" >"$TOKEN_ENV"
+  WIRE_EXECUTOR_MCP=1
+  export EXECUTOR_MCP_TOKEN=old-process-token
+  BOXD_EXECUTOR_TOKEN=runtime-token
+  _load_executor_mcp_env
+  [[ "$EXECUTOR_MCP_TOKEN" == runtime-token ]]
+  unset BOXD_EXECUTOR_TOKEN
+  EXECUTOR_MCP_TOKEN=live-token
+  _load_executor_mcp_env
+  [[ "$EXECUTOR_MCP_TOKEN" == live-token ]]
+  unset EXECUTOR_MCP_TOKEN
+  _load_executor_mcp_env
+  [[ "$EXECUTOR_MCP_TOKEN" == disk-token ]]
+  WIRE_EXECUTOR_MCP=0
+  _load_executor_mcp_env
+  [[ -z "${EXECUTOR_MCP_TOKEN:-}" ]]
+)
+
+# If a concurrent process owns the gateway lock after the old gateway stops,
+# reload succeeds only when that contender has actually started a replacement.
+(
+  HB_DATA="$tmp/gateway-reload-race-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  mkdir -p "$GATEWAY_RELOAD_REQUESTS"
+  touch "$GATEWAY_RELOAD_REQUESTS/request.race"
+  _gateway_running() { return 0; }
+  _stop_gateway() { :; }
+  _start_gateway() { return 2; }
+  gateway_reload_if_requested
+  [[ ! -e "$GATEWAY_RELOAD_REQUESTS/request.race" ]]
+)
+
 # Hermes removal prompts for confirmation. Legacy cleanup must provide its
 # answer rather than invisibly reading from the login terminal before tmux.
 (
