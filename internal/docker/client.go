@@ -154,6 +154,7 @@ type ContainerSpec struct {
 	NetworkID      string
 	NetworkAliases []string
 	Binds          []string // "volume:/container/path" or "volume:/path:ro"
+	GroupAdd       []string // supplemental numeric GIDs needed by host bind mounts
 	ExposedPorts   nat.PortSet
 	PortBindings   nat.PortMap
 	DNS            []string
@@ -177,6 +178,7 @@ func (c *Client) ContainerCreate(ctx context.Context, spec ContainerSpec) (strin
 	}
 	hostCfg := &container.HostConfig{
 		Binds:        spec.Binds,
+		GroupAdd:     spec.GroupAdd,
 		PortBindings: spec.PortBindings,
 		DNS:          spec.DNS,
 		Sysctls:      spec.Sysctls,

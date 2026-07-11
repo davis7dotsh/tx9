@@ -88,6 +88,11 @@ func cmdCreate(args []string) error {
 	if err := box.SaveExecutorConfig(name, tok, executorConfig); err != nil {
 		return fmt.Errorf("create %s: %w", name, err)
 	}
+	// Host mounts are machine-local desired state, not part of a portable
+	// box. Never inherit them from a stale same-named env file.
+	if err := box.SaveAgentMounts(name, nil); err != nil {
+		return fmt.Errorf("create %s: %w", name, err)
+	}
 
 	fmt.Printf("tx9: creating box %q (agent + executor containers, private network)\n", name)
 	b, err := box.Create(ctx, cli, box.CreateOpts{

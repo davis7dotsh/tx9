@@ -85,6 +85,8 @@ grep -q 'provision.sh tools' docker/Dockerfile
 grep -q 'provision.sh assets' docker/Dockerfile
 grep -q 'EXECUTOR_MCP_TOKEN' docker/executor-entrypoint.sh
 grep -q -- '--hostname 0.0.0.0' docker/executor-entrypoint.sh
+grep -q 'TX9_AGENT_MOUNT_GIDS' docker/entrypoint.sh
+grep -q 'usermod --append --groups' docker/entrypoint.sh
 grep -Fq '[ -t 0 ] && [ -t 1 ]' guest/agent-bash-profile.sh
 
 grep -qi 'networking is always enabled' README.md

@@ -43,6 +43,7 @@ var commandSpecs = []commandSpec{
 	{name: "stop", help: "stop a running box", run: cmdStop},
 	{name: "backup", help: "archive a box to a .tx9 file", aliases: []string{"export", "save"}, run: cmdBackup},
 	{name: "import", help: "restore a box from a .tx9 file", aliases: []string{"load", "restore"}, run: cmdImport},
+	{name: "mount", help: "add/list/remove persistent agent host mounts", run: cmdMount},
 	{name: "gateway", help: "status/enable/disable the supervised Hermes gateway", run: cmdGateway},
 	{name: "open", help: "print/open a box's authenticated dashboard URL", run: cmdOpen},
 	{name: "doctor", help: "run health checks against a box", run: cmdDoctor},

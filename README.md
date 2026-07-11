@@ -16,6 +16,8 @@ the runtime architecture and its verification history.
 
 For a stable HTTPS Executor origin and OAuth callbacks over a tailnet, see
 [Tailscale HTTPS for Executor](docs/tailscale-executor.md).
+For host directories and NAS shares that should be visible inside an agent,
+see [Host mounts](docs/host-mounts.md).
 
 ## Model
 
@@ -41,6 +43,17 @@ The agent volume is the box; containers are disposable; tools are image
 layers ("upgrade" = rebuild image + recreate containers). Executor state is
 scratch and does not travel. Networking is always enabled because the agent
 tools require internet access.
+
+External host storage can be attached below `/mnt` without folding it into the
+portable box volume:
+
+```bash
+tx9 mount add media-bot "$HOME/agents" /mnt/agents --require-mountpoint
+tx9 mount list media-bot
+```
+
+Mount configuration survives container recreation and box upgrades. The host
+is still responsible for mounting and authenticating the underlying share.
 
 ## Repository layout
 
