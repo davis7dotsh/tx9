@@ -4,7 +4,6 @@ import (
 	"context"
 	"flag"
 	"fmt"
-	"io"
 	"os"
 	"path"
 	"text/tabwriter"
@@ -170,7 +169,14 @@ func applyAgentMounts(ctx context.Context, cli *docker.Client, b *box.Box, name 
 	// A quiesced box (e.g. freshly imported, single-writer safety gate) must
 	// stay quiesced: PrepareRuntime runs `hb up`, which clears the quiesce
 	// marker and wires MCP — exactly what cmd_import deliberately avoids.
-	if err := box.HB(ctx, cli, b, token, io.Discard, io.Discard, "is-paused"); err == nil {
+	// An inconclusive check is an error, not "active": guessing wrong would
+	// unquiesce the box. The mounts themselves are already applied and
+	// saved; the box's own workload loop reconciles the runtime regardless.
+	quiesced, err := box.AgentQuiesced(ctx, cli, b, token)
+	if err != nil {
+		return fmt.Errorf("mounts are applied, but could not determine whether the box is quiesced; skipped runtime preparation: %w", err)
+	}
+	if quiesced {
 		fmt.Println("tx9: box is quiesced; skipping runtime preparation (run `hb resume` inside the box when ready)")
 		return nil
 	}

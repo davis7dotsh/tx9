@@ -309,6 +309,40 @@ func configureAgentMountGroups(ctx context.Context, cli *docker.Client, containe
 	return nil
 }
 
+// AgentQuiesced reports whether the box's agent is quiesced (`hb pause`,
+// the single-writer safety gate). Unlike calling `hb is-paused` through HB —
+// where "not paused" (exit 1) and "exec failed" are the same error — this
+// maps the exit code inside the container so a transient exec failure is an
+// error, never mistaken for "active".
+func AgentQuiesced(ctx context.Context, cli *docker.Client, b *Box, token string) (bool, error) {
+	if b.AgentID == "" {
+		return false, fmt.Errorf("box: quiesce check %s: agent container missing", b.Name)
+	}
+	cmd := []string{
+		"runuser", "-u", "agent", "--",
+		"env", "HOME=/data/home/agent",
+		"EXECUTOR_HOST=executor",
+		"BOXD_EXECUTOR_TOKEN=" + token,
+		"bash", "--noprofile", "--norc", "-c",
+		`. /etc/profile.d/hermes-box.sh; if hb is-paused; then echo paused; else rc=$?; [ "$rc" -eq 1 ] && echo active || exit "$rc"; fi`,
+	}
+	res, err := cli.Exec(ctx, b.AgentID, cmd, nil, "root")
+	if err != nil {
+		return false, fmt.Errorf("box: quiesce check %s: %w", b.Name, err)
+	}
+	if res.ExitCode != 0 {
+		return false, fmt.Errorf("box: quiesce check %s: exit %d: %s", b.Name, res.ExitCode, strings.TrimSpace(res.Stderr))
+	}
+	switch strings.TrimSpace(res.Stdout) {
+	case "paused":
+		return true, nil
+	case "active":
+		return false, nil
+	default:
+		return false, fmt.Errorf("box: quiesce check %s: unexpected output %q", b.Name, strings.TrimSpace(res.Stdout))
+	}
+}
+
 // HB runs `hb <args...>` inside the agent container, exactly replicating
 // boxd's `_guest_hb` remote-control pattern (dossier §3): `runuser` drops to
 // the agent user, and BOXD_EXECUTOR_TOKEN takes precedence over whatever
