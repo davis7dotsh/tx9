@@ -21,6 +21,7 @@ import (
 func cmdCreate(args []string) error {
 	fs := flag.NewFlagSet("create", flag.ContinueOnError)
 	executorFlags := addExecutorConfigFlags(fs)
+	resourceFlags := addResourceConfigFlags(fs)
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
 	}
@@ -54,6 +55,10 @@ func cmdCreate(args []string) error {
 		return fmt.Errorf("create: %w", err)
 	}
 	executorConfig, err := executorFlags.loadFresh(name)
+	if err != nil {
+		return fmt.Errorf("create %s: %w", name, err)
+	}
+	resources, err := resourceFlags.apply(box.DefaultResources())
 	if err != nil {
 		return fmt.Errorf("create %s: %w", name, err)
 	}
@@ -93,10 +98,13 @@ func cmdCreate(args []string) error {
 	if err := box.SaveAgentMounts(name, nil); err != nil {
 		return fmt.Errorf("create %s: %w", name, err)
 	}
+	if err := box.SaveResources(name, resources); err != nil {
+		return fmt.Errorf("create %s: %w", name, err)
+	}
 
 	fmt.Printf("tx9: creating box %q (agent + executor containers, private network)\n", name)
 	b, err := box.Create(ctx, cli, box.CreateOpts{
-		Name: name, Image: imageTag, Token: tok, Executor: executorConfig,
+		Name: name, Image: imageTag, Token: tok, Executor: executorConfig, Resources: resources,
 	})
 	if err != nil {
 		box.Destroy(ctx, cli, name)

@@ -25,7 +25,8 @@ files=(
 
 bash -n "${files[@]}"
 python3 -c 'compile(open("guest/hermes-state", encoding="utf-8").read(), "guest/hermes-state", "exec")'
-for file in guest/hb guest/hb-workload guest/hermes-state provision/provision.sh tests/hermes-state.sh "${regression_files[@]}"; do
+python3 -c 'compile(open("guest/tx9-logs", encoding="utf-8").read(), "guest/tx9-logs", "exec")'
+for file in guest/hb guest/hb-workload guest/hermes-state guest/tx9-logs provision/provision.sh tests/hermes-state.sh "${regression_files[@]}"; do
   [[ -x "$file" ]] || { echo "not executable: $file" >&2; exit 1; }
 done
 
@@ -87,6 +88,10 @@ grep -q 'EXECUTOR_MCP_TOKEN' docker/executor-entrypoint.sh
 grep -q -- '--hostname 0.0.0.0' docker/executor-entrypoint.sh
 grep -q 'TX9_AGENT_MOUNT_GIDS' docker/entrypoint.sh
 grep -q 'usermod --append --groups' docker/entrypoint.sh
+grep -q 'tx9-logs capture' docker/entrypoint.sh
+grep -q -- '--source agent' docker/entrypoint.sh
+grep -q 'tx9-logs capture --source executor' docker/executor-entrypoint.sh
+grep -q 'tx9-logs.*OPT/bin/tx9-logs' provision/provision.sh
 grep -Fq '[ -t 0 ] && [ -t 1 ]' guest/agent-bash-profile.sh
 
 grep -qi 'networking is always enabled' README.md

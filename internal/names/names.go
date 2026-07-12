@@ -30,6 +30,7 @@ var reserved = map[string]bool{
 	"enter": true, "ssh": true, "shell": true, "start": true, "stop": true,
 	"backup": true, "export": true, "save": true,
 	"import": true, "load": true, "restore": true,
+	"logs": true, "resources": true,
 	"gateway": true, "open": true, "doctor": true, "upgrade": true, "update": true,
 	"delete": true, "rm": true, "remove": true, "prune": true,
 	"help": true, "version": true,

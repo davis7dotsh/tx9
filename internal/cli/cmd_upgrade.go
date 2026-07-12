@@ -29,13 +29,14 @@ func cmdUpgrade(args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
 	force := fs.Bool("force", false, "self-update: skip the dev-build guard and reinstall even if already current")
 	executorFlags := addExecutorConfigFlags(fs)
+	resourceFlags := addResourceConfigFlags(fs)
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
 	}
 
 	if fs.NArg() == 0 {
-		if executorFlags.hasOverrides() {
-			return fmt.Errorf("upgrade: executor flags require a box name")
+		if executorFlags.hasOverrides() || resourceFlags.hasOverrides() {
+			return fmt.Errorf("upgrade: executor/resource flags require a box name")
 		}
 		return cmdUpgradeSelf(*force)
 	}
@@ -51,6 +52,14 @@ func cmdUpgrade(args []string) error {
 		}
 		fromVersion := b.Version
 		executorConfig, err := executorFlags.load(name)
+		if err != nil {
+			return fmt.Errorf("upgrade %s: %w", name, err)
+		}
+		resources, err := box.InspectResources(ctx, cli, b)
+		if err != nil {
+			return fmt.Errorf("upgrade %s: %w", name, err)
+		}
+		resources, err = resourceFlags.apply(resources)
 		if err != nil {
 			return fmt.Errorf("upgrade %s: %w", name, err)
 		}
@@ -78,6 +87,9 @@ func cmdUpgrade(args []string) error {
 		if err := box.SaveExecutorConfig(name, tok, executorConfig); err != nil {
 			return fmt.Errorf("upgrade %s: %w", name, err)
 		}
+		if err := box.SaveResources(name, resources); err != nil {
+			return fmt.Errorf("upgrade %s: %w", name, err)
+		}
 
 		fmt.Printf("tx9: stopping and removing %s's containers (network/volumes/token kept)\n", name)
 		if err := removeBoxContainers(ctx, cli, b); err != nil {
@@ -86,7 +98,7 @@ func cmdUpgrade(args []string) error {
 
 		fmt.Printf("tx9: recreating %s on %s\n", name, imageTag)
 		newB, err := box.Create(ctx, cli, box.CreateOpts{
-			Name: name, Image: imageTag, Token: tok, Executor: executorConfig, AgentMounts: agentMounts,
+			Name: name, Image: imageTag, Token: tok, Executor: executorConfig, Resources: resources, AgentMounts: agentMounts,
 		})
 		if err != nil {
 			// Create returns the box when the containers exist but failed to

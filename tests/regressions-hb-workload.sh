@@ -141,6 +141,134 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
   fi
 )
 
+# Gateway process discovery excludes the tx9-logs supervisor whose argv also
+# contains the wrapped `hermes gateway run` command.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  pgrep() { printf '101\n202\n'; }
+  ps() {
+    case "${*: -1}" in
+      101) printf 'python3 /opt/hermes-box/bin/tx9-logs capture --source hermes -- hermes gateway run --replace\n' ;;
+      202) printf 'hermes gateway run --replace\n' ;;
+    esac
+  }
+  mapfile -t gateway_pids < <(_gateway_pids)
+  [[ "${gateway_pids[*]}" == 202 ]]
+  mapfile -t capture_pids < <(_gateway_capture_pids)
+  [[ "${capture_pids[*]}" == 101 ]]
+  _gateway_running
+)
+
+# Gateway startup holds its flock until the real Hermes child appears. A
+# concurrent reconcile therefore observes that child instead of launching a
+# second tx9-logs wrapper during Python startup or legacy-log migration.
+(
+  HB_DATA="$tmp/gateway-start-race-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  rm -f "$GATEWAY_DISABLED" "$QUIESCE_FILE"
+  INSTALL_HERMES=1
+  launches="$tmp/gateway-start-race.launches"
+  running="$tmp/gateway-start-race.running"
+  hermes() { :; }
+  _spawn_without_lock_fd() {
+    printf 'launch\n' >>"$launches"
+    (sleep 0.2; touch "$running"; sleep 0.2) &
+  }
+  _gateway_pids() { [[ ! -e "$running" ]] || printf '4242\n'; }
+  _gateway_capture_pids() { return 0; }
+  _start_gateway &
+  first_start=$!
+  sleep 0.02
+  _start_gateway &
+  second_start=$!
+  wait "$first_start"
+  wait "$second_start"
+  [[ "$(wc -l <"$launches" | tr -d ' ')" == 1 ]]
+  [[ "$(cat "$GATEWAY_PID")" == 4242 ]]
+)
+
+# A live capture wrapper that outlasts the synchronous wait is migration-
+# pending, not failed. Leave it running, and have concurrent reconciliations
+# recognize the same wrapper instead of killing/relaunching it from byte zero.
+(
+  HB_DATA="$tmp/gateway-slow-migration-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  rm -f "$GATEWAY_DISABLED" "$QUIESCE_FILE"
+  INSTALL_HERMES=1
+  launches="$tmp/gateway-slow-migration.launches"
+  slow_wrapper_pid=""
+  hermes() { :; }
+  _spawn_without_lock_fd() {
+    printf 'launch\n' >>"$launches"
+    command sleep 30 &
+    slow_wrapper_pid=$!
+  }
+  _gateway_pids() { return 0; }
+  _gateway_capture_pids() { [[ -z "$slow_wrapper_pid" ]] || printf '%s\n' "$slow_wrapper_pid"; }
+  # Exercise all 50 polling iterations without making the regression sleep.
+  sleep() { :; }
+
+  _start_gateway
+  kill -0 "$slow_wrapper_pid"
+  _start_gateway
+  kill -0 "$slow_wrapper_pid"
+  [[ "$(wc -l <"$launches" | tr -d ' ')" == 1 ]]
+  [[ ! -e "$GATEWAY_PID" ]]
+  kill "$slow_wrapper_pid"
+  wait "$slow_wrapper_pid" 2>/dev/null || true
+)
+
+# A concurrent explicit enable waits longer for GATEWAY_LOCK than the starter
+# holds it, then recognizes the same pending wrapper. It must never restore the
+# disabled marker while that wrapper is still capable of starting Hermes.
+(
+  HB_DATA="$tmp/gateway-enable-pending-race-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  rm -f "$GATEWAY_DISABLED" "$QUIESCE_FILE"
+  INSTALL_HERMES=1
+  GATEWAY_START_WAIT_ATTEMPTS=3
+  GATEWAY_START_WAIT_INTERVAL=0.1
+  GATEWAY_LOCK_WAIT_SECONDS=1
+  launches="$tmp/gateway-enable-pending-race.launches"
+  wrapper_pid_file="$tmp/gateway-enable-pending-race.pid"
+  hermes() { :; }
+  _spawn_without_lock_fd() {
+    printf 'launch\n' >>"$launches"
+    command sleep 30 &
+    printf '%s\n' "$!" >"$wrapper_pid_file"
+  }
+  _gateway_pids() { return 0; }
+  _gateway_capture_pids() { [[ ! -s "$wrapper_pid_file" ]] || cat "$wrapper_pid_file"; }
+
+  _start_gateway &
+  first_start=$!
+  wait_for_file "$wrapper_pid_file"
+  set +e
+  gateway_enable --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY \
+    >"$tmp/gateway-enable-pending-race.stdout" \
+    2>"$tmp/gateway-enable-pending-race.stderr"
+  enable_status=$?
+  wait "$first_start"
+  first_status=$?
+  set -e
+  slow_wrapper_pid="$(cat "$wrapper_pid_file")"
+
+  [[ "$first_status" == 0 ]]
+  [[ "$enable_status" == 0 ]]
+  [[ ! -e "$GATEWAY_DISABLED" ]]
+  kill -0 "$slow_wrapper_pid"
+  [[ "$(wc -l <"$launches" | tr -d ' ')" == 1 ]]
+  kill "$slow_wrapper_pid"
+  wait "$slow_wrapper_pid" 2>/dev/null || true
+)
+
 # Active-path acknowledgement reports success only when persistence succeeds.
 (
   # shellcheck disable=SC1090

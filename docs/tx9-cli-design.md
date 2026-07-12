@@ -1,10 +1,10 @@
 # tx9 CLI — design
 
-Status: agreed 2026-07-04 (12 decisions below, settled in conversation with
-Davis). Nothing here is implemented yet; this document is the spec the Go
-implementation is built from. The bash prototypes that informed it (`./box`
-on smolvm, `./docker/boxd` on compose) are deleted; recover them from git
-history (`9350212` and earlier) when porting logic.
+Status: implemented and evolving. The initial 12 decisions were settled on
+2026-07-04; this document now records the shipped Go CLI plus later command
+surface additions. The deleted bash prototypes that informed it (`./box` on
+smolvm, `./docker/boxd` on compose) remain available in git history
+(`9350212` and earlier).
 
 ## What tx9 is
 
@@ -38,6 +38,11 @@ tx9 create
 
 ## Command surface
 
+Running `tx9` with no arguments prints an ASCII overview of configured boxes
+(state, image version, dashboard URL, container CPU/RAM, and volume
+usage/budgets), followed by the command list. It exits successfully when the
+Docker overview can be read. `tx9 help` remains Docker-independent.
+
 | Command | Behavior |
 |---|---|
 | `tx9 create [name]` (alias `new`) | Generate name if absent. Build `tx9-box:<version>` if missing (with real progress UX). Create network + volumes + both containers, mint token, wire MCP, run doctor. Print getting-started checklist. |
@@ -47,6 +52,8 @@ tx9 create
 | `tx9 backup <box>` (aliases `export`, `save`) | Flags: `--path` (default `~/Downloads`), `--password`/env/prompt, `--no-encrypt`. Quiesce → archive agent /data → validate → (encrypt) → verify → `<box>-<timestamp>.tx9`. |
 | `tx9 import <file.tx9>` (aliases `load`, `restore`) | Flags: `--name`, `--password`/env/prompt. Validate before creating anything; restore staged; arrive quiesced + gateway-disabled + fresh token; fail on name collision. |
 | `tx9 mount <add\|list\|remove> ...` | Persist host-directory bind mounts for an agent and recreate only its disposable container. Targets must be below `/mnt`, outside the portable `/data` volume. `add` supports `--read-only` and `--require-mountpoint`. |
+| `tx9 logs <box>` | Query durable agent, Executor, Hermes, Codex, and Claude events. Filters include source, age, text, count, and normalized JSONL. `tx9 logs export <box>` creates a mode-0600 portable log bundle from both isolated volumes. |
+| `tx9 resources <box>` | Show actual container CPU/RAM limits and volume usage versus advisory budgets. `resources set` updates limits live and persists them; `resources reset` restores 4 CPU/8 GiB (agent) and 2 CPU/2 GiB (Executor). |
 | `tx9 gateway <status\|enable\|disable> <box>` | Inspect or control the container-supervised Hermes gateway. Enable requires `--confirm-single-writer`. |
 | `tx9 open <box>` | Print (or open) the authenticated dashboard URL (`?_token=`). |
 | `tx9 doctor <box>` | In-box `hb doctor` + host-side published-port probe. |
@@ -58,6 +65,10 @@ tx9 create
 `--executor-web-base-url`, `--executor-publish`, and `--executor-dns` options.
 Their resolved values are persisted per box and reused on future upgrades.
 `--clear-executor-config` returns a box to the default dynamic HTTP exposure.
+The same commands also accept `--agent-cpus`, `--agent-memory`,
+`--executor-cpus`, `--executor-memory`, `--agent-volume-budget`, and
+`--executor-volume-budget`; omitted values keep the defaults or the box's
+current allocation, as appropriate.
 
 ## Fixed contracts (carried from the verified bash draft)
 
@@ -86,6 +97,17 @@ the port:
   `--require-mountpoint` refuses to bind an empty underlying directory when a
   host share is offline. Required non-root source GIDs are added to the agent
   container automatically.
+- **Resources**: container limits are per-box desired state, with current
+  defaults of 4 CPU/8 GiB for the agent and 2 CPU/2 GiB for Executor. Live
+  changes survive upgrades and agent recreation. Local named volumes remain
+  unbounded host-backed storage; recorded volume budgets are advisory and
+  never labeled as enforced quotas.
+- **Observability**: tx9-owned process output is redacted, rotated, and stored
+  on the producing component's own volume. Host-side queries merge these
+  streams with tolerant readers for the native Codex/Claude JSONL and Hermes
+  SQLite histories. Executor data is never mounted into the agent container.
+  This provides complete tx9-owned runtime output, not an independent audit
+  trail for operations that Executor does not emit to any durable sink.
 - **Gateway single-writer**: restored boxes never auto-enable the Hermes
   gateway. `tx9 gateway enable <box> --confirm-single-writer` delegates to
   `hb gateway-enable` and stays the only host-side path.

@@ -79,6 +79,18 @@ per box into `.boxd/<name>.env` (mode 0600) and injects into both containers.
 with that token (`EXECUTOR_HOST` + `BOXD_EXECUTOR_TOKEN`); the same token
 authenticates you to the dashboard/MCP from the LAN or Tailscale.
 
+Both volumes also retain observability data without crossing the isolation
+boundary. Agent supervisor/Hermes output and native Codex/Claude/Hermes
+histories stay on `agent-data`; Executor runtime output stays on `exec-data`.
+`tx9 logs` mounts both volumes read-only into a short-lived helper solely for
+query/export. The agent container never receives the Executor volume.
+
+Container resource defaults are agent 4 CPU/8 GiB and Executor 2 CPU/2 GiB.
+They are per-box, live-updatable limits rather than image settings. Docker
+local volumes have host-wide elastic capacity on the supported default
+backend, so tx9 reports real usage plus `unlimited`, with optional advisory
+budgets for planning and warnings.
+
 What the agent container can do to Executor: exactly what any LAN client can
 do — talk HTTP to the token-gated endpoint. Nothing else. Cross-box: each
 compose project gets its own network, so `alpha`'s agent cannot even resolve

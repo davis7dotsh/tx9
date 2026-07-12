@@ -44,6 +44,16 @@ _stop_api_bridge() { [ "$HERMES_BRIDGE_PORT" = 0 ] || _stop_bridge "$HERMES_BRID
 
 _stop_executor_bridge() { [ "$PORT" = 4788 ] || _stop_bridge "$PORT"; }
 
+_spawn_logged() {
+  local source="$1" logfile="$2"
+  shift 2
+  if command -v tx9-logs >/dev/null 2>&1; then
+    tx9-logs capture --source "$source" --log-dir "$LOGS" -- "$@" &
+  else
+    "$@" >>"$logfile" 2>&1 &
+  fi
+}
+
 _gateway_reload_pending() {
   [ -d "$GATEWAY_RELOAD_REQUESTS" ] &&
     [ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -maxdepth 1 -type f -name 'request.*' -print -quit)" ]
@@ -84,22 +94,26 @@ reconcile_once() {
     return
   fi
   if _gateway_reload_pending &&
-     ! hb gateway-reload-if-requested >>"$LOGS/workload.log" 2>&1; then
+     ! hb gateway-reload-if-requested; then
     _stop_api_bridge
     return
   fi
-  if hb reconcile >>"$LOGS/workload.log" 2>&1; then reconciled=1; fi
+  # The container entrypoint captures this process's stdout/stderr into the
+  # compatible workload.log and structured agent.jsonl. Leaving hb output on
+  # its original stream also keeps it visible in `docker logs`.
+  if hb reconcile; then reconciled=1; fi
   # socat bridge for host access (only when a distinct port was assigned)
   if [ "$PORT" != "4788" ] && command -v socat >/dev/null 2>&1 && _exec_up \
      && ! pgrep -f "socat TCP-LISTEN:$PORT," >/dev/null 2>&1; then
-    socat "TCP-LISTEN:$PORT,bind=0.0.0.0,fork,reuseaddr" "TCP:127.0.0.1:$EXECUTOR_TARGET_PORT" \
-      >>"$LOGS/socat.log" 2>&1 &
+    _spawn_logged socat "$LOGS/socat.log" socat \
+      "TCP-LISTEN:$PORT,bind=0.0.0.0,fork,reuseaddr" "TCP:127.0.0.1:$EXECUTOR_TARGET_PORT"
   fi
   if [ "$HERMES_BRIDGE_PORT" != 0 ] && [ "$reconciled" = 1 ] && [ ! -e "$GATEWAY_DISABLED" ] \
      && command -v socat >/dev/null 2>&1 && _wait_api_ready; then
     if ! pgrep -f "socat TCP-LISTEN:$HERMES_BRIDGE_PORT," >/dev/null 2>&1; then
-      socat "TCP-LISTEN:$HERMES_BRIDGE_PORT,bind=0.0.0.0,fork,reuseaddr" \
-        "TCP:127.0.0.1:$HERMES_TARGET_PORT" >>"$LOGS/hermes-api-socat.log" 2>&1 &
+      _spawn_logged hermes-api-socat "$LOGS/hermes-api-socat.log" socat \
+        "TCP-LISTEN:$HERMES_BRIDGE_PORT,bind=0.0.0.0,fork,reuseaddr" \
+        "TCP:127.0.0.1:$HERMES_TARGET_PORT"
     fi
   else
     _stop_api_bridge

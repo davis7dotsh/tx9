@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"errors"
+	"io"
 	"strings"
 	"testing"
 )
@@ -54,5 +56,37 @@ func TestUsageShowsAliasesFromCommandSpecs(t *testing.T) {
 		if !strings.Contains(usage.String(), line) {
 			t.Errorf("usage does not contain alias line %q:\n%s", line, usage.String())
 		}
+	}
+}
+
+func TestNoArgumentsShowsOverviewAndCommands(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	status := runWithOverview([]string{"tx9"}, nil, func(w io.Writer) error {
+		_, err := io.WriteString(w, "ASCII BOX DIAGRAM\n")
+		return err
+	}, &stdout, &stderr)
+	if status != 0 {
+		t.Fatalf("status = %d, want 0; stderr=%s", status, stderr.String())
+	}
+	for _, want := range []string{"ASCII BOX DIAGRAM", "Commands:", "logs", "resources"} {
+		if !strings.Contains(stdout.String(), want) {
+			t.Errorf("stdout missing %q:\n%s", want, stdout.String())
+		}
+	}
+}
+
+func TestNoArgumentsFallsBackToCommandsWhenOverviewFails(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	status := runWithOverview([]string{"tx9"}, nil, func(io.Writer) error {
+		return errors.New("daemon unavailable")
+	}, &stdout, &stderr)
+	if status != 1 {
+		t.Fatalf("status = %d, want 1", status)
+	}
+	if !strings.Contains(stdout.String(), "overview unavailable") || !strings.Contains(stdout.String(), "Commands:") {
+		t.Fatalf("stdout missing fallback:\n%s", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "daemon unavailable") {
+		t.Fatalf("stderr missing cause:\n%s", stderr.String())
 	}
 }

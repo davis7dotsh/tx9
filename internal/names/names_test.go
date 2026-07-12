@@ -61,6 +61,8 @@ func TestValidate(t *testing.T) {
 		{"save", false},
 		{"load", false},
 		{"restore", false},
+		{"logs", false},
+		{"resources", false},
 		{"gateway", false},
 		{"update", false},
 		{"rm", false},

@@ -1,0 +1,1774 @@
+#!/usr/bin/env python3
+"""Capture, query, and export durable tx9 event logs.
+
+The capture mode is an internal container primitive. Query and export are the
+stable host integration surface used by `tx9 logs` with the two box volumes
+mounted read-only at arbitrary roots.
+"""
+
+from __future__ import annotations
+
+import argparse
+import base64
+import datetime as dt
+import heapq
+import io
+import json
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+import urllib.parse
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from pathlib import Path
+from typing import Any, BinaryIO
+
+
+SCHEMA = "tx9.event.v1"
+DEFAULT_MAX_BYTES = 20 * 1024 * 1024
+DEFAULT_MAX_FILES = 5
+MIN_MAX_BYTES = 1024
+MAX_EVENT_MESSAGE_BYTES = 1024 * 1024
+MAX_CAPTURE_CHUNK_BYTES = 64 * 1024
+MAX_NORMALIZE_DEPTH = 24
+MAX_NORMALIZE_ITEMS = 200
+MAX_NORMALIZE_STRING_BYTES = 64 * 1024
+MAX_SOURCE_RECORD_BYTES = 2 * 1024 * 1024
+REDACTED = "[REDACTED]"
+REDACTED_BYTES = REDACTED.encode()
+TRUNCATED = "[TRUNCATED]"
+UTC = dt.timezone.utc
+
+SOURCE_ALIASES = {
+    "agent": "agent",
+    "supervisor": "agent",
+    "workload": "agent",
+    "executor": "executor",
+    "hermes": "hermes",
+    "gateway": "hermes",
+    "hermes-gateway": "hermes",
+    "codex": "codex",
+    "cc": "claude",
+    "claude": "claude",
+    "claude-code": "claude",
+    "socat": "agent",
+    "hermes-api-socat": "hermes",
+}
+
+BEARER_RE = re.compile(r"(?i)(\bbearer[ \t]+)([^\s,;\"']+)")
+AUTHORIZATION_RE = re.compile(r"(?i)(\b(?:proxy-)?authorization\b[ \t]*[=:][ \t]*)([^\r\n]+)")
+COOKIE_HEADER_RE = re.compile(r"(?im)(\b(?:set-)?cookie\b[ \t]*:[ \t]*)([^\r\n]*)")
+TOKEN_PARAM_RE = re.compile(
+    r"(?i)(\b[A-Za-z0-9_.-]*token\b[\"']?[ \t]*(?:%3[dD]|[=:])[ \t]*(?:%22|%27|[\"']?))"
+    r"([^\s&;,}\]\"']+)"
+)
+SENSITIVE_PARAM_RE = re.compile(
+    r"(?i)(\b[A-Za-z0-9_.-]*(?:password|passwd|secret|api[_-]?key|authorization|cookie)"
+    r"[A-Za-z0-9_.-]*\b[\"']?[ \t]*(?:%3[dD]|[=:])[ \t]*(?:%22|%27|[\"']?))"
+    r"([^\s&;,}\]\"']+)"
+)
+TOKEN_ENV_NAME_RE = re.compile(r"(^|_)TOKEN($|_)", re.IGNORECASE)
+
+WARNINGS: list[str] = []
+
+
+def utc_now() -> dt.datetime:
+    return dt.datetime.now(UTC)
+
+
+def isoformat(value: dt.datetime | None = None) -> str:
+    value = value or utc_now()
+    return value.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def warn(message: str) -> None:
+    message = redact_text(message, token_env_values())
+    WARNINGS.append(message)
+    print(f"tx9-logs: warning: {message}", file=sys.stderr)
+
+
+def token_env_values() -> tuple[str, ...]:
+    values = {
+        value
+        for name, value in os.environ.items()
+        if value and (TOKEN_ENV_NAME_RE.search(name) or sensitive_key(name))
+    }
+    return tuple(sorted(values, key=len, reverse=True))
+
+
+def redact_text(value: str, exact_values: Sequence[str]) -> str:
+    value = BEARER_RE.sub(lambda match: match.group(1) + REDACTED, value)
+    value = AUTHORIZATION_RE.sub(lambda match: match.group(1) + REDACTED, value)
+    value = COOKIE_HEADER_RE.sub(lambda match: match.group(1) + REDACTED, value)
+    value = TOKEN_PARAM_RE.sub(lambda match: match.group(1) + REDACTED, value)
+    value = SENSITIVE_PARAM_RE.sub(lambda match: match.group(1) + REDACTED, value)
+    for secret in exact_values:
+        value = value.replace(secret, REDACTED)
+    return value
+
+
+def sensitive_key(value: str) -> bool:
+    compact = re.sub(r"[^a-z0-9]", "", value.casefold())
+    if compact.endswith("token") and not compact.endswith("tokens"):
+        return True
+    return any(
+        marker in compact
+        for marker in ("password", "passwd", "secret", "apikey", "authorization", "cookie")
+    )
+
+
+def redact_value(value: Any, exact_values: Sequence[str]) -> Any:
+    if isinstance(value, str):
+        return redact_text(value, exact_values)
+    if isinstance(value, list):
+        return [redact_value(item, exact_values) for item in value]
+    if isinstance(value, tuple):
+        return [redact_value(item, exact_values) for item in value]
+    if isinstance(value, Mapping):
+        redacted: dict[str, Any] = {}
+        for key, item in value.items():
+            text_key = str(key)
+            if sensitive_key(text_key):
+                redacted[text_key] = REDACTED
+            else:
+                redacted[text_key] = redact_value(item, exact_values)
+        return redacted
+    return value
+
+
+class StreamingExactRedactor:
+    """Redact exact byte strings without exposing matches across reads."""
+
+    def __init__(self, exact_values: Sequence[bytes]) -> None:
+        self.exact_values = tuple(
+            sorted({value for value in exact_values if value}, key=len, reverse=True)
+        )
+        self.pattern = (
+            re.compile(b"|".join(re.escape(value) for value in self.exact_values))
+            if self.exact_values
+            else None
+        )
+        self.pending = bytearray()
+
+    def _partial_suffix_length(self, payload: bytes) -> int:
+        best = 0
+        for value in self.exact_values:
+            maximum = min(len(value) - 1, len(payload))
+            if maximum <= best:
+                continue
+            start = len(payload) - maximum
+            candidate = payload.find(value[:1], start)
+            while candidate >= 0:
+                suffix = payload[candidate:]
+                if len(suffix) <= best:
+                    break
+                if value.startswith(suffix):
+                    best = len(suffix)
+                    break
+                candidate = payload.find(value[:1], candidate + 1)
+        return best
+
+    def feed(self, payload: bytes) -> bytes:
+        if not self.exact_values:
+            return payload
+        combined = bytes(self.pending) + payload
+        held_bytes = self._partial_suffix_length(combined)
+        safe_end = len(combined) - held_bytes
+        assert self.pattern is not None
+        # A complete value may overlap its own proper suffix (for example,
+        # "token-123-token"). Never split through such a match just because
+        # that suffix is also a valid prefix for the next read.
+        while True:
+            protected_end = safe_end
+            for match in self.pattern.finditer(combined):
+                if match.start() < safe_end < match.end():
+                    protected_end = min(protected_end, match.start())
+            if protected_end == safe_end:
+                break
+            safe_end = protected_end
+        self.pending = bytearray(combined[safe_end:])
+        return self.pattern.sub(REDACTED_BYTES, combined[:safe_end])
+
+    def finish(self) -> bytes:
+        payload = bytes(self.pending)
+        self.pending.clear()
+        if self.pattern is None:
+            return payload
+        return self.pattern.sub(REDACTED_BYTES, payload)
+
+
+class StreamingPatternRedactor:
+    """Statefully redact credential-shaped values from an arbitrary byte stream."""
+
+    _WORD_TAIL_BYTES = 24
+    _WORD_RE = re.compile(rb"[A-Za-z0-9_.-]+")
+    _NON_HSPACE_RE = re.compile(rb"[^ \t]")
+    _BEARER_DELIMITERS = frozenset(b" \t\r\n,;\"'")
+    _VALUE_DELIMITERS = frozenset(b" \t\r\n&;,}]\"'")
+    _LINE_DELIMITERS = frozenset(b"\r\n")
+    _BEARER_DELIMITER_RE = re.compile(rb"[ \t\r\n,;\"']")
+    _VALUE_DELIMITER_RE = re.compile(rb"[ \t\r\n&;,}\]\"']")
+    _LINE_DELIMITER_RE = re.compile(rb"[\r\n]")
+    _SENSITIVE_MARKERS = (
+        b"password",
+        b"passwd",
+        b"secret",
+        b"apikey",
+        b"api_key",
+        b"api-key",
+        b"authorization",
+        b"cookie",
+    )
+
+    def __init__(self) -> None:
+        self.state = "scan"
+        self.word_length = 0
+        self.word_tail = b""
+        self.word_sensitive = False
+        self.key_kind = ""
+        self.key_quote_allowed = True
+        self.value_quote_allowed = True
+        self.value_delimiters = self._VALUE_DELIMITERS
+        self.value_delimiter_re = self._VALUE_DELIMITER_RE
+
+    def _word_ends(self, value: bytes) -> bool:
+        return self.word_length >= len(value) and self.word_tail.endswith(value)
+
+    def _word_has_boundary_suffix(self, value: bytes) -> bool:
+        if not self._word_ends(value):
+            return False
+        if self.word_length == len(value):
+            return True
+        # Dot and hyphen are accepted in parameter names but are non-word
+        # bytes to the text regexes. Preserve that boundary behavior when a
+        # header keyword is namespaced inside one scanner word.
+        offset = len(value) + 1
+        return len(self.word_tail) >= offset and self.word_tail[-offset] in b".-"
+
+    def _append_word(self, value: bytes) -> None:
+        lowered = value.lower()
+        self.word_length += len(value)
+        if not self.word_sensitive:
+            boundary = self.word_tail + lowered[: self._WORD_TAIL_BYTES]
+            self.word_sensitive = any(
+                marker in lowered or marker in boundary for marker in self._SENSITIVE_MARKERS
+            )
+        self.word_tail = (self.word_tail + lowered[-self._WORD_TAIL_BYTES :])[
+            -self._WORD_TAIL_BYTES :
+        ]
+
+    def _reset_word(self) -> None:
+        self.word_length = 0
+        self.word_tail = b""
+        self.word_sensitive = False
+
+    def _classify_word(self) -> str:
+        if self._word_has_boundary_suffix(b"bearer"):
+            return "bearer"
+        if self._word_has_boundary_suffix(b"authorization") or self._word_has_boundary_suffix(
+            b"proxy-authorization"
+        ):
+            return "authorization"
+        if self._word_has_boundary_suffix(b"cookie") or self._word_has_boundary_suffix(
+            b"set-cookie"
+        ):
+            return "cookie"
+        if self._word_ends(b"token") or self.word_sensitive:
+            return "value"
+        return ""
+
+    def _reset_scan(self) -> None:
+        self.state = "scan"
+        self.key_kind = ""
+        self.key_quote_allowed = True
+        self.value_quote_allowed = True
+        self.value_delimiters = self._VALUE_DELIMITERS
+        self.value_delimiter_re = self._VALUE_DELIMITER_RE
+        self._reset_word()
+
+    def _set_value_delimiters(self, delimiters: frozenset[int]) -> None:
+        self.value_delimiters = delimiters
+        if delimiters == self._BEARER_DELIMITERS:
+            self.value_delimiter_re = self._BEARER_DELIMITER_RE
+        elif delimiters == self._LINE_DELIMITERS:
+            self.value_delimiter_re = self._LINE_DELIMITER_RE
+        else:
+            self.value_delimiter_re = self._VALUE_DELIMITER_RE
+
+    def _start_suppression(self, output: bytearray, delimiters: frozenset[int]) -> None:
+        output.extend(REDACTED_BYTES)
+        self.state = "suppress"
+        self._set_value_delimiters(delimiters)
+
+    def feed(self, payload: bytes) -> bytes:
+        output = bytearray()
+        index = 0
+        while index < len(payload):
+            if self.state == "suppress":
+                match = self.value_delimiter_re.search(payload, index)
+                if match is None:
+                    break
+                index = match.start()
+                output.append(payload[index])
+                index += 1
+                self._reset_scan()
+                continue
+
+            if self.state == "bearer_gap":
+                match = self._NON_HSPACE_RE.search(payload, index)
+                if match is None:
+                    output.extend(payload[index:])
+                    break
+                output.extend(payload[index : match.start()])
+                index = match.start()
+                byte = payload[index]
+                index += 1
+                if byte in self._BEARER_DELIMITERS:
+                    output.append(byte)
+                    self._reset_scan()
+                else:
+                    self._start_suppression(output, self._BEARER_DELIMITERS)
+                continue
+
+            if self.state == "after_key":
+                byte = payload[index]
+                if self.key_quote_allowed and byte in b"\"'":
+                    output.append(byte)
+                    index += 1
+                    self.key_quote_allowed = False
+                    continue
+                if byte in b" \t":
+                    match = self._NON_HSPACE_RE.search(payload, index)
+                    end = len(payload) if match is None else match.start()
+                    output.extend(payload[index:end])
+                    index = end
+                    continue
+                if byte in b"=:":
+                    output.append(byte)
+                    index += 1
+                    if self.key_kind == "authorization" or (
+                        self.key_kind == "cookie" and byte == ord(":")
+                    ):
+                        self._set_value_delimiters(self._LINE_DELIMITERS)
+                    else:
+                        self._set_value_delimiters(self._VALUE_DELIMITERS)
+                    self.state = "value_gap"
+                    continue
+                if byte == ord("%"):
+                    output.append(byte)
+                    index += 1
+                    self.state = "key_percent"
+                    continue
+                self._reset_scan()
+                continue
+
+            if self.state == "key_percent":
+                byte = payload[index]
+                if byte == ord("3"):
+                    output.append(byte)
+                    index += 1
+                    self.state = "key_percent_3"
+                else:
+                    self._reset_scan()
+                continue
+
+            if self.state == "key_percent_3":
+                byte = payload[index]
+                if byte in b"dD":
+                    output.append(byte)
+                    index += 1
+                    self._set_value_delimiters(self._VALUE_DELIMITERS)
+                    self.state = "value_gap"
+                else:
+                    self._reset_scan()
+                continue
+
+            if self.state == "value_gap":
+                byte = payload[index]
+                if byte in b" \t":
+                    match = self._NON_HSPACE_RE.search(payload, index)
+                    end = len(payload) if match is None else match.start()
+                    output.extend(payload[index:end])
+                    index = end
+                    continue
+                if self.value_quote_allowed and byte in b"\"'":
+                    output.append(byte)
+                    index += 1
+                    self.value_quote_allowed = False
+                    continue
+                if byte in self.value_delimiters:
+                    output.append(byte)
+                    index += 1
+                    self._reset_scan()
+                else:
+                    index += 1
+                    self._start_suppression(output, self.value_delimiters)
+                continue
+
+            word = self._WORD_RE.match(payload, index)
+            if word is not None:
+                value = word.group()
+                output.extend(value)
+                self._append_word(value)
+                index = word.end()
+                continue
+
+            if self.word_length:
+                word_kind = self._classify_word()
+                self._reset_word()
+                if word_kind == "bearer" and payload[index] in b" \t":
+                    output.append(payload[index])
+                    index += 1
+                    self.state = "bearer_gap"
+                elif word_kind:
+                    self.key_kind = word_kind
+                    self.key_quote_allowed = True
+                    self.value_quote_allowed = True
+                    self.state = "after_key"
+                continue
+
+            word = self._WORD_RE.search(payload, index)
+            end = len(payload) if word is None else word.start()
+            output.extend(payload[index:end])
+            index = end
+        return bytes(output)
+
+
+class StreamingRedactor:
+    def __init__(self, exact_values: Sequence[bytes]) -> None:
+        self.patterns = StreamingPatternRedactor()
+        self.exact = StreamingExactRedactor(exact_values)
+
+    def feed(self, payload: bytes) -> bytes:
+        # Pattern recognition needs the original key/header context. Exact
+        # substitution comes second so a secret equal to "token" cannot turn
+        # `token=value` into `[REDACTED]=value` before the value is suppressed.
+        return self.exact.feed(self.patterns.feed(payload))
+
+    def finish(self) -> bytes:
+        return self.exact.finish()
+
+
+def utf8_safe_chunk_end(payload: bytearray, end: int) -> int:
+    """Move a byte boundary back when it bisects a valid UTF-8 code point."""
+
+    if end > len(payload):
+        return end
+    start = end - 1
+    while start > 0 and end - start <= 3 and payload[start] & 0xC0 == 0x80:
+        start -= 1
+    lead = payload[start]
+    if 0xC2 <= lead <= 0xDF:
+        expected = 2
+    elif 0xE0 <= lead <= 0xEF:
+        expected = 3
+    elif 0xF0 <= lead <= 0xF4:
+        expected = 4
+    else:
+        expected = 1
+    if expected > 1 and end - start < expected:
+        return start
+    return end
+
+
+def positive_int(value: str, *, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from exc
+    if parsed < minimum:
+        raise argparse.ArgumentTypeError(f"must be at least {minimum}")
+    return parsed
+
+
+def path_parts_under(root: Path, path: Path) -> tuple[Path, tuple[str, ...]]:
+    root = root.absolute()
+    path = path.absolute()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise OSError(f"path escapes its mounted volume: {path}") from exc
+    parts = relative.parts
+    if not parts or any(part in ("", ".", "..") for part in parts):
+        raise OSError(f"invalid path below mounted volume: {path}")
+    return root, parts
+
+
+def open_regular_binary(root: Path, path: Path) -> BinaryIO:
+    """Open one regular file without following any path-component symlink."""
+
+    root, parts = path_parts_under(root, path)
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    file_flags = os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directory_fd = os.open(root, directory_flags)
+    file_fd: int | None = None
+    try:
+        for part in parts[:-1]:
+            next_fd = os.open(part, directory_flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        file_fd = os.open(parts[-1], file_flags, dir_fd=directory_fd)
+        if not stat.S_ISREG(os.fstat(file_fd).st_mode):
+            raise OSError(f"refusing non-regular log source: {path}")
+        handle = os.fdopen(file_fd, "rb")
+        file_fd = None
+        return handle
+    finally:
+        if file_fd is not None:
+            os.close(file_fd)
+        os.close(directory_fd)
+
+
+def iter_bounded_records(handle: BinaryIO) -> Iterator[tuple[int, bytes | None, bool]]:
+    """Read logical lines without ever allocating an unbounded source record."""
+
+    record_number = 0
+    while True:
+        payload = handle.readline(MAX_SOURCE_RECORD_BYTES + 1)
+        if not payload:
+            return
+        record_number += 1
+        terminated = payload.endswith((b"\n", b"\r"))
+        if len(payload) <= MAX_SOURCE_RECORD_BYTES:
+            yield record_number, payload, terminated
+            continue
+
+        while not terminated:
+            remainder = handle.readline(MAX_SOURCE_RECORD_BYTES + 1)
+            if not remainder:
+                break
+            terminated = remainder.endswith((b"\n", b"\r"))
+        yield record_number, None, terminated
+
+
+def open_directory_under(root: Path, path: Path) -> int:
+    root = root.absolute()
+    path = path.absolute()
+    try:
+        relative = path.relative_to(root)
+    except ValueError as exc:
+        raise OSError(f"directory escapes its mounted volume: {path}") from exc
+    if any(part in ("", ".", "..") for part in relative.parts):
+        raise OSError(f"invalid directory below mounted volume: {path}")
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    directory_fd = os.open(root, flags)
+    try:
+        for part in relative.parts:
+            next_fd = os.open(part, flags, dir_fd=directory_fd)
+            os.close(directory_fd)
+            directory_fd = next_fd
+        result = directory_fd
+        directory_fd = -1
+        return result
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
+
+
+def directory_exists(root: Path, path: Path) -> bool:
+    try:
+        fd = open_directory_under(root, path)
+    except OSError:
+        return False
+    os.close(fd)
+    return True
+
+
+def iter_regular_files(root: Path, base: Path, *, recursive: bool) -> Iterator[Path]:
+    """Walk regular files beneath base without following any symlink."""
+
+    root = root.absolute()
+    base = base.absolute()
+    try:
+        base_relative = base.relative_to(root)
+        base_fd = open_directory_under(root, base)
+    except (OSError, ValueError):
+        return
+    directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+
+    def walk(directory_fd: int, relative: Path) -> Iterator[Path]:
+        try:
+            with os.scandir(directory_fd) as entries:
+                classified = []
+                for entry in entries:
+                    try:
+                        if entry.is_file(follow_symlinks=False):
+                            classified.append((entry.name, False))
+                        elif recursive and entry.is_dir(follow_symlinks=False):
+                            classified.append((entry.name, True))
+                    except OSError:
+                        continue
+            for name, is_directory in sorted(classified):
+                child_relative = relative / name
+                if not is_directory:
+                    yield root / child_relative
+                    continue
+                try:
+                    child_fd = os.open(name, directory_flags, dir_fd=directory_fd)
+                except OSError:
+                    continue
+                try:
+                    yield from walk(child_fd, child_relative)
+                finally:
+                    os.close(child_fd)
+        except OSError as exc:
+            warn(f"cannot scan {root / relative}: {exc}")
+
+    try:
+        yield from walk(base_fd, base_relative)
+    finally:
+        os.close(base_fd)
+
+
+class RotatingWriter:
+    """Size-bounded append-only file with a fixed total generation count."""
+
+    def __init__(self, path: Path, max_bytes: int, max_files: int) -> None:
+        self.path = path
+        self.max_bytes = max_bytes
+        self.max_files = max_files
+        self.lock = threading.Lock()
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+
+    def _rotate(self) -> None:
+        if self.max_files == 1:
+            self.path.unlink(missing_ok=True)
+            return
+        oldest = Path(f"{self.path}.{self.max_files - 1}")
+        oldest.unlink(missing_ok=True)
+        for index in range(self.max_files - 2, 0, -1):
+            source = Path(f"{self.path}.{index}")
+            if source.exists():
+                source.replace(Path(f"{self.path}.{index + 1}"))
+        if self.path.exists():
+            self.path.replace(Path(f"{self.path}.1"))
+
+    def write(self, payload: bytes) -> None:
+        if len(payload) > self.max_bytes:
+            marker = b"\n[tx9 log record truncated]\n"
+            payload = payload[: max(0, self.max_bytes - len(marker))] + marker
+            payload = payload[: self.max_bytes]
+        with self.lock:
+            try:
+                current_size = self.path.stat().st_size
+            except FileNotFoundError:
+                current_size = 0
+            if current_size and current_size + len(payload) > self.max_bytes:
+                self._rotate()
+            fd = os.open(
+                self.path,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(fd, view)
+                    if written <= 0:
+                        raise OSError("short write while persisting log data")
+                    view = view[written:]
+                os.fchmod(fd, 0o600)
+            finally:
+                os.close(fd)
+
+
+def truncate_utf8(value: str, max_bytes: int) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= max_bytes:
+        return value
+    marker = "… [truncated]"
+    budget = max(0, max_bytes - len(marker.encode()))
+    return encoded[:budget].decode("utf-8", errors="ignore") + marker
+
+
+def event_bytes(event: Mapping[str, Any], max_bytes: int) -> bytes:
+    candidate = dict(event)
+    candidate["message"] = truncate_utf8(
+        str(candidate.get("message", "")), min(MAX_EVENT_MESSAGE_BYTES, max_bytes // 2)
+    )
+    payload = (json.dumps(candidate, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    if len(payload) <= max_bytes:
+        return payload
+
+    candidate.pop("data", None)
+    overhead = len(
+        (json.dumps({**candidate, "message": ""}, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    )
+    candidate["message"] = truncate_utf8(str(candidate.get("message", "")), max(0, max_bytes - overhead))
+    payload = (json.dumps(candidate, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+    if len(payload) <= max_bytes:
+        return payload
+
+    minimal = {
+        "schema": SCHEMA,
+        "timestamp": candidate.get("timestamp", isoformat()),
+        "box": truncate_utf8(str(candidate.get("box", "")), 64),
+        "source": truncate_utf8(str(candidate.get("source", "unknown")), 32),
+        "stream": str(candidate.get("stream", "event")),
+        "type": "truncated",
+        "message": "event exceeded TX9_LOG_MAX_BYTES",
+    }
+    return (json.dumps(minimal, ensure_ascii=False, separators=(",", ":")) + "\n").encode()
+
+
+def log_paths(log_dir: Path, source: str) -> tuple[Path, Path]:
+    if source == "agent":
+        return log_dir / "workload.log", log_dir / "agent.jsonl"
+    if source == "hermes":
+        return log_dir / "hermes-gateway.log", log_dir / "hermes.jsonl"
+    return log_dir / f"{source}.log", log_dir / f"{source}.jsonl"
+
+
+def write_all(fd: int, payload: bytes) -> None:
+    view = memoryview(payload)
+    while view:
+        try:
+            written = os.write(fd, view)
+        except (BrokenPipeError, OSError):
+            return
+        if written <= 0:
+            return
+        view = view[written:]
+
+
+class Capture:
+    def __init__(self, source: str, log_dir: Path, max_bytes: int, max_files: int) -> None:
+        log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        try:
+            log_dir.chmod(0o700)
+        except OSError:
+            pass
+        raw_path, jsonl_path = log_paths(log_dir, source)
+        self.source = source
+        self.box = os.environ.get("TX9_BOX_NAME", "")
+        self.exact_values = token_env_values()
+        self.exact_value_bytes = tuple(
+            value.encode("utf-8", errors="replace") for value in self.exact_values
+        )
+        self.raw = RotatingWriter(raw_path, max_bytes, max_files)
+        self.jsonl = RotatingWriter(jsonl_path, max_bytes, max_files)
+        self.max_bytes = max_bytes
+        self.child: subprocess.Popen[bytes] | None = None
+        self.active_pgid: int | None = None
+        self.received_signal: int | None = None
+        self.output_lock = threading.Lock()
+        self.failed_writers: set[str] = set()
+
+        inherited_out = os.environ.get("TX9_LOG_MIRROR_STDOUT_FD")
+        inherited_err = os.environ.get("TX9_LOG_MIRROR_STDERR_FD")
+        self.owns_mirror_fds = inherited_out is None or inherited_err is None
+        if self.owns_mirror_fds:
+            self.mirror_out = os.dup(sys.stdout.fileno())
+            self.mirror_err = os.dup(sys.stderr.fileno())
+        else:
+            self.mirror_out = int(inherited_out)
+            self.mirror_err = int(inherited_err)
+            # A nested capture must not keep its parent's stdout/stderr pipes
+            # open. Mirror directly to the inherited original container fds.
+            os.dup2(self.mirror_out, sys.stdout.fileno())
+            os.dup2(self.mirror_err, sys.stderr.fileno())
+        self._migrate_legacy_runtime(log_dir, raw_path)
+
+    def close(self) -> None:
+        if self.owns_mirror_fds:
+            os.close(self.mirror_out)
+            os.close(self.mirror_err)
+
+    def _migrate_legacy_runtime(self, log_dir: Path, raw_path: Path) -> None:
+        """Convert a pre-structured raw log once so upgrades retain history."""
+
+        marker = log_dir / f".{self.source}-structured-v1"
+        try:
+            marker_fd = os.open(marker, os.O_RDONLY | os.O_CLOEXEC | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            marker_fd = -1
+        except OSError as exc:
+            warn(f"cannot inspect legacy-log migration marker {marker}: {exc}")
+            return
+        if marker_fd >= 0:
+            os.close(marker_fd)
+            return
+
+        try:
+            legacy = open_regular_binary(log_dir, raw_path)
+        except FileNotFoundError:
+            legacy = None
+        except OSError as exc:
+            warn(f"cannot migrate legacy runtime log {raw_path}: {exc}")
+            return
+
+        if legacy is not None:
+            with legacy:
+                modified_at = os.fstat(legacy.fileno()).st_mtime
+                for line_number, payload, _terminated in iter_bounded_records(legacy):
+                    if payload is None:
+                        warn(f"omitted oversized legacy runtime record in {raw_path}:{line_number}")
+                        line = "record omitted because it exceeds the migration size limit"
+                    else:
+                        line = payload.decode("utf-8", errors="replace")
+                    message = redact_text(line.rstrip("\r\n"), self.exact_values)
+                    if not message:
+                        continue
+                    event = normalized_event(
+                        box=self.box,
+                        source=self.source,
+                        stream="log",
+                        kind="legacy_output",
+                        message=message,
+                        timestamp=fallback_timestamp(modified_at, line_number),
+                    )
+                    self._persist("structured", self.jsonl, event_bytes(event, self.max_bytes))
+                    if "structured" in self.failed_writers:
+                        return
+            try:
+                truncate_fd = os.open(
+                    raw_path,
+                    os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW,
+                )
+                os.close(truncate_fd)
+            except OSError as exc:
+                warn(f"cannot truncate migrated legacy runtime log {raw_path}: {exc}")
+
+        try:
+            marker_fd = os.open(
+                marker,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_CLOEXEC | os.O_NOFOLLOW,
+                0o600,
+            )
+        except FileExistsError:
+            return
+        except OSError as exc:
+            warn(f"cannot record legacy-log migration marker {marker}: {exc}")
+            return
+        os.close(marker_fd)
+
+    def _base_event(self, stream: str, event_type: str, message: str) -> dict[str, Any]:
+        return {
+            "schema": SCHEMA,
+            "timestamp": isoformat(),
+            "box": self.box,
+            "source": self.source,
+            "stream": stream,
+            "type": event_type,
+            "message": message,
+        }
+
+    def structured(self, event_type: str, message: str, data: Any | None = None) -> None:
+        event = self._base_event("event", event_type, message)
+        if data is not None:
+            event["data"] = data
+        event = redact_value(event, self.exact_values)
+        with self.output_lock:
+            self._persist("structured", self.jsonl, event_bytes(event, self.max_bytes))
+
+    def _persist(self, label: str, writer: RotatingWriter, payload: bytes) -> None:
+        try:
+            writer.write(payload)
+        except OSError as exc:
+            if label in self.failed_writers:
+                return
+            self.failed_writers.add(label)
+            warning = f"tx9-logs: warning: cannot persist {label} log {writer.path}: {exc}\n"
+            write_all(self.mirror_err, warning.encode("utf-8", errors="replace"))
+
+    def output(self, stream: str, payload: bytes) -> None:
+        text = payload.decode("utf-8", errors="replace")
+        redacted = redact_text(text, self.exact_values)
+        mirrored = redacted.encode("utf-8", errors="replace")
+        with self.output_lock:
+            self._persist("raw", self.raw, mirrored)
+            event = self._base_event(stream, "output", redacted.rstrip("\r\n"))
+            self._persist("structured", self.jsonl, event_bytes(event, self.max_bytes))
+            write_all(self.mirror_out if stream == "stdout" else self.mirror_err, mirrored)
+
+    def _forward_signal(self, signum: int, _frame: Any) -> None:
+        if self.received_signal is None:
+            self.received_signal = signum
+        pgid = self.active_pgid
+        if pgid is None:
+            return
+        try:
+            os.killpg(pgid, signum)
+        except ProcessLookupError:
+            pass
+
+    def install_signal_handlers(self) -> None:
+        for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGQUIT, signal.SIGHUP):
+            if signum == signal.SIGHUP and signal.getsignal(signum) == signal.SIG_IGN:
+                continue
+            signal.signal(signum, self._forward_signal)
+
+    def _reader(self, stream: str, pipe: BinaryIO) -> None:
+        try:
+            pending = bytearray()
+            redactor = StreamingRedactor(self.exact_value_bytes)
+            read_chunk = getattr(pipe, "read1", pipe.read)
+            while True:
+                chunk = read_chunk(MAX_CAPTURE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                pending.extend(redactor.feed(chunk))
+                while pending:
+                    newline = pending.find(b"\n")
+                    if newline >= 0:
+                        end = newline + 1
+                    elif len(pending) >= MAX_CAPTURE_CHUNK_BYTES:
+                        end = utf8_safe_chunk_end(pending, MAX_CAPTURE_CHUNK_BYTES)
+                    else:
+                        break
+                    self.output(stream, bytes(pending[:end]))
+                    del pending[:end]
+            pending.extend(redactor.finish())
+            while len(pending) >= MAX_CAPTURE_CHUNK_BYTES:
+                end = utf8_safe_chunk_end(pending, MAX_CAPTURE_CHUNK_BYTES)
+                self.output(stream, bytes(pending[:end]))
+                del pending[:end]
+            if pending:
+                self.output(stream, bytes(pending))
+        finally:
+            pipe.close()
+
+    def run_once(self, command: Sequence[str]) -> int:
+        child_env = dict(os.environ)
+        child_env["TX9_LOG_MIRROR_STDOUT_FD"] = str(self.mirror_out)
+        child_env["TX9_LOG_MIRROR_STDERR_FD"] = str(self.mirror_err)
+        try:
+            child = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                env=child_env,
+                start_new_session=True,
+                pass_fds=(self.mirror_out, self.mirror_err),
+            )
+            self.child = child
+            self.active_pgid = child.pid
+            # A signal can arrive after Popen creates the process group but
+            # before the assignment above. Honor it before waiting so that
+            # startup cannot lose Docker's shutdown request.
+            if self.received_signal is not None:
+                self._forward_signal(self.received_signal, None)
+        except OSError as exc:
+            message = f"could not start {Path(command[0]).name}: {exc}"
+            self.output("stderr", (message + "\n").encode())
+            self.structured("process_start_failed", message)
+            return 127 if isinstance(exc, FileNotFoundError) else 126
+
+        self.structured(
+            "process_start",
+            f"{Path(command[0]).name} started",
+            {"pid": self.child.pid, "command": Path(command[0]).name},
+        )
+        assert self.child.stdout is not None
+        assert self.child.stderr is not None
+        readers = [
+            threading.Thread(target=self._reader, args=("stdout", self.child.stdout), daemon=True),
+            threading.Thread(target=self._reader, args=("stderr", self.child.stderr), daemon=True),
+        ]
+        for reader in readers:
+            reader.start()
+        return_code = self.child.wait()
+        for reader in readers:
+            reader.join()
+        self.active_pgid = None
+        self.child = None
+
+        if return_code < 0:
+            status = 128 - return_code
+            self.structured(
+                "process_exit",
+                f"{Path(command[0]).name} exited on signal {-return_code}",
+                {"signal": -return_code, "status": status},
+            )
+        else:
+            status = return_code
+            self.structured(
+                "process_exit",
+                f"{Path(command[0]).name} exited with status {status}",
+                {"status": status},
+            )
+        if self.received_signal is not None:
+            return 128 + self.received_signal
+        return status
+
+
+def capture_command(args: argparse.Namespace) -> int:
+    command = list(args.command)
+    if command and command[0] == "--":
+        command.pop(0)
+    if not command:
+        raise SystemExit("tx9-logs capture: a command is required after --")
+    if not re.fullmatch(r"[a-z0-9][a-z0-9_-]*", args.source):
+        raise SystemExit("tx9-logs capture: --source must contain lowercase letters, digits, _ or -")
+
+    capture = Capture(args.source, Path(args.log_dir), args.max_bytes, args.max_files)
+    capture.install_signal_handlers()
+    try:
+        while True:
+            status = capture.run_once(command)
+            if args.restart_delay is None or capture.received_signal is not None:
+                return status
+            capture.structured(
+                "process_restart",
+                f"restarting {Path(command[0]).name} in {args.restart_delay:g}s",
+                {"delay_seconds": args.restart_delay, "previous_status": status},
+            )
+            deadline = time.monotonic() + args.restart_delay
+            while capture.received_signal is None and time.monotonic() < deadline:
+                time.sleep(min(0.1, max(0.0, deadline - time.monotonic())))
+            if capture.received_signal is not None:
+                return 128 + capture.received_signal
+    finally:
+        capture.close()
+
+
+def normalize_source(value: str) -> str:
+    lowered = value.strip().lower()
+    return SOURCE_ALIASES.get(lowered, lowered)
+
+
+def selected_sources(value: str) -> set[str] | None:
+    values = {item.strip().lower() for item in value.split(",") if item.strip()}
+    if not values or "all" in values:
+        return None
+    normalized = {normalize_source(item) for item in values}
+    unknown = normalized - {"agent", "executor", "hermes", "codex", "claude"}
+    if unknown:
+        raise ValueError("unknown source(s): " + ", ".join(sorted(unknown)))
+    return normalized
+
+
+def source_wanted(source: str, selected: set[str] | None) -> bool:
+    return selected is None or normalize_source(source) in selected
+
+
+def parse_timestamp(value: Any) -> dt.datetime | None:
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        if seconds > 100_000_000_000:
+            seconds /= 1000
+        try:
+            return dt.datetime.fromtimestamp(seconds, UTC)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    if re.fullmatch(r"[0-9]+(?:\.[0-9]+)?", text):
+        return parse_timestamp(float(text))
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = dt.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.astimezone(UTC)
+
+
+def find_timestamp(value: Any, depth: int = 0) -> dt.datetime | None:
+    if depth >= MAX_NORMALIZE_DEPTH or not isinstance(value, Mapping):
+        return None
+    for key in ("timestamp", "created_at", "createdAt", "time", "date", "updated_at"):
+        parsed = parse_timestamp(value.get(key))
+        if parsed is not None:
+            return parsed
+    for key in ("payload", "message", "data"):
+        parsed = find_timestamp(value.get(key), depth + 1)
+        if parsed is not None:
+            return parsed
+    return None
+
+
+def parse_since(value: str) -> dt.datetime | None:
+    if not value:
+        return None
+    duration = re.fullmatch(r"([0-9]+(?:\.[0-9]+)?)(s|m|h|d|w)", value.strip(), re.IGNORECASE)
+    if duration:
+        amount = float(duration.group(1))
+        multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[
+            duration.group(2).lower()
+        ]
+        return utc_now() - dt.timedelta(seconds=amount * multiplier)
+    parsed = parse_timestamp(value)
+    if parsed is None:
+        raise ValueError(f"invalid --since value {value!r}; use a duration such as 24h or an RFC3339 timestamp")
+    return parsed
+
+
+def home_for_root(root: Path) -> Path:
+    nested = root / "home" / "agent"
+    if directory_exists(root, nested):
+        return nested
+    return root
+
+
+def rotated_paths(active: Path, root: Path) -> list[Path]:
+    rotations: list[tuple[int, Path]] = []
+    active_present = False
+    for candidate in iter_regular_files(root, active.parent, recursive=False):
+        if candidate.name == active.name:
+            active_present = True
+            continue
+        if not candidate.name.startswith(active.name + "."):
+            continue
+        suffix = candidate.name.removeprefix(active.name + ".")
+        if suffix.isdigit():
+            rotations.append((int(suffix), candidate))
+    return [path for _, path in sorted(rotations, reverse=True)] + ([active] if active_present else [])
+
+
+def json_safe(value: Any, depth: int = 0) -> Any:
+    if depth >= MAX_NORMALIZE_DEPTH:
+        return TRUNCATED
+    if isinstance(value, str):
+        return truncate_utf8(value, MAX_NORMALIZE_STRING_BYTES)
+    if value is None or isinstance(value, (int, float, bool)):
+        return value
+    if isinstance(value, bytes):
+        value = value[:MAX_NORMALIZE_STRING_BYTES]
+        try:
+            return value.decode("utf-8")
+        except UnicodeDecodeError:
+            return {"encoding": "base64", "value": base64.b64encode(value).decode()}
+    if isinstance(value, Mapping):
+        result: dict[str, Any] = {}
+        for index, (key, item) in enumerate(value.items()):
+            if index >= MAX_NORMALIZE_ITEMS:
+                result["_tx9_truncated"] = f"more than {MAX_NORMALIZE_ITEMS} fields"
+                break
+            result[truncate_utf8(str(key), 256)] = json_safe(item, depth + 1)
+        return result
+    if isinstance(value, Sequence):
+        result = [json_safe(item, depth + 1) for item in value[:MAX_NORMALIZE_ITEMS]]
+        if len(value) > MAX_NORMALIZE_ITEMS:
+            result.append(TRUNCATED)
+        return result
+    return truncate_utf8(str(value), MAX_NORMALIZE_STRING_BYTES)
+
+
+def extract_text(value: Any, depth: int = 0) -> str:
+    if depth >= MAX_NORMALIZE_DEPTH:
+        return ""
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped.startswith(("{", "[")):
+            try:
+                nested = json.loads(stripped)
+            except (ValueError, RecursionError):
+                return value
+            nested_text = extract_text(nested, depth + 1)
+            return nested_text or value
+        return value
+    if isinstance(value, list):
+        parts = [extract_text(item, depth + 1) for item in value[:MAX_NORMALIZE_ITEMS]]
+        return " ".join(part for part in parts if part)
+    if not isinstance(value, Mapping):
+        return "" if value is None else str(value)
+    for key in ("text", "content", "message", "body", "title", "summary", "error"):
+        if key in value:
+            text = extract_text(value[key], depth + 1)
+            if text:
+                return text
+    for key in ("payload", "data"):
+        if key in value:
+            text = extract_text(value[key], depth + 1)
+            if text:
+                return text
+    return ""
+
+
+def event_type(value: Mapping[str, Any], fallback: str, depth: int = 0) -> str:
+    if depth >= MAX_NORMALIZE_DEPTH:
+        return fallback
+    for key in ("type", "event", "kind"):
+        item = value.get(key)
+        if isinstance(item, str) and item:
+            return item
+    payload = value.get("payload")
+    if isinstance(payload, Mapping):
+        return event_type(payload, fallback, depth + 1)
+    return fallback
+
+
+def normalized_event(
+    *,
+    box: str,
+    source: str,
+    stream: str,
+    kind: str,
+    message: str,
+    timestamp: dt.datetime | None,
+    data: Any | None = None,
+) -> dict[str, Any]:
+    event: dict[str, Any] = {
+        "schema": SCHEMA,
+        "timestamp": isoformat(timestamp),
+        "box": box,
+        "source": normalize_source(source),
+        "stream": stream,
+        "type": kind,
+        "message": truncate_utf8(message, MAX_EVENT_MESSAGE_BYTES),
+    }
+    if data is not None:
+        event["data"] = json_safe(data)
+    return event
+
+
+def fallback_timestamp(modified_at: float, offset: int = 0) -> dt.datetime:
+    base = modified_at
+    return dt.datetime.fromtimestamp(base + offset / 1_000_000, UTC)
+
+
+def read_jsonl(
+    path: Path, *, root: Path, box: str, source: str, fallback_kind: str
+) -> Iterator[dict[str, Any]]:
+    for rotated in rotated_paths(path, root):
+        try:
+            handle = open_regular_binary(root, rotated)
+        except OSError as exc:
+            warn(f"cannot read {rotated}: {exc}")
+            continue
+        with handle:
+            modified_at = os.fstat(handle.fileno()).st_mtime
+            for line_number, payload, terminated in iter_bounded_records(handle):
+                if payload is None:
+                    warn(f"omitted oversized source record in {rotated}:{line_number}")
+                    yield normalized_event(
+                        box=box,
+                        source=source,
+                        stream="event",
+                        kind="truncated",
+                        message="record omitted because it exceeds the query size limit",
+                        timestamp=fallback_timestamp(modified_at, line_number),
+                    )
+                    continue
+                if rotated == path and not terminated:
+                    warn(f"ignored unterminated active JSONL record in {rotated}:{line_number}")
+                    continue
+                line = payload.decode("utf-8", errors="replace")
+                stripped = line.rstrip("\r\n")
+                if not stripped:
+                    continue
+                try:
+                    record = json.loads(stripped)
+                except ValueError:
+                    yield normalized_event(
+                        box=box,
+                        source=source,
+                        stream="event",
+                        kind="unparsed",
+                        message=stripped,
+                        timestamp=fallback_timestamp(modified_at, line_number),
+                    )
+                    continue
+                except RecursionError:
+                    warn(f"ignored excessively nested JSONL record in {rotated}:{line_number}")
+                    yield normalized_event(
+                        box=box,
+                        source=source,
+                        stream="event",
+                        kind="unparsed",
+                        message="record omitted because its nesting exceeds the query limit",
+                        timestamp=fallback_timestamp(modified_at, line_number),
+                    )
+                    continue
+                if not isinstance(record, Mapping):
+                    record = {"value": record}
+                if record.get("schema") == SCHEMA:
+                    event = dict(json_safe(record))
+                    # The mounted volume and reader path are the provenance
+                    # boundary. Never allow an agent-authored record to claim
+                    # another component's source, and repair partial v1
+                    # records before filtering or text rendering.
+                    parsed = find_timestamp(event) or fallback_timestamp(modified_at, line_number)
+                    stream = event.get("stream")
+                    if not isinstance(stream, str) or not stream:
+                        stream = "event"
+                    kind = event.get("type")
+                    if not isinstance(kind, str) or not kind:
+                        kind = fallback_kind
+                    message = event.get("message")
+                    if not isinstance(message, str):
+                        message = (
+                            extract_text(message) if message is not None else extract_text(event)
+                        )
+                    event["schema"] = SCHEMA
+                    event["box"] = box
+                    event["source"] = normalize_source(source)
+                    event["timestamp"] = isoformat(parsed)
+                    event["stream"] = stream
+                    event["type"] = kind
+                    event["message"] = truncate_utf8(message, MAX_EVENT_MESSAGE_BYTES)
+                    yield event
+                    continue
+                timestamp = find_timestamp(record) or fallback_timestamp(modified_at, line_number)
+                yield normalized_event(
+                    box=box,
+                    source=source,
+                    stream="event",
+                    kind=event_type(record, fallback_kind),
+                    message=extract_text(record),
+                    timestamp=timestamp,
+                    data=record,
+                )
+
+
+def read_raw(
+    path: Path, *, root: Path, box: str, source: str, kind: str = "output"
+) -> Iterator[dict[str, Any]]:
+    for rotated in rotated_paths(path, root):
+        try:
+            handle = open_regular_binary(root, rotated)
+        except OSError as exc:
+            warn(f"cannot read {rotated}: {exc}")
+            continue
+        with handle:
+            modified_at = os.fstat(handle.fileno()).st_mtime
+            for line_number, payload, _terminated in iter_bounded_records(handle):
+                if payload is None:
+                    warn(f"omitted oversized source record in {rotated}:{line_number}")
+                    yield normalized_event(
+                        box=box,
+                        source=source,
+                        stream="log",
+                        kind="truncated",
+                        message="record omitted because it exceeds the query size limit",
+                        timestamp=fallback_timestamp(modified_at, line_number),
+                    )
+                    continue
+                line = payload.decode("utf-8", errors="replace")
+                message = line.rstrip("\r\n")
+                if not message:
+                    continue
+                timestamp = None
+                first = message.split(maxsplit=1)[0] if message else ""
+                timestamp = parse_timestamp(first) or fallback_timestamp(modified_at, line_number)
+                yield normalized_event(
+                    box=box,
+                    source=source,
+                    stream="log",
+                    kind=kind,
+                    message=message,
+                    timestamp=timestamp,
+                )
+
+
+def runtime_source(stem: str, scope: str) -> str:
+    if scope == "executor":
+        return "executor"
+    source = normalize_source(stem)
+    if source not in {"agent", "hermes", "codex", "claude"}:
+        return "agent"
+    return source
+
+
+def read_runtime_logs(root: Path, *, scope: str, box: str) -> Iterator[dict[str, Any]]:
+    log_dir = root / "logs"
+    files = list(iter_regular_files(root, log_dir, recursive=False))
+    for active in sorted(path for path in files if path.suffix == ".jsonl"):
+        source = runtime_source(active.stem, scope)
+        yield from read_jsonl(active, root=root, box=box, source=source, fallback_kind="output")
+
+    structured_replacements = {
+        "workload": "agent.jsonl",
+        "agent": "agent.jsonl",
+        "hermes-gateway": "hermes.jsonl",
+        "hermes": "hermes.jsonl",
+        "executor": "executor.jsonl",
+    }
+    names = {path.name for path in files}
+    for active in sorted(path for path in files if path.suffix == ".log"):
+        replacement = structured_replacements.get(active.stem, active.stem + ".jsonl")
+        if replacement and replacement in names:
+            continue
+        source = runtime_source(active.stem, scope)
+        if source not in {"agent", "executor", "hermes", "codex", "claude"}:
+            source = "agent" if scope == "agent" else "executor"
+        yield from read_raw(active, root=root, box=box, source=source)
+
+
+def read_client_events(
+    home: Path, *, root: Path, client: str, box: str
+) -> Iterator[dict[str, Any]]:
+    if client == "codex":
+        base = home / ".codex" / "sessions"
+    else:
+        base = home / ".claude" / "projects"
+    for path in sorted(
+        path for path in iter_regular_files(root, base, recursive=True) if path.suffix == ".jsonl"
+    ):
+        yield from read_jsonl(
+            path, root=root, box=box, source=client, fallback_kind=f"{client}.event"
+        )
+
+
+def hermes_db_paths(home: Path, *, root: Path) -> list[Path]:
+    hermes_home = home / ".hermes"
+    direct = hermes_home / "state.db"
+    files = list(iter_regular_files(root, hermes_home, recursive=True))
+    if direct in files:
+        return [direct]
+    return sorted(path for path in files if path.name == "state.db")
+
+
+def hermes_database_events(
+    connection: sqlite3.Connection, *, path: Path, box: str, modified_at: float
+) -> Iterator[dict[str, Any]]:
+    connection.row_factory = sqlite3.Row
+    connection.execute("PRAGMA query_only=ON")
+    # One read transaction gives sessions and messages the same live WAL
+    # snapshot.
+    connection.execute("BEGIN")
+    tables = {
+        str(row[0])
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN ('sessions','messages')"
+        )
+    }
+    for table in ("sessions", "messages"):
+        if table not in tables:
+            continue
+        rows = connection.execute(f'SELECT * FROM "{table}"')
+        for index, row in enumerate(rows, 1):
+            data = {key: json_safe(row[key]) for key in row.keys()}
+            timestamp = find_timestamp(data) or fallback_timestamp(modified_at, index)
+            message = extract_text(data)
+            if not message:
+                identifier = data.get("id", index)
+                message = f"Hermes {table[:-1]} {identifier}"
+            yield normalized_event(
+                box=box,
+                source="hermes",
+                stream="event",
+                kind=f"hermes.{table[:-1]}",
+                message=message,
+                timestamp=timestamp,
+                data=data,
+            )
+
+
+def hermes_snapshot_connection(
+    path: Path, *, root: Path, source_handle: BinaryIO
+) -> tuple[tempfile.TemporaryDirectory[str], sqlite3.Connection]:
+    snapshot_dir = tempfile.TemporaryDirectory(prefix="tx9-hermes-snapshot-")
+    snapshot_path = Path(snapshot_dir.name) / "state.db"
+    try:
+        source_handle.seek(0)
+        with snapshot_path.open("wb") as destination:
+            shutil.copyfileobj(source_handle, destination)
+        wal_path = Path(str(path) + "-wal")
+        try:
+            wal_source = open_regular_binary(root, wal_path)
+        except FileNotFoundError:
+            wal_source = None
+        if wal_source is not None:
+            with wal_source, Path(str(snapshot_path) + "-wal").open("wb") as destination:
+                shutil.copyfileobj(wal_source, destination)
+        return snapshot_dir, sqlite3.connect(snapshot_path, timeout=5)
+    except Exception:
+        snapshot_dir.cleanup()
+        raise
+
+
+def read_hermes_db(path: Path, *, root: Path, box: str) -> Iterator[dict[str, Any]]:
+    try:
+        source_handle = open_regular_binary(root, path)
+    except OSError as exc:
+        warn(f"cannot open Hermes database {path}: {exc}")
+        return
+    modified_at = os.fstat(source_handle.fileno()).st_mtime
+    connection: sqlite3.Connection | None = None
+    direct_error: sqlite3.Error | None = None
+    emitted = False
+    try:
+        quoted = urllib.parse.quote(f"/proc/self/fd/{source_handle.fileno()}", safe="/")
+        connection = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True, timeout=5)
+        try:
+            for event in hermes_database_events(
+                connection, path=path, box=box, modified_at=modified_at
+            ):
+                emitted = True
+                yield event
+        except sqlite3.Error as exc:
+            direct_error = exc
+    except sqlite3.Error as exc:
+        direct_error = exc
+    finally:
+        if connection is not None:
+            connection.close()
+
+    if direct_error is not None:
+        if emitted:
+            warn(f"Hermes database became unreadable during query {path}: {direct_error}")
+        else:
+            snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
+            snapshot_connection: sqlite3.Connection | None = None
+            try:
+                snapshot_dir, snapshot_connection = hermes_snapshot_connection(
+                    path, root=root, source_handle=source_handle
+                )
+                yield from hermes_database_events(
+                    snapshot_connection, path=path, box=box, modified_at=modified_at
+                )
+            except (OSError, sqlite3.Error) as snapshot_error:
+                warn(
+                    f"cannot read Hermes database {path}: {direct_error}; "
+                    f"writable snapshot fallback failed: {snapshot_error}"
+                )
+            finally:
+                if snapshot_connection is not None:
+                    snapshot_connection.close()
+                if snapshot_dir is not None:
+                    snapshot_dir.cleanup()
+    source_handle.close()
+
+
+def read_hermes_logs(home: Path, *, root: Path, box: str) -> Iterator[dict[str, Any]]:
+    hermes_home = home / ".hermes"
+    candidates: set[Path] = set()
+    direct_logs = hermes_home / "logs"
+    candidates.update(
+        path
+        for path in iter_regular_files(root, direct_logs, recursive=True)
+        if path.suffix in {".log", ".jsonl"}
+    )
+    candidates.update(
+        path
+        for path in iter_regular_files(root, hermes_home, recursive=False)
+        if path.suffix in {".log", ".jsonl"}
+    )
+    for path in sorted(candidates):
+        if path.suffix == ".jsonl":
+            yield from read_jsonl(
+                path, root=root, box=box, source="hermes", fallback_kind="hermes.log"
+            )
+        else:
+            yield from read_raw(path, root=root, box=box, source="hermes")
+
+
+def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int, dict[str, Any]]]:
+    selected = selected_sources(args.source)
+    since = parse_since(args.since)
+    agent_root = Path(args.agent_root)
+    executor_root = Path(args.executor_root)
+    agent_home = home_for_root(agent_root)
+
+    streams: list[Iterable[dict[str, Any]]] = []
+    if selected is None or selected & {"agent", "hermes", "codex", "claude"}:
+        streams.append(read_runtime_logs(agent_root, scope="agent", box=args.box))
+    if source_wanted("executor", selected):
+        streams.append(read_runtime_logs(executor_root, scope="executor", box=args.box))
+    if source_wanted("codex", selected):
+        streams.append(
+            read_client_events(agent_home, root=agent_root, client="codex", box=args.box)
+        )
+    if source_wanted("claude", selected):
+        streams.append(
+            read_client_events(agent_home, root=agent_root, client="claude", box=args.box)
+        )
+    if source_wanted("hermes", selected):
+        streams.append(read_hermes_logs(agent_home, root=agent_root, box=args.box))
+        streams.extend(
+            read_hermes_db(path, root=agent_root, box=args.box)
+            for path in hermes_db_paths(agent_home, root=agent_root)
+        )
+
+    exact_values = token_env_values()
+    sequence = 0
+    for stream in streams:
+        for event in stream:
+            source = normalize_source(str(event.get("source", "unknown")))
+            if not source_wanted(source, selected):
+                continue
+            timestamp = parse_timestamp(event.get("timestamp")) or dt.datetime.fromtimestamp(0, UTC)
+            if since is not None and timestamp < since:
+                continue
+            searchable = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+            if args.grep and args.grep.casefold() not in searchable.casefold():
+                continue
+            event["source"] = source
+            event["box"] = args.box
+            if not args.no_redact:
+                event = redact_value(event, exact_values)
+            yield timestamp, sequence, event
+            sequence += 1
+
+
+def collect_events(args: argparse.Namespace) -> list[dict[str, Any]]:
+    if args.tail is None:
+        events = list(filtered_events(args))
+    else:
+        events = heapq.nlargest(
+            args.tail,
+            filtered_events(args),
+            key=lambda item: (item[0], item[1]),
+        )
+    events.sort(key=lambda item: (item[0], item[1]))
+    return [event for _, _, event in events]
+
+
+def query_command(args: argparse.Namespace) -> int:
+    try:
+        events = collect_events(args)
+    except ValueError as exc:
+        raise SystemExit(f"tx9-logs query: {exc}") from exc
+    try:
+        for event in events:
+            if args.json:
+                print(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
+            else:
+                print(
+                    f"{event['timestamp']} [{event['box']}/{event['source']}/{event['stream']}] "
+                    f"{event.get('message', '')}"
+                )
+    except BrokenPipeError:
+        return 0
+    return 0
+
+
+def tar_member(name: str, payload: bytes | int, timestamp: int) -> tarfile.TarInfo:
+    info = tarfile.TarInfo(name)
+    info.size = payload if isinstance(payload, int) else len(payload)
+    info.mode = 0o600
+    info.mtime = timestamp
+    return info
+
+
+def export_command(args: argparse.Namespace) -> int:
+    try:
+        spool = sqlite3.connect("")
+        spool.execute("PRAGMA temp_store=FILE")
+        spool.execute(
+            "CREATE TABLE events(timestamp REAL NOT NULL, sequence INTEGER NOT NULL, source TEXT NOT NULL, payload TEXT NOT NULL)"
+        )
+        for timestamp, sequence, event in filtered_events(args):
+            spool.execute(
+                "INSERT INTO events VALUES(?, ?, ?, ?)",
+                (
+                    timestamp.timestamp(),
+                    sequence,
+                    str(event["source"]),
+                    json.dumps(event, ensure_ascii=False, separators=(",", ":")),
+                ),
+            )
+        spool.commit()
+    except ValueError as exc:
+        raise SystemExit(f"tx9-logs export: {exc}") from exc
+    generated = utc_now()
+    if args.tail is None:
+        rows = spool.execute("SELECT source, payload FROM events ORDER BY timestamp, sequence")
+    else:
+        rows = spool.execute(
+            "SELECT source, payload FROM "
+            "(SELECT timestamp, sequence, source, payload FROM events ORDER BY timestamp DESC, sequence DESC LIMIT ?) "
+            "ORDER BY timestamp, sequence",
+            (args.tail,),
+        )
+    event_file = tempfile.TemporaryFile()
+    event_count = 0
+    sources: set[str] = set()
+    for source, payload in rows:
+        event_file.write(payload.encode() + b"\n")
+        event_count += 1
+        sources.add(str(source))
+    event_size = event_file.tell()
+    event_file.seek(0)
+    manifest = {
+        "schema": "tx9.log-export.v1",
+        "box": args.box,
+        "generated_at": isoformat(generated),
+        "event_count": event_count,
+        "sources": sorted(sources),
+        "filters": {
+            "source": args.source,
+            "since": args.since or None,
+            "grep": (
+                args.grep
+                if args.no_redact
+                else redact_text(args.grep, token_env_values())
+            )
+            or None,
+            "tail": args.tail,
+            "redacted": not args.no_redact,
+        },
+        "members": ["manifest.json", "events.jsonl"],
+        "complete": not WARNINGS,
+        "warnings": list(WARNINGS),
+    }
+    manifest_payload = (json.dumps(manifest, indent=2, sort_keys=True) + "\n").encode()
+    timestamp = int(generated.timestamp())
+    try:
+        with tarfile.open(fileobj=sys.stdout.buffer, mode="w|gz") as archive:
+            archive.addfile(tar_member("manifest.json", manifest_payload, timestamp), io.BytesIO(manifest_payload))
+            archive.addfile(tar_member("events.jsonl", event_size, timestamp), event_file)
+    except BrokenPipeError:
+        return 0
+    finally:
+        event_file.close()
+        spool.close()
+    return 0
+
+
+def add_query_options(parser: argparse.ArgumentParser, *, default_tail: int | None) -> None:
+    parser.add_argument("--agent-root", required=True, help="read-only agent volume root")
+    parser.add_argument("--executor-root", required=True, help="read-only Executor volume root")
+    parser.add_argument("--box", required=True, help="box name used in normalized events")
+    parser.add_argument("--source", default="all", help="comma-separated agent,executor,hermes,codex,claude")
+    parser.add_argument("--tail", type=lambda value: positive_int(value), default=default_tail)
+    parser.add_argument("--since", default="", help="duration such as 24h or RFC3339 timestamp")
+    parser.add_argument("--grep", default="", help="case-insensitive text filter")
+    parser.add_argument("--no-redact", action="store_true", help="do not redact query/export source values")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="tx9-logs")
+    subparsers = parser.add_subparsers(dest="action", required=True)
+
+    capture = subparsers.add_parser("capture", help=argparse.SUPPRESS)
+    capture.add_argument("--source", required=True)
+    capture.add_argument("--log-dir", default="/data/logs")
+    capture.add_argument(
+        "--max-bytes",
+        type=lambda value: positive_int(value, minimum=MIN_MAX_BYTES),
+        default=positive_int(os.environ.get("TX9_LOG_MAX_BYTES", str(DEFAULT_MAX_BYTES)), minimum=MIN_MAX_BYTES),
+    )
+    capture.add_argument(
+        "--max-files",
+        type=lambda value: positive_int(value),
+        default=positive_int(os.environ.get("TX9_LOG_MAX_FILES", str(DEFAULT_MAX_FILES))),
+    )
+    capture.add_argument("--restart-delay", type=float)
+    capture.add_argument("command", nargs=argparse.REMAINDER)
+    capture.set_defaults(handler=capture_command)
+
+    query = subparsers.add_parser("query", help="query normalized durable events")
+    add_query_options(query, default_tail=200)
+    query.add_argument("--json", action="store_true", help="emit JSONL instead of text")
+    query.set_defaults(handler=query_command)
+
+    export = subparsers.add_parser("export", help="stream a normalized .tar.gz export")
+    add_query_options(export, default_tail=None)
+    export.set_defaults(handler=export_command)
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    if getattr(args, "restart_delay", None) is not None and args.restart_delay < 0:
+        parser.error("--restart-delay must not be negative")
+    return int(args.handler(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
