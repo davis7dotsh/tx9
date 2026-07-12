@@ -28,7 +28,7 @@ grep -q 'executor-out' "$executor_root/logs/executor.log"
 [[ "$(stat -c '%a' "$executor_root/logs/executor.jsonl")" == 600 ]]
 jq -e 'select(.source == "executor" and .stream == "stdout" and .type == "output")' \
   "$executor_root/logs/executor.jsonl" >/dev/null
-if rg -n 'bearer-secret|query-secret|param-secret|exact-capture-secret|exact-api-key-secret|exact-client-secret|cookie-first|cookie-second|json-secret|pw-secret' \
+if grep -R -nE -- 'bearer-secret|query-secret|param-secret|exact-capture-secret|exact-api-key-secret|exact-client-secret|cookie-first|cookie-second|json-secret|pw-secret' \
     "$tmp/capture.stdout" "$tmp/capture.stderr" "$executor_root/logs"; then
   echo "capture persisted or mirrored a token" >&2
   exit 1
@@ -43,7 +43,7 @@ MULTILINE_SECRET="$multiline_secret" \
   "$helper" capture --source agent --log-dir "$multiline_dir" -- \
     python3 -c 'import os; print("before " + os.environ["MULTILINE_SECRET"] + " after")' \
     >"$tmp/multiline-secret.stdout"
-if rg -n 'multiline-first-half|multiline-second-half' \
+if grep -R -nE -- 'multiline-first-half|multiline-second-half' \
     "$tmp/multiline-secret.stdout" "$multiline_dir"; then
   echo "capture exposed part of a multiline exact secret" >&2
   exit 1
@@ -58,7 +58,7 @@ BOUNDARY_TOKEN="$boundary_secret" \
   "$helper" capture --source executor --log-dir "$boundary_dir" -- \
     python3 -c 'import os; os.write(1, b"x" * (65536 - 7) + os.environ["BOUNDARY_TOKEN"].encode() + b"tail")' \
     >"$tmp/boundary.stdout"
-if rg -n "$boundary_secret" "$tmp/boundary.stdout" "$boundary_dir"; then
+if grep -R -nF -- "$boundary_secret" "$tmp/boundary.stdout" "$boundary_dir"; then
   echo "capture exposed an exact token across a chunk boundary" >&2
   exit 1
 fi
@@ -73,7 +73,7 @@ SHORT_TOKEN=x LONG_TOKEN=long-exact-secret \
     >"$tmp/short-secret.stdout"
 grep -q 'executor box next xylophone bare=x token=\[REDACTED\] \[REDACTED\]' \
   "$tmp/short-secret.stdout"
-if rg -n 'long-exact-secret' "$tmp/short-secret.stdout" "$short_secret_dir"; then
+if grep -R -nF -- 'long-exact-secret' "$tmp/short-secret.stdout" "$short_secret_dir"; then
   echo "capture exposed a long exact secret" >&2
   exit 1
 fi
@@ -93,7 +93,7 @@ os.write(1, b"o" * 65526)
 time.sleep(0.02)
 os.write(1, os.environ["SELF_TOKEN"].encode() + b"\n")
 PY
-if rg -n "$overlap_secret" "$tmp/overlap-secret.stdout" "$overlap_dir"; then
+if grep -R -nF -- "$overlap_secret" "$tmp/overlap-secret.stdout" "$overlap_dir"; then
   echo "capture split and exposed a self-overlapping exact secret" >&2
   exit 1
 fi
@@ -106,7 +106,7 @@ KEY_SECRET=access_token \
   "$helper" capture --source agent --log-dir "$context_dir" -- \
     bash -c 'printf "access_token=pattern-value-secret\n"' \
     >"$tmp/exact-pattern-context.stdout"
-if rg -n 'pattern-value-secret' "$tmp/exact-pattern-context.stdout" "$context_dir"; then
+if grep -R -nF -- 'pattern-value-secret' "$tmp/exact-pattern-context.stdout" "$context_dir"; then
   echo "exact replacement erased pattern context before value redaction" >&2
   exit 1
 fi
@@ -165,7 +165,7 @@ for prefix, value, suffix in cases:
     time.sleep(0.02)
     os.write(1, value[512:] + suffix)
 PY
-if rg -n 'bearer-boundary-secret|authorization-boundary-secret|cookie-boundary-secret|token-boundary-secret|password-boundary-secret|namespaced-auth-secret|namespaced-cookie-secret|namespaced-bearer-secret' \
+if grep -R -nE -- 'bearer-boundary-secret|authorization-boundary-secret|cookie-boundary-secret|token-boundary-secret|password-boundary-secret|namespaced-auth-secret|namespaced-cookie-secret|namespaced-bearer-secret' \
     "$tmp/pattern-boundary.stdout" "$pattern_dir"; then
   echo "capture exposed a credential pattern across a chunk boundary" >&2
   exit 1
@@ -456,7 +456,7 @@ for message in \
   'legacy workload newer rotation line 01 zzzzzzzzzzzzzzzzzzzz' \
   'legacy workload active history line 01 zzzzzzzzzzzzzzzzzzzz' \
   'agent supervisor fixture'; do
-  rg -Fq "$message" "$agent_root/logs"
+  grep -R -Fq -- "$message" "$agent_root/logs"
 done
 [[ ! -e "$agent_root/logs/workload.log.1" ]]
 [[ ! -e "$agent_root/logs/workload.log.2" ]]
@@ -495,11 +495,11 @@ jq -e -s 'map(.source) | unique == ["agent", "claude", "codex", "executor", "her
   "$tmp/query.jsonl" >/dev/null
 jq -e -s 'all(.[]; .schema == "tx9.event.v1" and .box == "fixture-box")' \
   "$tmp/query.jsonl" >/dev/null
-if rg -n 'codex-bearer|bare-query-secret|codex-field-secret|claude-query|db-field-secret' "$tmp/query.jsonl"; then
+if grep -nE -- 'codex-bearer|bare-query-secret|codex-field-secret|claude-query|db-field-secret' "$tmp/query.jsonl"; then
   echo "query emitted an unredacted token" >&2
   exit 1
 fi
-if rg -n 'url-secret|auth-secret|password-secret|api-key-secret|access-token-secret|pattern-value-secret' \
+if grep -nE -- 'url-secret|auth-secret|password-secret|api-key-secret|access-token-secret|pattern-value-secret' \
     "$tmp/query.jsonl"; then
   echo "query emitted a common unredacted credential form" >&2
   exit 1
@@ -580,7 +580,7 @@ for message in \
     'select(.message == $message) | .source == "hermes"' "$tmp/exported/events.jsonl" >/dev/null
   [[ "$(jq -r --arg message "$message" 'select(.message == $message) | .message' "$tmp/exported/events.jsonl" | wc -l | tr -d ' ')" == 1 ]]
 done
-if rg -n 'must-not-export|bare-query-secret|codex-field-secret|claude-query|db-field-secret|pattern-value-secret' "$tmp/exported"; then
+if grep -R -nE -- 'must-not-export|bare-query-secret|codex-field-secret|claude-query|db-field-secret|pattern-value-secret' "$tmp/exported"; then
   echo "export contained source state or an unredacted token" >&2
   exit 1
 fi
@@ -663,7 +663,7 @@ QUERY_TOKEN=search-secret "$helper" export \
   2>"$tmp/redacted-metadata.stderr"
 mkdir "$tmp/redacted-metadata"
 tar -xzf "$tmp/redacted-metadata.tar.gz" -C "$tmp/redacted-metadata"
-if rg -n 'search-secret' "$tmp/redacted-metadata" "$tmp/redacted-metadata.stderr"; then
+if grep -R -nF -- 'search-secret' "$tmp/redacted-metadata" "$tmp/redacted-metadata.stderr"; then
   echo "export metadata or warnings exposed an exact query token" >&2
   exit 1
 fi
