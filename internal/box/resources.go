@@ -82,27 +82,9 @@ func DefaultResources() Resources {
 	}
 }
 
-// WithDefaults fills zero CPU/RAM fields with tx9's defaults. Volume budgets
-// deliberately remain zero because zero means unlimited for those fields.
-func (r Resources) WithDefaults() Resources {
-	defaults := DefaultResources()
-	if r.Agent.NanoCPUs == 0 {
-		r.Agent.NanoCPUs = defaults.Agent.NanoCPUs
-	}
-	if r.Agent.MemoryBytes == 0 {
-		r.Agent.MemoryBytes = defaults.Agent.MemoryBytes
-	}
-	if r.Executor.NanoCPUs == 0 {
-		r.Executor.NanoCPUs = defaults.Executor.NanoCPUs
-	}
-	if r.Executor.MemoryBytes == 0 {
-		r.Executor.MemoryBytes = defaults.Executor.MemoryBytes
-	}
-	return r
-}
-
-// Validate rejects allocations Docker cannot apply. CPU and RAM must be
-// positive; only advisory volume budgets accept zero (unlimited).
+// Validate rejects allocations Docker cannot apply. Zero CPU or RAM means
+// Docker should leave that resource unlimited; fresh boxes receive explicit
+// finite defaults from DefaultResources.
 func (r Resources) Validate() error {
 	for _, allocation := range []struct {
 		name      string
@@ -111,10 +93,11 @@ func (r Resources) Validate() error {
 		{name: "agent", resources: r.Agent},
 		{name: "executor", resources: r.Executor},
 	} {
-		if allocation.resources.NanoCPUs <= 0 {
-			return fmt.Errorf("%s CPUs must be greater than zero", allocation.name)
+		if allocation.resources.NanoCPUs < 0 {
+			return fmt.Errorf("%s CPUs must be zero (unlimited) or greater", allocation.name)
 		}
-		if allocation.resources.MemoryBytes < MinimumMemoryBytes {
+		if allocation.resources.MemoryBytes < 0 ||
+			(allocation.resources.MemoryBytes > 0 && allocation.resources.MemoryBytes < MinimumMemoryBytes) {
 			return fmt.Errorf("%s memory must be at least %s", allocation.name, FormatBytes(MinimumMemoryBytes))
 		}
 		if allocation.resources.MemoryBytes > math.MaxInt64/2 {
@@ -140,16 +123,15 @@ func LoadResources(name string) (Resources, error) {
 
 	resources := DefaultResources()
 	fields := []struct {
-		key       string
-		dest      *int64
-		allowZero bool
+		key  string
+		dest *int64
 	}{
 		{key: AgentNanoCPUsEnv, dest: &resources.Agent.NanoCPUs},
 		{key: AgentMemoryBytesEnv, dest: &resources.Agent.MemoryBytes},
 		{key: ExecutorNanoCPUsEnv, dest: &resources.Executor.NanoCPUs},
 		{key: ExecutorMemoryBytesEnv, dest: &resources.Executor.MemoryBytes},
-		{key: AgentVolumeBudgetBytesEnv, dest: &resources.AgentVolumeBudgetBytes, allowZero: true},
-		{key: ExecutorVolumeBudgetBytesEnv, dest: &resources.ExecutorVolumeBudgetBytes, allowZero: true},
+		{key: AgentVolumeBudgetBytesEnv, dest: &resources.AgentVolumeBudgetBytes},
+		{key: ExecutorVolumeBudgetBytesEnv, dest: &resources.ExecutorVolumeBudgetBytes},
 	}
 	for _, field := range fields {
 		raw, ok := env[field.key]
@@ -157,7 +139,7 @@ func LoadResources(name string) (Resources, error) {
 			continue
 		}
 		value, err := strconv.ParseInt(strings.TrimSpace(raw), 10, 64)
-		if err != nil || value < 0 || (!field.allowZero && value == 0) {
+		if err != nil || value < 0 {
 			return Resources{}, fmt.Errorf("box: load resources %s: invalid %s value %q", name, field.key, raw)
 		}
 		*field.dest = value
@@ -170,10 +152,9 @@ func LoadResources(name string) (Resources, error) {
 
 // SaveResources persists a complete resource configuration without
 // discarding token, executor, mount, or future settings in the box env file.
-// Zero CPU/RAM fields are resolved to tx9's defaults for convenient use with
-// a partially-populated Resources value.
+// CPU/RAM fields are complete desired values; zero is persisted because it
+// means unlimited to Docker.
 func SaveResources(name string, resources Resources) error {
-	resources = resources.WithDefaults()
 	if err := resources.Validate(); err != nil {
 		return fmt.Errorf("box: save resources %s: %w", name, err)
 	}
@@ -254,14 +235,14 @@ func ParseCPUs(value string) (int64, error) {
 	if err != nil || math.IsNaN(cpus) || math.IsInf(cpus, 0) || cpus <= 0 {
 		return 0, fmt.Errorf("CPU count must be a number greater than zero: %q", value)
 	}
-	if cpus > float64(math.MaxInt64)/1_000_000_000 {
+	scaled := math.Round(cpus * 1_000_000_000)
+	if scaled >= float64(math.MaxInt64) {
 		return 0, fmt.Errorf("CPU count is too large: %q", value)
 	}
-	nanoCPUs := int64(math.Round(cpus * 1_000_000_000))
-	if nanoCPUs == 0 {
+	if scaled == 0 {
 		return 0, fmt.Errorf("CPU count is too small: %q", value)
 	}
-	return nanoCPUs, nil
+	return int64(scaled), nil
 }
 
 // FormatCPUs formats Docker NanoCPUs without unnecessary trailing zeroes.

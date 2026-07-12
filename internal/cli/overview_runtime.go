@@ -5,13 +5,16 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"github.com/davis7dotsh/tx9/internal/box"
 	"github.com/davis7dotsh/tx9/internal/docker"
 )
 
 func showOverview(w io.Writer) error {
-	return withDocker(func(ctx context.Context, cli *docker.Client) error {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return withDockerContext(ctx, func(ctx context.Context, cli *docker.Client) error {
 		boxes, err := box.List(ctx, cli)
 		if err != nil {
 			return fmt.Errorf("list boxes: %w", err)

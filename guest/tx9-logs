@@ -536,7 +536,7 @@ def iter_bounded_records(handle: BinaryIO) -> Iterator[tuple[int, bytes | None, 
         if not payload:
             return
         record_number += 1
-        terminated = payload.endswith((b"\n", b"\r"))
+        terminated = payload.endswith(b"\n")
         if len(payload) <= MAX_SOURCE_RECORD_BYTES:
             yield record_number, payload, terminated
             continue
@@ -545,7 +545,7 @@ def iter_bounded_records(handle: BinaryIO) -> Iterator[tuple[int, bytes | None, 
             remainder = handle.readline(MAX_SOURCE_RECORD_BYTES + 1)
             if not remainder:
                 break
-            terminated = remainder.endswith((b"\n", b"\r"))
+            terminated = remainder.endswith(b"\n")
         yield record_number, None, terminated
 
 
@@ -1486,6 +1486,17 @@ def read_hermes_db(path: Path, *, root: Path, box: str) -> Iterator[dict[str, An
     except OSError as exc:
         warn(f"cannot open Hermes database {path}: {exc}")
         return
+    try:
+        yield from read_open_hermes_db(
+            path, root=root, box=box, source_handle=source_handle
+        )
+    finally:
+        source_handle.close()
+
+
+def read_open_hermes_db(
+    path: Path, *, root: Path, box: str, source_handle: BinaryIO
+) -> Iterator[dict[str, Any]]:
     modified_at = os.fstat(source_handle.fileno()).st_mtime
     connection: sqlite3.Connection | None = None
     direct_error: sqlite3.Error | None = None
@@ -1530,7 +1541,6 @@ def read_hermes_db(path: Path, *, root: Path, box: str) -> Iterator[dict[str, An
                     snapshot_connection.close()
                 if snapshot_dir is not None:
                     snapshot_dir.cleanup()
-    source_handle.close()
 
 
 def read_hermes_logs(home: Path, *, root: Path, box: str) -> Iterator[dict[str, Any]]:

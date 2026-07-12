@@ -61,7 +61,10 @@ func requireBoxName(fs *flag.FlagSet, cmd string) (string, error) {
 // withDocker opens a Docker Engine API client from the environment, runs
 // fn, and always closes the client afterward.
 func withDocker(fn func(ctx context.Context, cli *docker.Client) error) error {
-	ctx := context.Background()
+	return withDockerContext(context.Background(), fn)
+}
+
+func withDockerContext(ctx context.Context, fn func(ctx context.Context, cli *docker.Client) error) error {
 	cli, err := docker.NewClient(ctx)
 	if err != nil {
 		return err

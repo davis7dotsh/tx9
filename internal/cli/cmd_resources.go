@@ -43,7 +43,7 @@ func (f *resourceFlagValues) hasOverrides() bool {
 }
 
 func (f *resourceFlagValues) apply(base box.Resources) (box.Resources, error) {
-	result := base.WithDefaults()
+	result := base
 	var err error
 	if f.agentCPUs != "" {
 		result.Agent.NanoCPUs, err = box.ParseCPUs(f.agentCPUs)
@@ -223,14 +223,16 @@ func requireCompleteResources(ctx context.Context, cli *docker.Client, b *box.Bo
 	if err != nil {
 		return box.Resources{}, err
 	}
-	if resources.Agent.NanoCPUs <= 0 || resources.Agent.MemoryBytes <= 0 ||
-		resources.Executor.NanoCPUs <= 0 || resources.Executor.MemoryBytes <= 0 {
-		return box.Resources{}, fmt.Errorf("container inspection returned incomplete CPU/RAM limits")
+	if err := resources.Validate(); err != nil {
+		return box.Resources{}, fmt.Errorf("container inspection returned invalid resource limits: %w", err)
 	}
 	return resources, nil
 }
 
 func applyResourcesTransaction(ctx context.Context, cli containerResourceUpdater, b *box.Box, oldResources, newResources box.Resources, persist func() error) error {
+	if err := validateLiveResourceTransition(b.Name, oldResources, newResources); err != nil {
+		return err
+	}
 	var updatedAgent, updatedExecutor bool
 	if oldResources.Agent != newResources.Agent {
 		warnings, err := cli.ContainerUpdateResources(ctx, b.AgentID, newResources.Agent.NanoCPUs, newResources.Agent.MemoryBytes)
@@ -266,6 +268,32 @@ func applyResourcesTransaction(ctx context.Context, cli containerResourceUpdater
 			}
 		}
 		return errors.Join(fmt.Errorf("persist resource settings: %w", err), errors.Join(rollbackErrs...))
+	}
+	return nil
+}
+
+func validateLiveResourceTransition(name string, oldResources, newResources box.Resources) error {
+	roles := []struct {
+		name    string
+		old     box.ContainerResources
+		updated box.ContainerResources
+	}{
+		{name: "agent", old: oldResources.Agent, updated: newResources.Agent},
+		{name: "executor", old: oldResources.Executor, updated: newResources.Executor},
+	}
+	for _, role := range roles {
+		for _, resource := range []struct {
+			name     string
+			oldValue int64
+			newValue int64
+		}{
+			{name: "CPU", oldValue: role.old.NanoCPUs, newValue: role.updated.NanoCPUs},
+			{name: "memory", oldValue: role.old.MemoryBytes, newValue: role.updated.MemoryBytes},
+		} {
+			if (resource.oldValue == 0) != (resource.newValue == 0) {
+				return fmt.Errorf("cannot change %s %s between unlimited and finite with Docker's live update API; use `tx9 upgrade %s` with the same resource flags", role.name, resource.name, name)
+			}
+		}
 	}
 	return nil
 }

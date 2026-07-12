@@ -80,8 +80,8 @@ func TestNoArgumentsFallsBackToCommandsWhenOverviewFails(t *testing.T) {
 	status := runWithOverview([]string{"tx9"}, nil, func(io.Writer) error {
 		return errors.New("daemon unavailable")
 	}, &stdout, &stderr)
-	if status != 1 {
-		t.Fatalf("status = %d, want 1", status)
+	if status != 0 {
+		t.Fatalf("status = %d, want 0", status)
 	}
 	if !strings.Contains(stdout.String(), "overview unavailable") || !strings.Contains(stdout.String(), "Commands:") {
 		t.Fatalf("stdout missing fallback:\n%s", stdout.String())

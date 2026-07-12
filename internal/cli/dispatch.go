@@ -86,7 +86,7 @@ func runWithOverview(args []string, buildContext fs.FS, overview func(io.Writer)
 			fmt.Fprintf(stderr, "tx9: overview: %v\n", err)
 			fmt.Fprintf(stdout, "tx9 %s - box overview unavailable\n", version.Version)
 			printCommandList(stdout)
-			return 1
+			return 0
 		}
 		printCommandList(stdout)
 		return 0

@@ -435,6 +435,9 @@ for _ in range(100):
 (logs / "oversized-search-secret.log").write_bytes(
     b"z" * (2 * 1024 * 1024 + 128) + b"\n"
 )
+(logs / "oversized-cr-boundary.log").write_bytes(
+    b"q" * (2 * 1024 * 1024) + b"\r" + b"must-not-escape-oversized-record\n"
+)
 PY
 "$helper" query --agent-root "$hostile_agent" --executor-root "$executor_root" \
   --box fixture-box --source executor --tail 100 --json \
@@ -452,6 +455,10 @@ grep -q '\[TRUNCATED\]' "$tmp/hostile-all.jsonl"
 grep -q 'hostile-nested-number' "$tmp/hostile-all.jsonl"
 grep -q 'record omitted because it exceeds the query size limit' "$tmp/hostile-all.jsonl"
 grep -q 'omitted oversized source record' "$tmp/hostile-all.stderr"
+if grep -q 'must-not-escape-oversized-record' "$tmp/hostile-all.jsonl"; then
+  echo "query emitted the tail of an oversized CR-boundary record" >&2
+  exit 1
+fi
 jq -e 'select(.message == "forged-executor-source") | .source == "agent" and .stream == "event" and .type == "output"' \
   "$tmp/hostile-all.jsonl" >/dev/null
 

@@ -116,6 +116,26 @@ func TestResourcesPersistPreserveUnknownAndReset(t *testing.T) {
 	}
 }
 
+func TestResourcesPersistUnlimitedContainerAllocations(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	const name = "unlimited"
+	if err := state.WriteBoxEnv(name, map[string]string{}); err != nil {
+		t.Fatal(err)
+	}
+
+	want := Resources{}
+	if err := SaveResources(name, want); err != nil {
+		t.Fatal(err)
+	}
+	got, err := LoadResources(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("LoadResources() = %#v, want unlimited values %#v", got, want)
+	}
+}
+
 func TestLoadResourcesUsesDefaultsForMissingKeys(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	const name = "partial"
@@ -145,7 +165,7 @@ func TestLoadResourcesRejectsInvalidStoredValues(t *testing.T) {
 		value string
 	}{
 		{name: "not a number", key: AgentMemoryBytesEnv, value: "8GiB"},
-		{name: "zero CPU", key: AgentNanoCPUsEnv, value: "0"},
+		{name: "negative CPU", key: AgentNanoCPUsEnv, value: "-1"},
 		{name: "negative budget", key: ExecutorVolumeBudgetBytesEnv, value: "-1"},
 	}
 	for _, tc := range cases {
@@ -171,6 +191,15 @@ func TestResourceParsingAndFormatting(t *testing.T) {
 	}
 	if FormatCPUs(0) != "unlimited" {
 		t.Errorf("FormatCPUs(0) = %q", FormatCPUs(0))
+	}
+	for _, value := range []string{"9223372036.854776", "9223372036.854777"} {
+		if _, err := ParseCPUs(value); err == nil {
+			t.Errorf("ParseCPUs(%q) error = nil, want overflow error", value)
+		}
+	}
+	largeCPUs, err := ParseCPUs("9223372036.854774")
+	if err != nil || largeCPUs <= 0 {
+		t.Errorf("ParseCPUs(largest safe fixture) = %d, %v", largeCPUs, err)
 	}
 
 	bytes, err := ParseBytes("8GiB")
@@ -206,6 +235,16 @@ func TestResourceParsingAndFormatting(t *testing.T) {
 
 func TestResourcesEnforceDockerMinimumMemory(t *testing.T) {
 	resources := DefaultResources()
+	resources.Agent.NanoCPUs = 0
+	resources.Agent.MemoryBytes = 0
+	if err := resources.Validate(); err != nil {
+		t.Fatalf("Validate() unlimited resources = %v", err)
+	}
+	resources.Agent.NanoCPUs = -1
+	if err := resources.Validate(); err == nil {
+		t.Fatal("Validate() error = nil for negative CPUs")
+	}
+	resources.Agent.NanoCPUs = 0
 	resources.Agent.MemoryBytes = MinimumMemoryBytes - 1
 	if err := resources.Validate(); err == nil {
 		t.Fatal("Validate() error = nil below Docker's minimum memory")

@@ -137,6 +137,10 @@ TX9 therefore reports their real used bytes and `unlimited` capacity by
 default; optional volume values are explicitly advisory budgets used for
 visibility and over-budget warnings, not filesystem enforcement.
 
+If a container was configured outside tx9 with unlimited CPU or RAM, use
+`tx9 upgrade <box>` plus the desired resource flags to move it to a finite
+limit. Docker's live update API cannot safely roll that transition back.
+
 Fresh and restored boxes begin with the Hermes gateway durably disabled so
 setup and migration cannot create a second Discord writer; enabling it is
 always an explicit, confirmed step. Do not use `hermes gateway run` as the

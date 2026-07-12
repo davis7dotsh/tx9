@@ -41,7 +41,7 @@ type CreateOpts struct {
 // first) are created fresh each time.
 func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, error) {
 	name := opts.Name
-	resources := opts.Resources.WithDefaults()
+	resources := opts.Resources
 	if err := resources.Validate(); err != nil {
 		return nil, fmt.Errorf("box: create %s: resources: %w", name, err)
 	}

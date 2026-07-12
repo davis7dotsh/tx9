@@ -5,6 +5,7 @@ import (
 	"errors"
 	"flag"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/davis7dotsh/tx9/internal/box"
@@ -54,6 +55,26 @@ func TestResourceFlagsApplyOverDefaults(t *testing.T) {
 	}
 	if got.AgentVolumeBudgetBytes != 96<<30 || got.ExecutorVolumeBudgetBytes != 0 {
 		t.Errorf("volume budgets = %d/%d", got.AgentVolumeBudgetBytes, got.ExecutorVolumeBudgetBytes)
+	}
+}
+
+func TestResourceFlagsPreserveUnlimitedBaseValues(t *testing.T) {
+	base := box.Resources{}
+	fs := flag.NewFlagSet("resources", flag.ContinueOnError)
+	flags := addResourceConfigFlags(fs)
+	if err := fs.Parse([]string{"--agent-volume-budget", "10GiB"}); err != nil {
+		t.Fatal(err)
+	}
+
+	got, err := flags.apply(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Agent != base.Agent || got.Executor != base.Executor {
+		t.Fatalf("container allocations = %#v/%#v, want unlimited values preserved", got.Agent, got.Executor)
+	}
+	if got.AgentVolumeBudgetBytes != 10<<30 {
+		t.Fatalf("agent volume budget = %d, want %d", got.AgentVolumeBudgetBytes, int64(10<<30))
 	}
 }
 
@@ -160,5 +181,25 @@ func TestApplyResourcesTransactionPersistsBudgetWithoutContainerUpdates(t *testi
 	}
 	if !persisted || len(updater.calls) != 0 {
 		t.Fatalf("persisted/calls = %t/%#v, want true/no calls", persisted, updater.calls)
+	}
+}
+
+func TestApplyResourcesTransactionRejectsNonRollbackableUnlimitedTransition(t *testing.T) {
+	oldResources := box.DefaultResources()
+	oldResources.Agent.NanoCPUs = 0
+	newResources := oldResources
+	newResources.Agent.NanoCPUs = box.DefaultAgentNanoCPUs
+	updater := &fakeResourceUpdater{}
+	persisted := false
+
+	err := applyResourcesTransaction(context.Background(), updater, &box.Box{Name: "media-bot", AgentID: "agent", ExecutorID: "executor"}, oldResources, newResources, func() error {
+		persisted = true
+		return nil
+	})
+	if err == nil || !strings.Contains(err.Error(), "tx9 upgrade media-bot") {
+		t.Fatalf("transaction error = %v, want upgrade guidance", err)
+	}
+	if persisted || len(updater.calls) != 0 {
+		t.Fatalf("persisted/calls = %t/%#v, want false/no calls", persisted, updater.calls)
 	}
 }
