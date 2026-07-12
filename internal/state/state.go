@@ -102,8 +102,8 @@ func ReadBoxEnv(name string) (map[string]string, error) {
 	return env, nil
 }
 
-// WriteBoxEnv writes a KEY=VALUE env file (mode 0600), overwriting any
-// existing file.
+// WriteBoxEnv atomically writes a KEY=VALUE env file (mode 0600). Failures
+// before the final rename leave any existing file unchanged.
 func WriteBoxEnv(name string, env map[string]string) error {
 	path, err := BoxEnvPath(name)
 	if err != nil {
@@ -119,9 +119,32 @@ func WriteBoxEnv(name string, env map[string]string) error {
 	for _, k := range keys {
 		fmt.Fprintf(&b, "%s=%s\n", k, env[k])
 	}
-	if err := os.WriteFile(path, []byte(b.String()), 0o600); err != nil {
+	temp, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return fmt.Errorf("state: writeBoxEnv: %w", err)
 	}
+	tempPath := temp.Name()
+	committed := false
+	defer func() {
+		if !committed {
+			_ = os.Remove(tempPath)
+		}
+	}()
+	if _, err := temp.WriteString(b.String()); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("state: writeBoxEnv: %w", err)
+	}
+	if err := temp.Sync(); err != nil {
+		_ = temp.Close()
+		return fmt.Errorf("state: writeBoxEnv: %w", err)
+	}
+	if err := temp.Close(); err != nil {
+		return fmt.Errorf("state: writeBoxEnv: %w", err)
+	}
+	if err := os.Rename(tempPath, path); err != nil {
+		return fmt.Errorf("state: writeBoxEnv: %w", err)
+	}
+	committed = true
 	return nil
 }
 

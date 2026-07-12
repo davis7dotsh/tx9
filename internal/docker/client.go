@@ -10,7 +10,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 
+	dockertypes "github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/build"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
@@ -141,6 +143,59 @@ func (c *Client) VolumeRemove(ctx context.Context, name string, force bool) erro
 	return nil
 }
 
+// VolumeUsage returns byte usage for the requested named volumes from one
+// /system/df request. A value of -1 means the daemon cannot report usage for
+// that volume (for example, because its driver is not local). With no names,
+// usage for every volume returned by the daemon is included.
+func (c *Client) VolumeUsage(ctx context.Context, names ...string) (map[string]int64, []string, error) {
+	usage, err := c.cli.DiskUsage(ctx, dockertypes.DiskUsageOptions{
+		Types: []dockertypes.DiskUsageObject{dockertypes.VolumeObject},
+	})
+	if err != nil {
+		return nil, nil, fmt.Errorf("docker: volume disk usage: %w", err)
+	}
+
+	wanted := make(map[string]bool, len(names))
+	orderedNames := make([]string, 0, len(names))
+	for _, name := range names {
+		if name == "" || wanted[name] {
+			continue
+		}
+		wanted[name] = true
+		orderedNames = append(orderedNames, name)
+	}
+	filterByName := len(wanted) > 0
+
+	result := make(map[string]int64, len(names))
+	var warnings []string
+	for _, v := range usage.Volumes {
+		if v == nil || v.Name == "" {
+			continue
+		}
+		if filterByName && !wanted[v.Name] {
+			continue
+		}
+		delete(wanted, v.Name)
+		if v.UsageData == nil {
+			result[v.Name] = -1
+			warnings = append(warnings, fmt.Sprintf("volume %s: Docker did not return usage data", v.Name))
+			continue
+		}
+		result[v.Name] = v.UsageData.Size
+		if v.UsageData.Size < 0 {
+			warnings = append(warnings, fmt.Sprintf("volume %s: driver %s does not report usage", v.Name, v.Driver))
+		}
+	}
+	for _, name := range orderedNames {
+		if !wanted[name] {
+			continue
+		}
+		result[name] = -1
+		warnings = append(warnings, fmt.Sprintf("volume %s: not found in Docker disk usage response", name))
+	}
+	return result, warnings, nil
+}
+
 // ContainerSpec describes a container tx9 wants created. It only covers the
 // fields the box topology (dossier §1) actually uses — not the full Engine
 // API surface.
@@ -167,6 +222,10 @@ type ContainerSpec struct {
 // `--init` and `restart: unless-stopped` baked in (dossier §1.3 — every box
 // container uses both).
 func (c *Client) ContainerCreate(ctx context.Context, spec ContainerSpec) (string, error) {
+	memorySwap, err := defaultMemorySwapLimit(spec.MemoryBytes)
+	if err != nil {
+		return "", fmt.Errorf("docker: container create %s: %w", spec.Name, err)
+	}
 	initEnabled := true
 	cfg := &container.Config{
 		Image:        spec.Image,
@@ -187,8 +246,9 @@ func (c *Client) ContainerCreate(ctx context.Context, spec ContainerSpec) (strin
 			Name: container.RestartPolicyUnlessStopped,
 		},
 		Resources: container.Resources{
-			NanoCPUs: spec.NanoCPUs,
-			Memory:   spec.MemoryBytes,
+			NanoCPUs:   spec.NanoCPUs,
+			Memory:     spec.MemoryBytes,
+			MemorySwap: memorySwap,
 		},
 	}
 
@@ -240,6 +300,41 @@ func (c *Client) ContainerInspect(ctx context.Context, id string) (container.Ins
 		return container.InspectResponse{}, fmt.Errorf("docker: container inspect %s: %w", id, err)
 	}
 	return resp, nil
+}
+
+// ContainerUpdateResources updates a container's mutable CPU and memory
+// limits in place. Docker may accept an update with non-fatal warnings, so
+// callers receive those warnings verbatim for display.
+func (c *Client) ContainerUpdateResources(ctx context.Context, id string, nanoCPUs, memoryBytes int64) ([]string, error) {
+	memorySwap, err := defaultMemorySwapLimit(memoryBytes)
+	if err != nil {
+		return nil, fmt.Errorf("docker: container update resources %s: %w", id, err)
+	}
+	resp, err := c.cli.ContainerUpdate(ctx, id, container.UpdateConfig{
+		Resources: container.Resources{
+			NanoCPUs:   nanoCPUs,
+			Memory:     memoryBytes,
+			MemorySwap: memorySwap,
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("docker: container update resources %s: %w", id, err)
+	}
+	return append([]string(nil), resp.Warnings...), nil
+}
+
+// defaultMemorySwapLimit preserves Docker's default policy for a container
+// with a memory limit: total memory+swap is twice the RAM limit. Supplying it
+// explicitly on updates is important because Docker otherwise retains the
+// old swap ceiling and can reject a RAM increase above that ceiling.
+func defaultMemorySwapLimit(memoryBytes int64) (int64, error) {
+	if memoryBytes == 0 {
+		return 0, nil
+	}
+	if memoryBytes < 0 || memoryBytes > math.MaxInt64/2 {
+		return 0, fmt.Errorf("memory limit %d cannot be represented with Docker's default swap allowance", memoryBytes)
+	}
+	return memoryBytes * 2, nil
 }
 
 // ImageInspect returns full image metadata (used by `list` to show

@@ -3,6 +3,7 @@
 set -uo pipefail
 # shellcheck disable=SC1091
 [ -f /etc/profile.d/hermes-box.sh ] && . /etc/profile.d/hermes-box.sh
+export TX9_LOG_MAX_BYTES TX9_LOG_MAX_FILES
 # shellcheck source=guest/lib-mcp.sh
 . "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-mcp.sh"
 
@@ -23,6 +24,13 @@ WIRE_VERSION=http-v3
 WIRED="$AGENT_HOME/.hermes-box-wired"
 TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
 TOKEN_ENV="$AGENT_HOME/.config/hermes-box/executor-mcp.env"
+# The initiating start holds GATEWAY_LOCK while polling for the real child.
+# Its lock wait must be comfortably longer than that polling window so a
+# concurrent explicit enable observes the pending wrapper instead of timing
+# out and recreating the disabled marker underneath it.
+GATEWAY_LOCK_WAIT_SECONDS=10
+GATEWAY_START_WAIT_ATTEMPTS=50
+GATEWAY_START_WAIT_INTERVAL=0.1
 
 # Remote-executor mode (Docker compose split): when EXECUTOR_HOST points away
 # from loopback, Executor runs in its own container. hb then only checks
@@ -90,10 +98,11 @@ declare -A _DAEMON_LOCK_FDS
 
 _acquire_daemon_lock() {
   local lock="$1"
+  local wait_seconds="${2:-5}"
   local fd
   mkdir -p "$STATE_DIR" 2>/dev/null || true
   exec {fd}>"$lock"
-  if ! flock -w 5 "$fd"; then
+  if ! flock -w "$wait_seconds" "$fd"; then
     eval "exec ${fd}>&-"
     return 1
   fi
@@ -119,7 +128,7 @@ _release_daemon_lock() {
 # milliseconds right after spawning.
 _spawn_without_lock_fd() {
   shift
-  local logfile="$1" fd
+  local logfile="$1" fd source log_dir
   shift
   # A daemon start can occur while a higher-level coordination lock is also
   # held (for example, the MCP reload lock around a gateway restart). Close
@@ -129,6 +138,13 @@ _spawn_without_lock_fd() {
     for fd in "${_DAEMON_LOCK_FDS[@]}"; do
       eval "exec ${fd}>&-"
     done
+    if command -v tx9-logs >/dev/null 2>&1; then
+      source="$(basename "$logfile" .log)"
+      [[ "$source" != hermes-gateway ]] || source=hermes
+      log_dir="$(dirname "$logfile")"
+      exec nohup tx9-logs capture --source "$source" --log-dir "$log_dir" -- "$@" \
+        </dev/null >/dev/null 2>&1
+    fi
     exec nohup "$@" >>"$logfile" 2>&1
   ) &
 }
@@ -153,14 +169,61 @@ _executor_up() {
   fi
   echo "starting executor daemon"
   rm -f "$AGENT_HOME/.executor"/daemon-active-* 2>/dev/null || true
-  executor daemon run >>"$LOGS/executor.log" 2>&1 || true
+  if command -v tx9-logs >/dev/null 2>&1; then
+    tx9-logs capture --source executor --log-dir "$LOGS" -- executor daemon run || true
+  else
+    executor daemon run >>"$LOGS/executor.log" 2>&1 || true
+  fi
   _wait_port open || { echo "executor failed to become ready; see: hb logs executor" >&2; _release_daemon_lock "$EXECUTOR_LOCK"; return 1; }
   echo "executor daemon: ready"
   _release_daemon_lock "$EXECUTOR_LOCK"
 }
 
+_gateway_pids() {
+  local pid command_line
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    command_line="$(ps -o args= -p "$pid" 2>/dev/null)" || continue
+    [[ "$command_line" != *"tx9-logs capture"* ]] || continue
+    printf '%s\n' "$pid"
+  done < <(pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true)
+}
+
+_gateway_capture_pids() {
+  local pid command_line
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    command_line="$(ps -o args= -p "$pid" 2>/dev/null)" || continue
+    [[ "$command_line" == *"tx9-logs capture"* && "$command_line" == *"--source hermes"* ]] || continue
+    printf '%s\n' "$pid"
+  done < <(pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true)
+}
+
 _gateway_running() {
-  pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' >/dev/null 2>&1
+  [[ -n "$(_gateway_pids)" ]]
+}
+
+# Print the real gateway PID and return 0 once it appears. Return 2 when the
+# capture wrapper is still healthy after the short synchronous wait: it may be
+# migrating a large legacy log before starting Hermes, so callers must leave it
+# running and let a later reconciliation observe the child. Return 1 only for
+# a dead wrapper or an invalid process count.
+_wait_gateway_pid() {
+  local wrapper_pid="$1" attempts="${2:-$GATEWAY_START_WAIT_ATTEMPTS}" attempt state
+  local -a gateway_pids
+  for ((attempt = 0; attempt < attempts; attempt++)); do
+    mapfile -t gateway_pids < <(_gateway_pids)
+    if ((${#gateway_pids[@]} == 1)); then
+      printf '%s\n' "${gateway_pids[0]}"
+      return 0
+    fi
+    ((${#gateway_pids[@]} == 0)) || return 1
+    kill -0 "$wrapper_pid" 2>/dev/null || return 1
+    state="$(ps -o stat= -p "$wrapper_pid" 2>/dev/null)" || return 1
+    [[ "$state" != Z* ]] || return 1
+    sleep "$GATEWAY_START_WAIT_INTERVAL"
+  done
+  return 2
 }
 
 _load_executor_mcp_env() {
@@ -184,26 +247,69 @@ _load_executor_mcp_env() {
 # call lost a lock race would kill another process's legitimately-running
 # gateway.
 _start_gateway() {
+  local wrapper_pid gateway_pid wait_status
+  local -a gateway_pids capture_pids
   [[ "${INSTALL_HERMES:-0}" == 1 ]] || return 0
   [[ ! -e "$QUIESCE_FILE" && ! -e "$GATEWAY_DISABLED" ]] || return 0
   command -v hermes >/dev/null 2>&1 || { echo "hermes not installed" >&2; return 1; }
-  _acquire_daemon_lock "$GATEWAY_LOCK" || { echo "could not acquire Hermes gateway lock" >&2; return 2; }
-  if _gateway_running; then
-    local count
-    count="$(pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' | wc -l | tr -d ' ')"
-    if [[ "$count" != 1 ]]; then
+  _acquire_daemon_lock "$GATEWAY_LOCK" "$GATEWAY_LOCK_WAIT_SECONDS" || { echo "could not acquire Hermes gateway lock" >&2; return 2; }
+  mapfile -t gateway_pids < <(_gateway_pids)
+  if ((${#gateway_pids[@]} > 0)); then
+    if ((${#gateway_pids[@]} != 1)); then
       echo "multiple Hermes gateway processes detected" >&2
       _release_daemon_lock "$GATEWAY_LOCK"
       return 1
     fi
-    pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' | head -1 >"$GATEWAY_PID"
+    printf '%s\n' "${gateway_pids[0]}" >"$GATEWAY_PID"
+    _release_daemon_lock "$GATEWAY_LOCK"
+    return 0
+  fi
+  mapfile -t capture_pids < <(_gateway_capture_pids)
+  if ((${#capture_pids[@]} > 0)); then
+    if ((${#capture_pids[@]} != 1)); then
+      echo "Hermes gateway capture is pending but did not start cleanly" >&2
+      _release_daemon_lock "$GATEWAY_LOCK"
+      return 1
+    fi
+    if gateway_pid="$(_wait_gateway_pid "${capture_pids[0]}" 1)"; then
+      wait_status=0
+    else
+      wait_status=$?
+    fi
+    if [[ "$wait_status" == 0 ]]; then
+      printf '%s\n' "$gateway_pid" >"$GATEWAY_PID"
+    elif [[ "$wait_status" != 2 ]]; then
+      echo "Hermes gateway capture is pending but did not start cleanly" >&2
+      _release_daemon_lock "$GATEWAY_LOCK"
+      return 1
+    else
+      rm -f "$GATEWAY_PID"
+    fi
     _release_daemon_lock "$GATEWAY_LOCK"
     return 0
   fi
   rm -f "$GATEWAY_PID"
   _load_executor_mcp_env
   _spawn_without_lock_fd "$GATEWAY_LOCK" "$LOGS/hermes-gateway.log" hermes gateway run --replace
-  printf '%s\n' "$!" >"$GATEWAY_PID"
+  wrapper_pid="$!"
+  if gateway_pid="$(_wait_gateway_pid "$wrapper_pid")"; then
+    wait_status=0
+  else
+    wait_status=$?
+  fi
+  if [[ "$wait_status" == 2 ]]; then
+    # A live wrapper owns this launch. Releasing the flock is safe because
+    # later callers detect that wrapper and will not start a duplicate.
+    _release_daemon_lock "$GATEWAY_LOCK"
+    return 0
+  elif [[ "$wait_status" != 0 ]]; then
+    kill -TERM "$wrapper_pid" 2>/dev/null || true
+    wait "$wrapper_pid" 2>/dev/null || true
+    echo "Hermes gateway failed to start; see: hb logs hermes" >&2
+    _release_daemon_lock "$GATEWAY_LOCK"
+    return 1
+  fi
+  printf '%s\n' "$gateway_pid" >"$GATEWAY_PID"
   _release_daemon_lock "$GATEWAY_LOCK"
 }
 
@@ -702,6 +808,14 @@ doctor() {
 
 logs() {
   local name="${1:-executor}"
+  if [[ "$name" == executor ]] && _exec_remote; then
+    if [[ -n "${TX9_BOX_NAME:-}" ]]; then
+      printf "Executor runs in a separate container; on the host run: tx9 logs %q --source executor\n" "$TX9_BOX_NAME"
+    else
+      echo "Executor runs in a separate container; on the host run: tx9 logs <box> --source executor"
+    fi
+    return 0
+  fi
   [[ "$name" == hermes || "$name" == gateway ]] && name=hermes-gateway
   tail -n 200 -F "$LOGS/${name}.log"
 }

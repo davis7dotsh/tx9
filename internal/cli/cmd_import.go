@@ -57,6 +57,7 @@ chown root:root /data && chmod 0711 /data
 func cmdImport(args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
 	executorFlags := addExecutorConfigFlags(fs)
+	resourceFlags := addResourceConfigFlags(fs)
 	nameOverride := fs.String("name", "", "box name to restore under (default: from archive metadata)")
 	password := fs.String("password", "", "archive passphrase (else TX9_PASSWORD env, else prompt)")
 	if err := parseFlagsAnywhere(fs, args); err != nil {
@@ -80,6 +81,10 @@ func cmdImport(args []string) error {
 		return fmt.Errorf("import %s: %w", archivePath, err)
 	}
 	executorConfig, err := executorFlags.loadFresh(name)
+	if err != nil {
+		return fmt.Errorf("import %s: %w", name, err)
+	}
+	resources, err := resourceFlags.apply(box.DefaultResources())
 	if err != nil {
 		return fmt.Errorf("import %s: %w", name, err)
 	}
@@ -136,6 +141,9 @@ func cmdImport(args []string) error {
 		if err := box.SaveAgentMounts(name, nil); err != nil {
 			return fmt.Errorf("import %s: %w", name, err)
 		}
+		if err := box.SaveResources(name, resources); err != nil {
+			return fmt.Errorf("import %s: %w", name, err)
+		}
 
 		imageTag := fmt.Sprintf("tx9-box:%s", version.Version)
 		if err := ensureBoxImage(ctx, cli, imageTag); err != nil {
@@ -144,7 +152,7 @@ func cmdImport(args []string) error {
 
 		fmt.Printf("tx9: creating box %q (network, volumes, containers — not started yet)\n", name)
 		b, err := box.Create(ctx, cli, box.CreateOpts{
-			Name: name, Image: imageTag, Token: tok, Executor: executorConfig, NoStart: true,
+			Name: name, Image: imageTag, Token: tok, Executor: executorConfig, Resources: resources, NoStart: true,
 		})
 		if err != nil {
 			box.Destroy(ctx, cli, name)

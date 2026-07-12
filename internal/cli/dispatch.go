@@ -41,6 +41,8 @@ var commandSpecs = []commandSpec{
 	{name: "enter", help: "exec into a box's agent container (--executor for the executor container)", aliases: []string{"ssh", "shell"}, run: cmdEnter},
 	{name: "start", help: "start a stopped box", run: cmdStart},
 	{name: "stop", help: "stop a running box", run: cmdStop},
+	{name: "logs", help: "query/export durable agent, Executor, Hermes, Codex, and Claude events", run: cmdLogs},
+	{name: "resources", help: "show/update container limits and volume budgets", run: cmdResources},
 	{name: "backup", help: "archive a box to a .tx9 file", aliases: []string{"export", "save"}, run: cmdBackup},
 	{name: "import", help: "restore a box from a .tx9 file", aliases: []string{"load", "restore"}, run: cmdImport},
 	{name: "mount", help: "add/list/remove persistent agent host mounts", run: cmdMount},
@@ -73,11 +75,21 @@ func init() {
 // dispatches to the matching subcommand, and returns a process exit code.
 // buildContext is the embedded build-context filesystem from /assets.go.
 func Run(args []string, buildContext fs.FS) int {
+	return runWithOverview(args, buildContext, showOverview, os.Stdout, os.Stderr)
+}
+
+func runWithOverview(args []string, buildContext fs.FS, overview func(io.Writer) error, stdout, stderr io.Writer) int {
 	BuildContext = buildContext
 
 	if len(args) < 2 {
-		printUsage(os.Stdout)
-		return 1
+		if err := overview(stdout); err != nil {
+			fmt.Fprintf(stderr, "tx9: overview: %v\n", err)
+			fmt.Fprintf(stdout, "tx9 %s - box overview unavailable\n", version.Version)
+			printCommandList(stdout)
+			return 0
+		}
+		printCommandList(stdout)
+		return 0
 	}
 
 	sub := args[1]
@@ -85,10 +97,10 @@ func Run(args []string, buildContext fs.FS) int {
 
 	switch sub {
 	case "-h", "-help", "--help", "help":
-		printUsage(os.Stdout)
+		printUsage(stdout)
 		return 0
 	case "-v", "-version", "--version", "version":
-		fmt.Println(version.Version)
+		fmt.Fprintln(stdout, version.Version)
 		return 0
 	}
 
@@ -98,13 +110,13 @@ func Run(args []string, buildContext fs.FS) int {
 
 	fn, ok := commands[sub]
 	if !ok {
-		fmt.Fprintf(os.Stderr, "tx9: unknown command %q\n\n", sub)
-		printUsage(os.Stderr)
+		fmt.Fprintf(stderr, "tx9: unknown command %q\n\n", sub)
+		printUsage(stderr)
 		return 1
 	}
 
 	if err := fn(rest); err != nil {
-		fmt.Fprintf(os.Stderr, "tx9: %v\n", err)
+		fmt.Fprintf(stderr, "tx9: %v\n", err)
 		return 1
 	}
 	return 0
@@ -113,10 +125,7 @@ func Run(args []string, buildContext fs.FS) int {
 func printUsage(w io.Writer) {
 	fmt.Fprintf(w, "tx9 %s — manage hermes boxes\n\n", version.Version)
 	fmt.Fprintln(w, "Usage: tx9 <command> [args]")
-	fmt.Fprintln(w, "\nCommands:")
-	for _, spec := range commandSpecs {
-		fmt.Fprintf(w, "  %-10s %s\n", spec.name, spec.help)
-	}
+	printCommandList(w)
 	fmt.Fprintln(w, "\nAliases:")
 	for _, spec := range commandSpecs {
 		for _, alias := range spec.aliases {
@@ -129,4 +138,11 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "\nFlags:")
 	fmt.Fprintln(w, "  -h, --help     show this message")
 	fmt.Fprintln(w, "  -v, --version  print the CLI version")
+}
+
+func printCommandList(w io.Writer) {
+	fmt.Fprintln(w, "\nCommands:")
+	for _, spec := range commandSpecs {
+		fmt.Fprintf(w, "  %-10s %s\n", spec.name, spec.help)
+	}
 }

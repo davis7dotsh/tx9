@@ -8,6 +8,7 @@ syntax:
 	bash -n $(SHELL_FILES)
 	sh -n scripts/install.sh
 	python3 -c 'compile(open("guest/hermes-state", encoding="utf-8").read(), "guest/hermes-state", "exec")'
+	python3 -c 'compile(open("guest/tx9-logs", encoding="utf-8").read(), "guest/tx9-logs", "exec")'
 
 lint:
 	command -v shellcheck >/dev/null || { echo "shellcheck is required for make check" >&2; exit 1; }

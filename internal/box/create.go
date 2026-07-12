@@ -22,22 +22,13 @@ import (
 // closed port unless IPv6 is disabled in the container's netns.
 var ipv6DisableSysctl = map[string]string{"net.ipv6.conf.all.disable_ipv6": "1"}
 
-// CPU/memory limits, ported verbatim from docker/compose.yaml's defaults
-// (dossier §1.3/§1.4 live-inspect-confirmed): agent 4 CPUs / 8192 MiB,
-// executor 2 CPUs / 2048 MiB.
-const (
-	agentNanoCPUs       = 4_000_000_000
-	agentMemoryBytes    = 8192 * 1024 * 1024
-	executorNanoCPUs    = 2_000_000_000
-	executorMemoryBytes = 2048 * 1024 * 1024
-)
-
 // CreateOpts parameterizes Create.
 type CreateOpts struct {
 	Name        string
 	Image       string // e.g. "tx9-box:dev"
 	Token       string
 	Executor    ExecutorConfig
+	Resources   Resources
 	AgentMounts []AgentMount
 	NoStart     bool // create network/volumes/containers but do not start them (import path)
 }
@@ -50,6 +41,10 @@ type CreateOpts struct {
 // first) are created fresh each time.
 func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, error) {
 	name := opts.Name
+	resources := opts.Resources
+	if err := resources.Validate(); err != nil {
+		return nil, fmt.Errorf("box: create %s: resources: %w", name, err)
+	}
 	_, executorName := ContainerNames(name)
 	netName := NetworkName(name)
 	agentVol, execVol := VolumeNames(name)
@@ -70,14 +65,17 @@ func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, err
 		return nil, fmt.Errorf("box: create %s: %w", name, err)
 	}
 
-	agentSpec := newAgentContainerSpec(name, opts.Image, opts.Token, ver, netID, agentVol, externalBinds, supplementalGroups)
+	agentSpec := newAgentContainerSpecWithResources(name, opts.Image, opts.Token, ver, netID, agentVol, externalBinds, supplementalGroups, resources.Agent)
 	agentID, err := cli.ContainerCreate(ctx, agentSpec)
 	if err != nil {
 		return nil, fmt.Errorf("box: create %s: agent: %w", name, err)
 	}
 
 	execPort := nat.Port(executorPort)
-	executorEnv := []string{"EXECUTOR_MCP_TOKEN=" + opts.Token}
+	executorEnv := []string{
+		"EXECUTOR_MCP_TOKEN=" + opts.Token,
+		"TX9_BOX_NAME=" + name,
+	}
 	if opts.Executor.WebBaseURL != "" {
 		executorEnv = append(executorEnv, "EXECUTOR_WEB_BASE_URL="+opts.Executor.WebBaseURL)
 	}
@@ -102,8 +100,8 @@ func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, err
 		PortBindings:   nat.PortMap{execPort: []nat.PortBinding{{HostIP: publishIP, HostPort: opts.Executor.PublishPort}}},
 		DNS:            opts.Executor.DNS,
 		Sysctls:        ipv6DisableSysctl,
-		NanoCPUs:       executorNanoCPUs,
-		MemoryBytes:    executorMemoryBytes,
+		NanoCPUs:       resources.Executor.NanoCPUs,
+		MemoryBytes:    resources.Executor.MemoryBytes,
 	}
 	executorID, err := cli.ContainerCreate(ctx, executorSpec)
 	if err != nil {
@@ -139,6 +137,13 @@ func Create(ctx context.Context, cli *docker.Client, opts CreateOpts) (*Box, err
 }
 
 func newAgentContainerSpec(name, image, token, ver, netID, agentVol string, externalBinds, supplementalGroups []string) docker.ContainerSpec {
+	return newAgentContainerSpecWithResources(
+		name, image, token, ver, netID, agentVol, externalBinds, supplementalGroups,
+		DefaultResources().Agent,
+	)
+}
+
+func newAgentContainerSpecWithResources(name, image, token, ver, netID, agentVol string, externalBinds, supplementalGroups []string, resources ContainerResources) docker.ContainerSpec {
 	binds := append([]string{agentVol + ":/data"}, externalBinds...)
 	agentName, _ := ContainerNames(name)
 	env := []string{
@@ -146,6 +151,7 @@ func newAgentContainerSpec(name, image, token, ver, netID, agentVol string, exte
 		"BOXD_EXECUTOR_TOKEN=" + token,
 		"BOX_EXECUTOR_BRIDGE_PORT=4788",
 		"BOX_HERMES_BRIDGE_PORT=0",
+		"TX9_BOX_NAME=" + name,
 	}
 	if len(supplementalGroups) > 0 {
 		env = append(env, "TX9_AGENT_MOUNT_GIDS="+strings.Join(supplementalGroups, ","))
@@ -161,8 +167,8 @@ func newAgentContainerSpec(name, image, token, ver, netID, agentVol string, exte
 		Binds:          binds,
 		GroupAdd:       supplementalGroups,
 		Sysctls:        ipv6DisableSysctl,
-		NanoCPUs:       agentNanoCPUs,
-		MemoryBytes:    agentMemoryBytes,
+		NanoCPUs:       resources.NanoCPUs,
+		MemoryBytes:    resources.MemoryBytes,
 	}
 }
 
@@ -188,6 +194,13 @@ func RecreateAgent(ctx context.Context, cli *docker.Client, b *Box, token string
 	image := inspect.Config.Image
 	if image == "" {
 		return false, fmt.Errorf("box: recreate agent %s: existing container has no image reference", b.Name)
+	}
+	if inspect.HostConfig == nil {
+		return false, fmt.Errorf("box: recreate agent %s: existing container inspect response has no host config", b.Name)
+	}
+	resources := ContainerResources{
+		NanoCPUs:    inspect.HostConfig.NanoCPUs,
+		MemoryBytes: inspect.HostConfig.Memory,
 	}
 
 	wasRunning := b.AgentState == "running"
@@ -226,7 +239,7 @@ func RecreateAgent(ctx context.Context, cli *docker.Client, b *Box, token string
 		return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
 	}
 
-	spec := newAgentContainerSpec(b.Name, image, token, b.Version, netID, agentVol, externalBinds, supplementalGroups)
+	spec := newAgentContainerSpecWithResources(b.Name, image, token, b.Version, netID, agentVol, externalBinds, supplementalGroups, resources)
 	agentID, err := cli.ContainerCreate(ctx, spec)
 	if err != nil {
 		return false, fmt.Errorf("box: recreate agent %s: container removed but replacement creation failed; run `tx9 upgrade %s` to recreate it after fixing the cause: %w", b.Name, b.Name, err)
