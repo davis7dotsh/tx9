@@ -434,6 +434,61 @@ chmod 0500 "$agent_root/home/agent/.hermes"
 chmod 0700 "$agent_root/home/agent/.hermes"
 grep -q 'Hermes stale WAL message' "$tmp/wal-query.jsonl"
 
+# If a live read fails after emitting one table, replay the writable snapshot
+# and suppress only rows that already escaped. Identical legitimate rows keep
+# their multiplicity instead of being collapsed by the recovery pass.
+python3 - "$helper" "$tmp/partial-hermes" <<'PY'
+from collections import Counter
+import importlib.machinery
+import importlib.util
+import pathlib
+import sqlite3
+import sys
+
+loader = importlib.machinery.SourceFileLoader("tx9_logs_partial_fallback", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+root = pathlib.Path(sys.argv[2])
+root.mkdir()
+path = root / "state.db"
+with sqlite3.connect(path) as database:
+    database.executescript("""
+        CREATE TABLE sessions(id TEXT, created_at TEXT, title TEXT);
+        CREATE TABLE messages(created_at TEXT, content TEXT);
+        INSERT INTO sessions VALUES('s1', '2026-03-01T00:00:01Z', 'partial session');
+        INSERT INTO messages VALUES('2026-03-01T00:00:02Z', 'snapshot message');
+        INSERT INTO messages VALUES('2026-03-01T00:00:02Z', 'snapshot message');
+    """)
+
+original_events = module.hermes_database_events
+calls = 0
+
+
+def partial_events(connection, *, path, box, modified_at):
+    global calls
+    calls += 1
+    call_number = calls
+    for event in original_events(
+        connection, path=path, box=box, modified_at=modified_at
+    ):
+        yield event
+        if call_number == 1 and event["type"] == "hermes.message":
+            raise sqlite3.DatabaseError("injected failure after partial read")
+
+
+module.hermes_database_events = partial_events
+events = list(module.read_hermes_db(path, root=root, box="fixture-box"))
+
+assert calls == 2
+assert Counter((event["type"], event["message"]) for event in events) == Counter({
+    ("hermes.session", "partial session"): 1,
+    ("hermes.message", "snapshot message"): 2,
+})
+assert any("recovered remaining rows" in warning for warning in module.WARNINGS)
+PY
+
 python3 - "$agent_root/logs" <<'PY'
 import pathlib
 import sys

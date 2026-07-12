@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import base64
 import datetime as dt
+import hashlib
 import heapq
 import io
 import json
@@ -1524,13 +1525,20 @@ def read_hermes_db(path: Path, *, root: Path, box: str) -> Iterator[dict[str, An
         source_handle.close()
 
 
+def hermes_event_fingerprint(event: Mapping[str, Any]) -> bytes:
+    payload = json.dumps(
+        event, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(payload).digest()
+
+
 def read_open_hermes_db(
     path: Path, *, root: Path, box: str, source_handle: BinaryIO
 ) -> Iterator[dict[str, Any]]:
     modified_at = os.fstat(source_handle.fileno()).st_mtime
     connection: sqlite3.Connection | None = None
     direct_error: sqlite3.Error | None = None
-    emitted = False
+    emitted_counts: dict[bytes, int] = {}
     try:
         quoted = urllib.parse.quote(f"/proc/self/fd/{source_handle.fileno()}", safe="/")
         connection = sqlite3.connect(f"file:{quoted}?mode=ro", uri=True, timeout=5)
@@ -1538,7 +1546,8 @@ def read_open_hermes_db(
             for event in hermes_database_events(
                 connection, path=path, box=box, modified_at=modified_at
             ):
-                emitted = True
+                fingerprint = hermes_event_fingerprint(event)
+                emitted_counts[fingerprint] = emitted_counts.get(fingerprint, 0) + 1
                 yield event
         except sqlite3.Error as exc:
             direct_error = exc
@@ -1549,28 +1558,37 @@ def read_open_hermes_db(
             connection.close()
 
     if direct_error is not None:
-        if emitted:
-            warn(f"Hermes database became unreadable during query {path}: {direct_error}")
-        else:
-            snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
-            snapshot_connection: sqlite3.Connection | None = None
-            try:
-                snapshot_dir, snapshot_connection = hermes_snapshot_connection(
-                    path, root=root, source_handle=source_handle
-                )
-                yield from hermes_database_events(
-                    snapshot_connection, path=path, box=box, modified_at=modified_at
-                )
-            except (OSError, sqlite3.Error) as snapshot_error:
+        had_partial_direct_read = bool(emitted_counts)
+        snapshot_dir: tempfile.TemporaryDirectory[str] | None = None
+        snapshot_connection: sqlite3.Connection | None = None
+        try:
+            snapshot_dir, snapshot_connection = hermes_snapshot_connection(
+                path, root=root, source_handle=source_handle
+            )
+            for event in hermes_database_events(
+                snapshot_connection, path=path, box=box, modified_at=modified_at
+            ):
+                fingerprint = hermes_event_fingerprint(event)
+                duplicate_count = emitted_counts.get(fingerprint, 0)
+                if duplicate_count > 0:
+                    emitted_counts[fingerprint] = duplicate_count - 1
+                    continue
+                yield event
+            if had_partial_direct_read:
                 warn(
-                    f"cannot read Hermes database {path}: {direct_error}; "
-                    f"writable snapshot fallback failed: {snapshot_error}"
+                    f"Hermes database became unreadable during query {path}: {direct_error}; "
+                    "recovered remaining rows from a writable snapshot"
                 )
-            finally:
-                if snapshot_connection is not None:
-                    snapshot_connection.close()
-                if snapshot_dir is not None:
-                    snapshot_dir.cleanup()
+        except (OSError, sqlite3.Error) as snapshot_error:
+            warn(
+                f"cannot read Hermes database {path}: {direct_error}; "
+                f"writable snapshot fallback failed: {snapshot_error}"
+            )
+        finally:
+            if snapshot_connection is not None:
+                snapshot_connection.close()
+            if snapshot_dir is not None:
+                snapshot_dir.cleanup()
 
 
 def read_hermes_logs(home: Path, *, root: Path, box: str) -> Iterator[dict[str, Any]]:
