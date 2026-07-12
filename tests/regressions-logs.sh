@@ -9,6 +9,48 @@ agent_root="$tmp/agent"
 executor_root="$tmp/executor"
 mkdir -p "$agent_root/logs" "$executor_root/logs"
 
+# Reject restart delays that can bypass or indefinitely poison the supervisor's
+# monotonic sleep loop before any child process is started. Zero remains a
+# deliberate immediate-restart setting.
+python3 - "$helper" <<'PY'
+import contextlib
+import importlib.machinery
+import importlib.util
+import io
+import sys
+
+loader = importlib.machinery.SourceFileLoader("tx9_logs_restart_delay", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+parser = module.build_parser()
+
+for value in ("-1", "nan", "inf", "-inf"):
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        try:
+            parser.parse_args([
+                "capture", "--source", "agent", f"--restart-delay={value}", "--", "true"
+            ])
+        except SystemExit as exc:
+            assert exc.code == 2
+        else:
+            raise AssertionError(f"accepted invalid restart delay {value!r}")
+    assert "must be finite and non-negative" in stderr.getvalue()
+
+args = parser.parse_args([
+    "capture", "--source", "agent", "--restart-delay=0", "--", "true"
+])
+assert args.restart_delay == 0
+args = parser.parse_args([
+    "capture", "--source", "agent", "--restart-delay=0.25", "--", "true"
+])
+assert args.restart_delay == 0.25
+args = parser.parse_args(["capture", "--source", "agent", "--", "true"])
+assert args.restart_delay is None
+PY
+
 # Capture preserves the wrapped command's status and stdout/stderr split while
 # redacting all supported token forms before either mirroring or persistence.
 set +e

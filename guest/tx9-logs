@@ -15,6 +15,7 @@ import hashlib
 import heapq
 import io
 import json
+import math
 import os
 import re
 import select
@@ -492,6 +493,16 @@ def positive_int(value: str, *, minimum: int = 1) -> int:
         raise argparse.ArgumentTypeError(f"expected an integer, got {value!r}") from exc
     if parsed < minimum:
         raise argparse.ArgumentTypeError(f"must be at least {minimum}")
+    return parsed
+
+
+def nonnegative_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"expected a number, got {value!r}") from exc
+    if not math.isfinite(parsed) or parsed < 0:
+        raise argparse.ArgumentTypeError("must be finite and non-negative")
     return parsed
 
 
@@ -1805,7 +1816,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=lambda value: positive_int(value),
         default=positive_int(os.environ.get("TX9_LOG_MAX_FILES", str(DEFAULT_MAX_FILES))),
     )
-    capture.add_argument("--restart-delay", type=float)
+    capture.add_argument("--restart-delay", type=nonnegative_float)
     capture.add_argument("command", nargs=argparse.REMAINDER)
     capture.set_defaults(handler=capture_command)
 
@@ -1823,8 +1834,6 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
-    if getattr(args, "restart_delay", None) is not None and args.restart_delay < 0:
-        parser.error("--restart-delay must not be negative")
     return int(args.handler(args))
 
 
