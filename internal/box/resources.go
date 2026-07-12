@@ -31,13 +31,6 @@ const (
 	DefaultExecutorNanoCPUs    int64 = 2_000_000_000
 	DefaultExecutorMemoryBytes int64 = 2 * units.GiB
 	MinimumMemoryBytes         int64 = 6 * units.MiB
-
-	// Keep the original package-local names available to focused box tests
-	// and code that describes the historical defaults.
-	agentNanoCPUs       = DefaultAgentNanoCPUs
-	agentMemoryBytes    = DefaultAgentMemoryBytes
-	executorNanoCPUs    = DefaultExecutorNanoCPUs
-	executorMemoryBytes = DefaultExecutorMemoryBytes
 )
 
 var resourceEnvKeys = []string{
