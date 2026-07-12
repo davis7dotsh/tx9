@@ -7,14 +7,6 @@ with portable agent state on a named volume that travels as an encrypted,
 validated backup archive. Executor scratch state and runtime logs remain on a
 separate durable-but-non-portable volume.
 
-**Status: experiment, mid-transition.** The bash prototypes (smolvm `./box`
-and the compose `./docker/boxd`) have been retired in favor of a Go CLI
-(`tx9`, this repo, embedding its provisioning and guest assets) that is now
-implemented, released, and under active development, though still experimental.
-See [docs/tx9-cli-design.md](docs/tx9-cli-design.md) for the full
-design and [docs/docker-architecture.md](docs/docker-architecture.md) for
-the runtime architecture and its verification history.
-
 For a stable HTTPS Executor origin and OAuth callbacks over a tailnet, see
 [Tailscale HTTPS for Executor](docs/tailscale-executor.md).
 For host directories and NAS shares that should be visible inside an agent,
@@ -62,15 +54,15 @@ is still responsible for mounting and authenticating the underlying share.
 
 ## Repository layout
 
-| Path | Role |
-|---|---|
-| `box.env` | Build/runtime configuration: tool versions/channels and feature flags |
-| `site/` | Cloudflare Worker for tx9.col-agents.com: homepage, `/install` script, release downloads from R2 |
-| `provision/provision.sh` | Runs inside `docker build` (`tools` + `assets` layers); installs everything |
-| `guest/` | In-box runtime: `hb` control CLI, `hb-workload` reconcile loop, `hermes-state` validator, profiles, tmux config |
-| `docker/` | Image build assets: `Dockerfile`, agent + executor entrypoints |
-| `docs/` | Architecture, CLI design, operations history |
-| `tests/` | Static contract checks and guest-script regressions (`make check`) |
+| Path                     | Role                                                                                                            |
+| ------------------------ | --------------------------------------------------------------------------------------------------------------- |
+| `box.env`                | Build/runtime configuration: tool versions/channels and feature flags                                           |
+| `site/`                  | Cloudflare Worker for tx9.col-agents.com: homepage, `/install` script, release downloads from R2                |
+| `provision/provision.sh` | Runs inside `docker build` (`tools` + `assets` layers); installs everything                                     |
+| `guest/`                 | In-box runtime: `hb` control CLI, `hb-workload` reconcile loop, `hermes-state` validator, profiles, tmux config |
+| `docker/`                | Image build assets: `Dockerfile`, agent + executor entrypoints                                                  |
+| `docs/`                  | Architecture, CLI design, operations history                                                                    |
+| `tests/`                 | Static contract checks and guest-script regressions (`make check`)                                              |
 
 ## In-box control (`hb`)
 
