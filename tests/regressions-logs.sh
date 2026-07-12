@@ -64,6 +64,20 @@ if rg -n "$boundary_secret" "$tmp/boundary.stdout" "$boundary_dir"; then
 fi
 grep -q '\[REDACTED\]tail' "$tmp/boundary.stdout"
 
+# Very short environment values are redacted only in credential context;
+# treating them as global exact matches would corrupt nearly every record.
+short_secret_dir="$tmp/short-secret"
+SHORT_TOKEN=x LONG_TOKEN=long-exact-secret \
+  "$helper" capture --source agent --log-dir "$short_secret_dir" -- \
+    bash -c 'printf "executor box next xylophone bare=x token=x long-exact-secret\n"' \
+    >"$tmp/short-secret.stdout"
+grep -q 'executor box next xylophone bare=x token=\[REDACTED\] \[REDACTED\]' \
+  "$tmp/short-secret.stdout"
+if rg -n 'long-exact-secret' "$tmp/short-secret.stdout" "$short_secret_dir"; then
+  echo "capture exposed a long exact secret" >&2
+  exit 1
+fi
+
 # A complete exact value can overlap one of its own proper prefixes. Align the
 # overlap with the fixed flush boundary and pause the writer so capture cannot
 # rely on receiving the value and its following delimiter in one read.
@@ -88,9 +102,9 @@ grep -q '\[REDACTED\]' "$tmp/overlap-secret.stdout"
 # Pattern recognition runs before exact replacement. An exact secret equal to
 # the key name must not erase the `token=` cue and expose its following value.
 context_dir="$tmp/exact-pattern-context"
-KEY_SECRET=token \
+KEY_SECRET=access_token \
   "$helper" capture --source agent --log-dir "$context_dir" -- \
-    bash -c 'printf "token=pattern-value-secret\n"' \
+    bash -c 'printf "access_token=pattern-value-secret\n"' \
     >"$tmp/exact-pattern-context.stdout"
 if rg -n 'pattern-value-secret' "$tmp/exact-pattern-context.stdout" "$context_dir"; then
   echo "exact replacement erased pattern context before value redaction" >&2
@@ -186,29 +200,146 @@ signal_status=$?
 set -e
 [[ "$signal_status" == 143 ]]
 
+# Internal cleanup gives a same-group descendant a bounded TERM grace before
+# cancellation/escalation, so normal shutdown handlers can flush state.
+graceful_dir="$tmp/graceful-descendant"
+graceful_marker="$tmp/graceful-descendant.marker"
+graceful_pid_file="$tmp/graceful-descendant.pid"
+GRACEFUL_MARKER="$graceful_marker" GRACEFUL_PID_FILE="$graceful_pid_file" \
+  "$helper" capture --source agent --log-dir "$graceful_dir" -- python3 - \
+    >/dev/null 2>&1 <<'PY' &
+import os
+import pathlib
+import signal
+import time
+
+read_fd, write_fd = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(read_fd)
+
+    def stop(_signum, _frame):
+        time.sleep(0.3)
+        pathlib.Path(os.environ["GRACEFUL_MARKER"]).write_text("graceful")
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    os.write(write_fd, b"ready")
+    os.close(write_fd)
+    while True:
+        signal.pause()
+os.close(write_fd)
+assert os.read(read_fd, 5) == b"ready"
+os.close(read_fd)
+pathlib.Path(os.environ["GRACEFUL_PID_FILE"]).write_text(str(pid))
+os._exit(23)
+PY
+graceful_capture_pid=$!
+pids+=("$graceful_capture_pid")
+for _ in {1..100}; do
+  ! kill -0 "$graceful_capture_pid" 2>/dev/null && break
+  sleep 0.02
+done
+if kill -0 "$graceful_capture_pid" 2>/dev/null; then
+  echo "capture did not honor the bounded descendant shutdown grace" >&2
+  exit 1
+fi
+set +e
+wait "$graceful_capture_pid"
+graceful_status=$?
+set -e
+[[ "$graceful_status" == 23 ]]
+[[ "$(cat "$graceful_marker")" == graceful ]]
+
 # A child leader may exit while a descendant keeps its stdout/stderr pipes
-# open. Shutdown still targets the original process group so reader joins do
-# not hang until that descendant exits on its own.
-descendant_dir="$tmp/descendant-signal"
-"$helper" capture --source agent --log-dir "$descendant_dir" -- \
-  bash -c '(sleep 5) & exit 0' >/dev/null 2>&1 &
+# open. Capture terminates that process group and preserves the leader status
+# without waiting for the descendant or requiring an external signal.
+descendant_dir="$tmp/descendant-exit"
+descendant_pid_file="$tmp/descendant.pid"
+descendant_ready_file="$tmp/descendant.ready"
+# The nested bash expands its own job PID and inherited fixture path.
+# shellcheck disable=SC2016
+DESCENDANT_PID_FILE="$descendant_pid_file" DESCENDANT_READY_FILE="$descendant_ready_file" \
+  "$helper" capture --source agent --log-dir "$descendant_dir" -- \
+    bash -c '(trap "" TERM; : >"$DESCENDANT_READY_FILE"; while :; do sleep 1; done) & echo $! >"$DESCENDANT_PID_FILE"; while [[ ! -e "$DESCENDANT_READY_FILE" ]]; do sleep 0.01; done; exit 23' \
+    >/dev/null 2>&1 &
 descendant_capture_pid=$!
 pids+=("$descendant_capture_pid")
-sleep 0.1
-kill -TERM "$descendant_capture_pid"
-for _ in {1..50}; do
+for _ in {1..100}; do
   ! kill -0 "$descendant_capture_pid" 2>/dev/null && break
   sleep 0.02
 done
 if kill -0 "$descendant_capture_pid" 2>/dev/null; then
-  echo "capture shutdown hung on a surviving descendant's output pipes" >&2
+  echo "capture exit hung on a surviving descendant's output pipes" >&2
   exit 1
 fi
 set +e
 wait "$descendant_capture_pid"
 descendant_status=$?
 set -e
-[[ "$descendant_status" == 143 ]]
+[[ "$descendant_status" == 23 ]]
+jq -e 'select(.type == "process_exit") | .data.status == 23' \
+  "$descendant_dir/agent.jsonl" >/dev/null
+descendant_pid="$(cat "$descendant_pid_file")"
+for _ in {1..50}; do
+  ! kill -0 "$descendant_pid" 2>/dev/null && break
+  sleep 0.02
+done
+if kill -0 "$descendant_pid" 2>/dev/null; then
+  echo "capture left the wrapped child process group running" >&2
+  exit 1
+fi
+
+# A daemonized descendant can escape the original process group while keeping
+# its inherited pipes. Cancellable readers still let capture return; the test
+# explicitly cleans up that intentionally escaped fixture process.
+escaped_dir="$tmp/escaped-descendant"
+escaped_pid_file="$tmp/escaped-descendant.pid"
+ESCAPED_PID_FILE="$escaped_pid_file" \
+  "$helper" capture --source agent --log-dir "$escaped_dir" -- python3 - \
+    >/dev/null 2>&1 <<'PY' &
+import os
+import pathlib
+import time
+
+read_fd, write_fd = os.pipe()
+pid = os.fork()
+if pid == 0:
+    os.close(read_fd)
+    os.setsid()
+    os.write(write_fd, b"ready")
+    os.close(write_fd)
+    time.sleep(10)
+    os._exit(0)
+os.close(write_fd)
+assert os.read(read_fd, 5) == b"ready"
+os.close(read_fd)
+pathlib.Path(os.environ["ESCAPED_PID_FILE"]).write_text(str(pid))
+os._exit(19)
+PY
+escaped_capture_pid=$!
+pids+=("$escaped_capture_pid")
+for _ in {1..100}; do
+  ! kill -0 "$escaped_capture_pid" 2>/dev/null && break
+  sleep 0.02
+done
+if kill -0 "$escaped_capture_pid" 2>/dev/null; then
+  echo "capture exit hung on an escaped descendant's output pipes" >&2
+  exit 1
+fi
+set +e
+wait "$escaped_capture_pid"
+escaped_status=$?
+set -e
+[[ "$escaped_status" == 19 ]]
+jq -e 'select(.type == "process_exit") | .data.status == 19' \
+  "$escaped_dir/agent.jsonl" >/dev/null
+escaped_pid="$(cat "$escaped_pid_file")"
+pids+=("$escaped_pid")
+kill -0 "$escaped_pid"
+escaped_state="$(ps -o stat= -p "$escaped_pid" | tr -d ' ')"
+[[ -n "$escaped_state" && "$escaped_state" != Z* ]]
+kill -KILL "$escaped_pid" 2>/dev/null || true
 
 # Build pure fixtures for every query source. Deliberately place auth/config
 # files beside them: export must normalize events, never archive source state.
@@ -231,7 +362,7 @@ claude.mkdir(parents=True)
     "\n".join(json.dumps(record) for record in ({
         "timestamp": "2026-01-01T00:00:00Z",
         "type": "response_item",
-        "message": "codex old-marker Bearer codex-bearer bare-query-secret ?token=url-secret Authorization: Basic auth-secret token=pattern-value-secret",
+        "message": "codex old-marker Bearer codex-bearer bare-query-secret ?token=url-secret Authorization: Basic auth-secret access_token=pattern-value-secret",
         "api_token": "codex-field-secret",
         "password": "password-secret",
         "apiKey": "api-key-secret",
@@ -303,10 +434,39 @@ chmod 0500 "$agent_root/home/agent/.hermes"
 chmod 0700 "$agent_root/home/agent/.hermes"
 grep -q 'Hermes stale WAL message' "$tmp/wal-query.jsonl"
 
-printf 'legacy workload history\n' >"$agent_root/logs/workload.log"
-TX9_BOX_NAME=fixture-box "$helper" capture --source agent --log-dir "$agent_root/logs" -- \
+python3 - "$agent_root/logs" <<'PY'
+import pathlib
+import sys
+
+log_dir = pathlib.Path(sys.argv[1])
+for name, label in (
+    ("workload.log.2", "legacy workload oldest rotation"),
+    ("workload.log.1", "legacy workload newer rotation"),
+    ("workload.log", "legacy workload active history"),
+):
+    pathlib.Path(log_dir / name).write_text(
+        "".join(f"{label} line {index:02d} {'z' * 20}\n" for index in range(1, 11))
+    )
+PY
+TX9_BOX_NAME=fixture-box "$helper" capture --source agent --log-dir "$agent_root/logs" \
+  --max-bytes 1024 --max-files 3 -- \
   bash -c 'printf "agent supervisor fixture\n"' >/dev/null
-grep -q 'legacy workload history' "$agent_root/logs/agent.jsonl"
+for message in \
+  'legacy workload oldest rotation line 01 zzzzzzzzzzzzzzzzzzzz' \
+  'legacy workload newer rotation line 01 zzzzzzzzzzzzzzzzzzzz' \
+  'legacy workload active history line 01 zzzzzzzzzzzzzzzzzzzz' \
+  'agent supervisor fixture'; do
+  rg -Fq "$message" "$agent_root/logs"
+done
+[[ ! -e "$agent_root/logs/workload.log.1" ]]
+[[ ! -e "$agent_root/logs/workload.log.2" ]]
+[[ "$(find "$agent_root/logs" -maxdepth 1 -type f -name 'workload.legacy-*.log' | wc -l | tr -d ' ')" == 3 ]]
+
+printf 'legacy Hermes rotated history\n' >"$agent_root/logs/hermes-gateway.log.1"
+printf 'legacy Hermes active history\n' >"$agent_root/logs/hermes-gateway.log"
+TX9_BOX_NAME=fixture-box "$helper" capture --source hermes --log-dir "$agent_root/logs" -- \
+  bash -c 'printf "modern Hermes supervisor fixture\n"' >/dev/null
+[[ "$(find "$agent_root/logs" -maxdepth 1 -type f -name 'hermes-gateway.legacy-*.log' | wc -l | tr -d ' ')" == 2 ]]
 
 # Every source path is agent-controlled while the query helper mounts both
 # volumes. File and parent-directory symlinks must never cross that boundary.
@@ -328,7 +488,7 @@ if "$helper" query --agent-root "$agent_root" --executor-root "$executor_root" \
   exit 1
 fi
 
-KEY_SECRET=token QUERY_TOKEN=bare-query-secret "$helper" query \
+KEY_SECRET=access_token SHORT_TOKEN=x QUERY_TOKEN=bare-query-secret "$helper" query \
   --agent-root "$agent_root" --executor-root "$executor_root" --box fixture-box \
   --source agent,executor,hermes,codex,cc --tail 100 --json >"$tmp/query.jsonl"
 jq -e -s 'map(.source) | unique == ["agent", "claude", "codex", "executor", "hermes"]' \
@@ -344,7 +504,25 @@ if rg -n 'url-secret|auth-secret|password-secret|api-key-secret|access-token-sec
   echo "query emitted a common unredacted credential form" >&2
   exit 1
 fi
-grep -q 'legacy workload history' "$tmp/query.jsonl"
+for message in \
+  'legacy workload oldest rotation line 01 zzzzzzzzzzzzzzzzzzzz' \
+  'legacy workload newer rotation line 01 zzzzzzzzzzzzzzzzzzzz' \
+  'legacy workload active history line 01 zzzzzzzzzzzzzzzzzzzz' \
+  'agent supervisor fixture'; do
+  [[ "$(jq -r --arg message "$message" 'select(.message == $message) | .message' "$tmp/query.jsonl" | wc -l | tr -d ' ')" == 1 ]]
+done
+for message in \
+  'legacy Hermes rotated history' \
+  'legacy Hermes active history' \
+  'modern Hermes supervisor fixture'; do
+  jq -e --arg message "$message" \
+    'select(.message == $message) | .source == "hermes"' "$tmp/query.jsonl" >/dev/null
+  [[ "$(jq -r --arg message "$message" 'select(.message == $message) | .message' "$tmp/query.jsonl" | wc -l | tr -d ' ')" == 1 ]]
+done
+"$helper" query --agent-root "$agent_root" --executor-root "$executor_root" \
+  --box fixture-box --source agent --tail 1000 --grep 'legacy Hermes' --json \
+  >"$tmp/legacy-hermes-as-agent.jsonl"
+[[ ! -s "$tmp/legacy-hermes-as-agent.jsonl" ]]
 jq -e 'select(.message == "spoofed-native-source") | .source == "codex" and .stream == "event" and .type == "codex.event"' \
   "$tmp/query.jsonl" >/dev/null
 jq -e 'select(.source == "codex" and .timestamp == "2026-01-03T00:00:00.000Z") | .stream == "event" and .type == "codex.event" and .message == ""' \
@@ -376,7 +554,7 @@ grep -q 'codex-field-secret' "$tmp/no-redact.jsonl"
 
 # Export is a gzip tar streamed to stdout containing exactly a manifest and
 # normalized JSONL. No source database, auth, config, or raw files can enter it.
-KEY_SECRET=token QUERY_TOKEN=bare-query-secret "$helper" export \
+KEY_SECRET=access_token SHORT_TOKEN=x QUERY_TOKEN=bare-query-secret "$helper" export \
   --agent-root "$agent_root" --executor-root "$executor_root" --box fixture-box \
   --source all >"$tmp/export.tar.gz"
 gzip -t "$tmp/export.tar.gz"
@@ -387,6 +565,21 @@ tar -xzf "$tmp/export.tar.gz" -C "$tmp/exported"
 jq -e '.schema == "tx9.log-export.v1" and .box == "fixture-box" and .event_count > 0 and .complete == true and .warnings == [] and .members == ["manifest.json", "events.jsonl"]' \
   "$tmp/exported/manifest.json" >/dev/null
 jq -e -s 'length > 0 and all(.[]; .schema == "tx9.event.v1")' "$tmp/exported/events.jsonl" >/dev/null
+for message in \
+  'legacy workload oldest rotation line 01 zzzzzzzzzzzzzzzzzzzz' \
+  'legacy workload newer rotation line 01 zzzzzzzzzzzzzzzzzzzz' \
+  'legacy workload active history line 01 zzzzzzzzzzzzzzzzzzzz' \
+  'agent supervisor fixture'; do
+  [[ "$(jq -r --arg message "$message" 'select(.message == $message) | .message' "$tmp/exported/events.jsonl" | wc -l | tr -d ' ')" == 1 ]]
+done
+for message in \
+  'legacy Hermes rotated history' \
+  'legacy Hermes active history' \
+  'modern Hermes supervisor fixture'; do
+  jq -e --arg message "$message" \
+    'select(.message == $message) | .source == "hermes"' "$tmp/exported/events.jsonl" >/dev/null
+  [[ "$(jq -r --arg message "$message" 'select(.message == $message) | .message' "$tmp/exported/events.jsonl" | wc -l | tr -d ' ')" == 1 ]]
+done
 if rg -n 'must-not-export|bare-query-secret|codex-field-secret|claude-query|db-field-secret|pattern-value-secret' "$tmp/exported"; then
   echo "export contained source state or an unredacted token" >&2
   exit 1

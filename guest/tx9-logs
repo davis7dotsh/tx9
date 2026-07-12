@@ -16,6 +16,7 @@ import io
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import sqlite3
@@ -42,6 +43,9 @@ MAX_NORMALIZE_DEPTH = 24
 MAX_NORMALIZE_ITEMS = 200
 MAX_NORMALIZE_STRING_BYTES = 64 * 1024
 MAX_SOURCE_RECORD_BYTES = 2 * 1024 * 1024
+MIN_EXACT_SECRET_CHARS = 8
+CAPTURE_READER_POLL_SECONDS = 0.1
+CAPTURE_READER_DRAIN_SECONDS = 0.5
 REDACTED = "[REDACTED]"
 REDACTED_BYTES = REDACTED.encode()
 TRUNCATED = "[TRUNCATED]"
@@ -68,12 +72,12 @@ AUTHORIZATION_RE = re.compile(r"(?i)(\b(?:proxy-)?authorization\b[ \t]*[=:][ \t]
 COOKIE_HEADER_RE = re.compile(r"(?im)(\b(?:set-)?cookie\b[ \t]*:[ \t]*)([^\r\n]*)")
 TOKEN_PARAM_RE = re.compile(
     r"(?i)(\b[A-Za-z0-9_.-]*token\b[\"']?[ \t]*(?:%3[dD]|[=:])[ \t]*(?:%22|%27|[\"']?))"
-    r"([^\s&;,}\]\"']+)"
+    r"(\[REDACTED\]|[^\s&;,}\]\"']+)"
 )
 SENSITIVE_PARAM_RE = re.compile(
     r"(?i)(\b[A-Za-z0-9_.-]*(?:password|passwd|secret|api[_-]?key|authorization|cookie)"
     r"[A-Za-z0-9_.-]*\b[\"']?[ \t]*(?:%3[dD]|[=:])[ \t]*(?:%22|%27|[\"']?))"
-    r"([^\s&;,}\]\"']+)"
+    r"(\[REDACTED\]|[^\s&;,}\]\"']+)"
 )
 TOKEN_ENV_NAME_RE = re.compile(r"(^|_)TOKEN($|_)", re.IGNORECASE)
 
@@ -99,7 +103,8 @@ def token_env_values() -> tuple[str, ...]:
     values = {
         value
         for name, value in os.environ.items()
-        if value and (TOKEN_ENV_NAME_RE.search(name) or sensitive_key(name))
+        if len(value.strip()) >= MIN_EXACT_SECRET_CHARS
+        and (TOKEN_ENV_NAME_RE.search(name) or sensitive_key(name))
     }
     return tuple(sorted(values, key=len, reverse=True))
 
@@ -783,7 +788,7 @@ class Capture:
             os.close(self.mirror_err)
 
     def _migrate_legacy_runtime(self, log_dir: Path, raw_path: Path) -> None:
-        """Convert a pre-structured raw log once so upgrades retain history."""
+        """Archive pre-structured raw generations once so upgrades retain history."""
 
         marker = log_dir / f".{self.source}-structured-v1"
         try:
@@ -797,45 +802,26 @@ class Capture:
             os.close(marker_fd)
             return
 
-        try:
-            legacy = open_regular_binary(log_dir, raw_path)
-        except FileNotFoundError:
-            legacy = None
-        except OSError as exc:
-            warn(f"cannot migrate legacy runtime log {raw_path}: {exc}")
-            return
-
-        if legacy is not None:
-            with legacy:
-                modified_at = os.fstat(legacy.fileno()).st_mtime
-                for line_number, payload, _terminated in iter_bounded_records(legacy):
-                    if payload is None:
-                        warn(f"omitted oversized legacy runtime record in {raw_path}:{line_number}")
-                        line = "record omitted because it exceeds the migration size limit"
-                    else:
-                        line = payload.decode("utf-8", errors="replace")
-                    message = redact_text(line.rstrip("\r\n"), self.exact_values)
-                    if not message:
-                        continue
-                    event = normalized_event(
-                        box=self.box,
-                        source=self.source,
-                        stream="log",
-                        kind="legacy_output",
-                        message=message,
-                        timestamp=fallback_timestamp(modified_at, line_number),
-                    )
-                    self._persist("structured", self.jsonl, event_bytes(event, self.max_bytes))
-                    if "structured" in self.failed_writers:
-                        return
+        for legacy_path in rotated_paths(raw_path, log_dir):
+            generation = (
+                "active"
+                if legacy_path == raw_path
+                else legacy_path.name.removeprefix(raw_path.name + ".")
+            )
+            prefix = f"{raw_path.stem}.legacy-{generation}"
+            archive_path = log_dir / f"{prefix}.log"
+            counter = 1
+            while archive_path.exists():
+                archive_path = log_dir / f"{prefix}-{counter}.log"
+                counter += 1
             try:
-                truncate_fd = os.open(
-                    raw_path,
-                    os.O_WRONLY | os.O_TRUNC | os.O_CLOEXEC | os.O_NOFOLLOW,
-                )
-                os.close(truncate_fd)
+                legacy_path.rename(archive_path)
             except OSError as exc:
-                warn(f"cannot truncate migrated legacy runtime log {raw_path}: {exc}")
+                warn(
+                    f"cannot preserve legacy runtime log {legacy_path} "
+                    f"as {archive_path}: {exc}"
+                )
+                return
 
         try:
             marker_fd = os.open(
@@ -892,6 +878,9 @@ class Capture:
     def _forward_signal(self, signum: int, _frame: Any) -> None:
         if self.received_signal is None:
             self.received_signal = signum
+        self._signal_process_group(signum)
+
+    def _signal_process_group(self, signum: int) -> None:
         pgid = self.active_pgid
         if pgid is None:
             return
@@ -906,12 +895,34 @@ class Capture:
                 continue
             signal.signal(signum, self._forward_signal)
 
-    def _reader(self, stream: str, pipe: BinaryIO) -> None:
+    def _reader(
+        self,
+        stream: str,
+        pipe: BinaryIO,
+        stop: threading.Event,
+        cancelled: threading.Event,
+    ) -> None:
         try:
             pending = bytearray()
             redactor = StreamingRedactor(self.exact_value_bytes)
             read_chunk = getattr(pipe, "read1", pipe.read)
+            drain_deadline: float | None = None
             while True:
+                if stop.is_set() and drain_deadline is None:
+                    drain_deadline = time.monotonic() + CAPTURE_READER_DRAIN_SECONDS
+                timeout = CAPTURE_READER_POLL_SECONDS
+                if drain_deadline is not None:
+                    remaining = drain_deadline - time.monotonic()
+                    if remaining <= 0:
+                        cancelled.set()
+                        break
+                    timeout = min(timeout, remaining)
+                try:
+                    readable, _, _ = select.select([pipe], [], [], timeout)
+                except (OSError, ValueError):
+                    break
+                if not readable:
+                    continue
                 chunk = read_chunk(MAX_CAPTURE_CHUNK_BYTES)
                 if not chunk:
                     break
@@ -969,15 +980,33 @@ class Capture:
         )
         assert self.child.stdout is not None
         assert self.child.stderr is not None
+        reader_stop = threading.Event()
+        reader_cancelled = threading.Event()
         readers = [
-            threading.Thread(target=self._reader, args=("stdout", self.child.stdout), daemon=True),
-            threading.Thread(target=self._reader, args=("stderr", self.child.stderr), daemon=True),
+            threading.Thread(
+                target=self._reader,
+                args=("stdout", self.child.stdout, reader_stop, reader_cancelled),
+                daemon=True,
+            ),
+            threading.Thread(
+                target=self._reader,
+                args=("stderr", self.child.stderr, reader_stop, reader_cancelled),
+                daemon=True,
+            ),
         ]
         for reader in readers:
             reader.start()
         return_code = self.child.wait()
+        # The direct child owns the capture lifecycle. Stop background
+        # descendants in its process group, then let readers drain buffered
+        # output. Cancellable polling also bounds shutdown when a daemonized
+        # descendant escaped that group while retaining a pipe descriptor.
+        self._signal_process_group(signal.SIGTERM)
+        reader_stop.set()
         for reader in readers:
             reader.join()
+        if reader_cancelled.is_set():
+            self._signal_process_group(signal.SIGKILL)
         self.active_pgid = None
         self.child = None
 
@@ -1366,6 +1395,7 @@ def read_raw(
 def runtime_source(stem: str, scope: str) -> str:
     if scope == "executor":
         return "executor"
+    stem = stem.partition(".legacy-")[0]
     source = normalize_source(stem)
     if source not in {"agent", "hermes", "codex", "claude"}:
         return "agent"
