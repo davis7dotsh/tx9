@@ -359,6 +359,50 @@ HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" gateway-enable \
   [[ ! -e "$tmp/up-gateway-started" ]]
 )
 
+# The reconcile loop re-checks Executor every cycle; unchanged reachability
+# must log only on state changes so the durable agent stream is not flooded
+# with one identical line per cycle. Interactive paths always report.
+(
+  HB_DATA="$tmp/steady-report-data"
+  EXECUTOR_HOST=remote-executor
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  HB_RUNTIME_STATE_DIR="$tmp/steady-report-state"
+  init() { :; }
+  _start_gateway() { :; }
+  _wait_port() { return 0; }
+
+  reconcile >"$tmp/steady-1.out" 2>"$tmp/steady-1.err"
+  reconcile >"$tmp/steady-2.out" 2>"$tmp/steady-2.err"
+  grep -q 'reachable (remote)' "$tmp/steady-1.out"
+  [[ ! -s "$tmp/steady-2.out" ]] || {
+    echo "steady reconcile re-logged unchanged reachability" >&2; exit 1
+  }
+
+  _wait_port() { return 1; }
+  if reconcile >"$tmp/steady-3.out" 2>"$tmp/steady-3.err"; then
+    echo "reconcile masked an unreachable remote Executor" >&2; exit 1
+  fi
+  if reconcile >"$tmp/steady-4.out" 2>"$tmp/steady-4.err"; then
+    echo "reconcile masked an unreachable remote Executor" >&2; exit 1
+  fi
+  grep -q 'unreachable' "$tmp/steady-3.err"
+  [[ ! -s "$tmp/steady-4.err" ]] || {
+    echo "steady reconcile re-logged unchanged unreachability" >&2; exit 1
+  }
+
+  # Recovery flips the state again, so it logs again.
+  _wait_port() { return 0; }
+  reconcile >"$tmp/steady-5.out" 2>"$tmp/steady-5.err"
+  grep -q 'reachable (remote)' "$tmp/steady-5.out"
+
+  # Interactive invocations always report and never consume the loop's state.
+  up >"$tmp/steady-up-1.out" 2>&1
+  up >"$tmp/steady-up-2.out" 2>&1
+  grep -q 'reachable (remote)' "$tmp/steady-up-1.out"
+  grep -q 'reachable (remote)' "$tmp/steady-up-2.out"
+)
+
 # Hermes state validation is explicitly skipped when Hermes is disabled.
 (
   HB_DATA="$tmp/hermes-disabled-data"

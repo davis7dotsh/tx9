@@ -13,6 +13,7 @@ func TestLogsHelperArgs(t *testing.T) {
 		Tail:     50,
 		Since:    "24h",
 		Contains: "failed",
+		Level:    "warn",
 		JSON:     true,
 		NoRedact: true,
 	}
@@ -22,10 +23,30 @@ func TestLogsHelperArgs(t *testing.T) {
 	want := []string{
 		"query", "--agent-root", "/agent", "--executor-root", "/executor",
 		"--box", "large-cat", "--source", "codex,executor", "--tail", "50",
-		"--since", "24h", "--grep", "failed", "--json", "--no-redact",
+		"--since", "24h", "--grep", "failed", "--level", "warn", "--json", "--no-redact",
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("helper args = %#v, want %#v", got, want)
+	}
+}
+
+func TestLogsHelperArgsOmitsEmptyLevel(t *testing.T) {
+	got := logsHelperArgs("query", "large-cat", logsQueryOptions{Source: "all", Tail: 10})
+	for _, arg := range got {
+		if arg == "--level" {
+			t.Fatalf("helper args %#v include --level for an unset level", got)
+		}
+	}
+}
+
+func TestValidateLogsLevel(t *testing.T) {
+	for _, level := range []string{"", "debug", "info", "warn", "error"} {
+		if err := validateLogsLevel(level); err != nil {
+			t.Fatalf("validateLogsLevel(%q) = %v, want nil", level, err)
+		}
+	}
+	if err := validateLogsLevel("loud"); err == nil {
+		t.Fatal("validateLogsLevel accepted an unknown level")
 	}
 }
 
