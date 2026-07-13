@@ -53,7 +53,7 @@ PY
 
 # Source reads stop at the first unterminated snapshot boundary instead of
 # reframing bytes appended during the query as a separate record. A record that
-# fills the entire byte budget without room for its newline is already oversized.
+# exactly fills the byte budget is retained; only a larger record is oversized.
 python3 - "$helper" "$tmp/record-snapshot.log" <<'PY'
 import importlib.machinery
 import importlib.util
@@ -77,6 +77,12 @@ with open(path, "rb") as handle:
 
 with open(path, "wb") as handle:
     handle.write(b"x" * module.MAX_SOURCE_RECORD_BYTES)
+with open(path, "rb") as handle:
+    payload = b"x" * module.MAX_SOURCE_RECORD_BYTES
+    assert list(module.iter_bounded_records(handle)) == [(1, payload, False)]
+
+with open(path, "wb") as handle:
+    handle.write(b"x" * (module.MAX_SOURCE_RECORD_BYTES + 1))
 with open(path, "rb") as handle:
     assert list(module.iter_bounded_records(handle)) == [(1, None, False)]
 PY
@@ -811,16 +817,16 @@ remote_hint="$({
 grep -q 'tx9 logs fixture-box --source executor' <<<"$remote_hint"
 
 # Consecutive identical lines collapse into one structured event plus a
-# repeat-count summary; the raw log and the mirrored stream stay faithful,
-# and blank lines never become structured events.
+# repeat-count summary; blank lines break otherwise-identical runs without
+# becoming structured events, and the raw log and mirrored stream stay faithful.
 dedup_dir="$tmp/dedup"
 "$helper" capture --source executor --log-dir "$dedup_dir" -- \
-  bash -c 'printf "same-line\nsame-line\nsame-line\n\n   \ndifferent-line\n"' \
+  bash -c 'printf "same-line\nsame-line\nsame-line\n\n   \nsame-line\ndifferent-line\n"' \
   >"$tmp/dedup.stdout"
-[[ "$(grep -c 'same-line' "$tmp/dedup.stdout")" == 3 ]]
-[[ "$(grep -c 'same-line' "$dedup_dir/executor.log")" == 3 ]]
+[[ "$(grep -c 'same-line' "$tmp/dedup.stdout")" == 4 ]]
+[[ "$(grep -c 'same-line' "$dedup_dir/executor.log")" == 4 ]]
 [[ "$(jq -r 'select(.type == "output" and .message == "same-line") | .message' \
-  "$dedup_dir/executor.jsonl" | wc -l | tr -d ' ')" == 1 ]]
+  "$dedup_dir/executor.jsonl" | wc -l | tr -d ' ')" == 2 ]]
 jq -e 'select(.type == "output_repeated") | .data.count == 2 and .data.message == "same-line"' \
   "$dedup_dir/executor.jsonl" >/dev/null
 jq -e 'select(.type == "output" and .message == "different-line")' \

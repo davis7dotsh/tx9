@@ -560,9 +560,7 @@ def iter_bounded_records(handle: BinaryIO) -> Iterator[tuple[int, bytes | None, 
             return
         record_number += 1
         terminated = payload.endswith(b"\n")
-        if len(payload) < MAX_SOURCE_RECORD_BYTES or (
-            len(payload) == MAX_SOURCE_RECORD_BYTES and terminated
-        ):
+        if len(payload) <= MAX_SOURCE_RECORD_BYTES:
             yield record_number, payload, terminated
             if not terminated:
                 return
@@ -932,6 +930,7 @@ class Capture:
             self._persist("raw", self.raw, mirrored)
             write_all(self.mirror_out if stream == "stdout" else self.mirror_err, mirrored)
             if not message.strip():
+                self._flush_repeats_locked(stream)
                 return
             now = time.monotonic()
             state = self.dedup_state.get(stream)
