@@ -48,6 +48,12 @@ MAX_SOURCE_RECORD_BYTES = 2 * 1024 * 1024
 MIN_EXACT_SECRET_CHARS = 8
 CAPTURE_READER_POLL_SECONDS = 0.1
 CAPTURE_READER_DRAIN_SECONDS = 0.5
+CAPTURE_DEDUP_WINDOW_SECONDS = 60.0
+CAPTURE_DEDUP_MAX_REPEATS = 1000
+MAX_RAW_CONTINUATION_LINES = 1000
+# Numeric values below this many epoch seconds (2001-09-09) cannot be event
+# times; loadavg fragments and counters otherwise parse as 1970 timestamps.
+MIN_PLAUSIBLE_EPOCH_SECONDS = 1_000_000_000
 REDACTED = "[REDACTED]"
 REDACTED_BYTES = REDACTED.encode()
 TRUNCATED = "[TRUNCATED]"
@@ -778,6 +784,11 @@ class Capture:
         self.received_signal: int | None = None
         self.output_lock = threading.Lock()
         self.failed_writers: set[str] = set()
+        # Consecutive-duplicate suppression per stream: daemons that reprint
+        # one status line flood the structured stream. The raw log and the
+        # docker mirror stay byte-faithful; only structured events collapse
+        # into a summary. State: (message, repeat count, first monotonic).
+        self.dedup_state: dict[str, tuple[str, int, float]] = {}
 
         inherited_out = os.environ.get("TX9_LOG_MIRROR_STDOUT_FD")
         inherited_err = os.environ.get("TX9_LOG_MIRROR_STDERR_FD")
@@ -877,15 +888,52 @@ class Capture:
             warning = f"tx9-logs: warning: cannot persist {label} log {writer.path}: {exc}\n"
             write_all(self.mirror_err, warning.encode("utf-8", errors="replace"))
 
+    def _flush_repeats_locked(self, stream: str) -> None:
+        state = self.dedup_state.pop(stream, None)
+        if state is None:
+            return
+        message, count, _started = state
+        if count <= 1:
+            return
+        event = self._base_event(
+            stream, "output_repeated", f"previous line repeated {count - 1} more times"
+        )
+        event["data"] = {"count": count - 1, "message": message}
+        self._persist("structured", self.jsonl, event_bytes(event, self.max_bytes))
+
+    def flush_repeats(self) -> None:
+        with self.output_lock:
+            for stream in list(self.dedup_state):
+                self._flush_repeats_locked(stream)
+
     def output(self, stream: str, payload: bytes) -> None:
         text = payload.decode("utf-8", errors="replace")
         redacted = redact_text(text, self.exact_values)
         mirrored = redacted.encode("utf-8", errors="replace")
+        message = redacted.rstrip("\r\n")
         with self.output_lock:
             self._persist("raw", self.raw, mirrored)
-            event = self._base_event(stream, "output", redacted.rstrip("\r\n"))
-            self._persist("structured", self.jsonl, event_bytes(event, self.max_bytes))
             write_all(self.mirror_out if stream == "stdout" else self.mirror_err, mirrored)
+            if not message.strip():
+                return
+            now = time.monotonic()
+            state = self.dedup_state.get(stream)
+            if state is not None:
+                previous, count, started = state
+                if (
+                    message == previous
+                    and now - started <= CAPTURE_DEDUP_WINDOW_SECONDS
+                    and count < CAPTURE_DEDUP_MAX_REPEATS
+                ):
+                    self.dedup_state[stream] = (previous, count + 1, started)
+                    return
+                self._flush_repeats_locked(stream)
+            self.dedup_state[stream] = (message, 1, now)
+            event = self._base_event(stream, "output", message)
+            level = parse_level(message)
+            if level is not None:
+                event["level"] = level
+            self._persist("structured", self.jsonl, event_bytes(event, self.max_bytes))
 
     def _forward_signal(self, signum: int, _frame: Any) -> None:
         if self.received_signal is None:
@@ -1021,6 +1069,7 @@ class Capture:
             self._signal_process_group(signal.SIGKILL)
         self.active_pgid = None
         self.child = None
+        self.flush_repeats()
 
         if return_code < 0:
             status = 128 - return_code
@@ -1096,6 +1145,8 @@ def parse_timestamp(value: Any) -> dt.datetime | None:
         seconds = float(value)
         if seconds > 100_000_000_000:
             seconds /= 1000
+        if seconds < MIN_PLAUSIBLE_EPOCH_SECONDS:
+            return None
         try:
             return dt.datetime.fromtimestamp(seconds, UTC)
         except (OverflowError, OSError, ValueError):
@@ -1114,6 +1165,48 @@ def parse_timestamp(value: Any) -> dt.datetime | None:
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
     return parsed.astimezone(UTC)
+
+
+LEVELS = {"debug": 0, "info": 1, "warn": 2, "error": 3}
+LEVEL_ALIASES = {
+    "trace": "debug",
+    "debug": "debug",
+    "info": "info",
+    "notice": "info",
+    "warn": "warn",
+    "warning": "warn",
+    "error": "error",
+    "err": "error",
+    "critical": "error",
+    "fatal": "error",
+}
+# Python-logging style: an optional leading ISO timestamp, then a level token
+# followed by a logger name ("WARNING agent.loop:") or a delimiter.
+LEVEL_PREFIX_RE = re.compile(
+    r"^(?:\d{4}-\d{2}-\d{2}[T ][0-9:.,+Zz-]+\s+)?"
+    r"(?:\[[^\]]{1,64}\]\s+)?"
+    r"(TRACE|DEBUG|INFO|NOTICE|WARN|WARNING|ERROR|ERR|CRITICAL|FATAL)\b[ :]",
+    re.IGNORECASE,
+)
+LEVEL_TOKEN_RE = re.compile(
+    r"""(?:\blevel[=:]\s*"?|"level"\s*:\s*")"""
+    r"(trace|debug|info|notice|warn|warning|error|err|critical|fatal)\b",
+    re.IGNORECASE,
+)
+
+
+def normalize_level(value: Any) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return LEVEL_ALIASES.get(value.strip().casefold())
+
+
+def parse_level(message: str) -> str | None:
+    head = message[:256]
+    match = LEVEL_PREFIX_RE.match(head) or LEVEL_TOKEN_RE.search(head)
+    if match is None:
+        return None
+    return normalize_level(match.group(1))
 
 
 def find_timestamp(value: Any, depth: int = 0) -> dt.datetime | None:
@@ -1250,6 +1343,7 @@ def normalized_event(
     message: str,
     timestamp: dt.datetime | None,
     data: Any | None = None,
+    level: str | None = None,
 ) -> dict[str, Any]:
     event: dict[str, Any] = {
         "schema": SCHEMA,
@@ -1260,6 +1354,8 @@ def normalized_event(
         "type": kind,
         "message": truncate_utf8(message, MAX_EVENT_MESSAGE_BYTES),
     }
+    if level in LEVELS:
+        event["level"] = level
     if data is not None:
         event["data"] = json_safe(data)
     return event
@@ -1343,6 +1439,8 @@ def read_jsonl(
                         message = (
                             extract_text(message) if message is not None else extract_text(event)
                         )
+                    if not message.strip():
+                        continue
                     event["schema"] = SCHEMA
                     event["box"] = box
                     event["source"] = normalize_source(source)
@@ -1350,22 +1448,53 @@ def read_jsonl(
                     event["stream"] = stream
                     event["type"] = kind
                     event["message"] = truncate_utf8(message, MAX_EVENT_MESSAGE_BYTES)
+                    level = normalize_level(event.get("level")) or parse_level(message)
+                    if level in LEVELS:
+                        event["level"] = level
+                    else:
+                        event.pop("level", None)
                     yield event
                     continue
                 timestamp = find_timestamp(record) or fallback_timestamp(modified_at, line_number)
+                message = extract_text(record)
+                if not message.strip():
+                    continue
+                level = None
+                for key in ("level", "levelname", "severity"):
+                    level = normalize_level(record.get(key))
+                    if level is not None:
+                        break
                 yield normalized_event(
                     box=box,
                     source=source,
                     stream="event",
                     kind=event_type(record, fallback_kind),
-                    message=extract_text(record),
+                    message=message,
                     timestamp=timestamp,
                     data=record,
+                    level=level or parse_level(message),
                 )
 
 
+def raw_record_start(message: str) -> bool:
+    """A raw line starts a new logical record iff it opens with a parseable
+    timestamp or a level-led logging prefix; anything else continues the
+    previous record (tracebacks, embedded file contents, ps output)."""
+
+    first = message.split(maxsplit=1)[0] if message else ""
+    if parse_timestamp(first) is not None:
+        return True
+    return LEVEL_PREFIX_RE.match(message[:256]) is not None
+
+
 def read_raw(
-    path: Path, *, root: Path, box: str, source: str, kind: str = "output"
+    path: Path,
+    *,
+    root: Path,
+    box: str,
+    source: str,
+    kind: str = "output",
+    group_continuations: bool = False,
 ) -> Iterator[dict[str, Any]]:
     for rotated in rotated_paths(path, root):
         try:
@@ -1375,8 +1504,27 @@ def read_raw(
             continue
         with handle:
             modified_at = os.fstat(handle.fileno()).st_mtime
-            for line_number, payload, _terminated in iter_bounded_records(handle):
+            pending: dict[str, Any] | None = None
+            pending_lines = 0
+
+            def build(message: str, line_number: int) -> dict[str, Any]:
+                first = message.split(maxsplit=1)[0] if message else ""
+                timestamp = parse_timestamp(first) or fallback_timestamp(modified_at, line_number)
+                return normalized_event(
+                    box=box,
+                    source=source,
+                    stream="log",
+                    kind=kind,
+                    message=message,
+                    timestamp=timestamp,
+                    level=parse_level(message),
+                )
+
+            for line_number, payload, terminated in iter_bounded_records(handle):
                 if payload is None:
+                    if pending is not None:
+                        yield pending
+                        pending = None
                     warn(f"omitted oversized source record in {rotated}:{line_number}")
                     yield normalized_event(
                         box=box,
@@ -1387,21 +1535,34 @@ def read_raw(
                         timestamp=fallback_timestamp(modified_at, line_number),
                     )
                     continue
+                if rotated == path and not terminated:
+                    # The active file's final line may still be mid-write; a
+                    # later query sees the complete line, so emitting the
+                    # fragment now would surface truncated duplicates.
+                    continue
                 line = payload.decode("utf-8", errors="replace")
                 message = line.rstrip("\r\n")
-                if not message:
+                if not message.strip():
                     continue
-                timestamp = None
-                first = message.split(maxsplit=1)[0] if message else ""
-                timestamp = parse_timestamp(first) or fallback_timestamp(modified_at, line_number)
-                yield normalized_event(
-                    box=box,
-                    source=source,
-                    stream="log",
-                    kind=kind,
-                    message=message,
-                    timestamp=timestamp,
-                )
+                if not group_continuations:
+                    yield build(message, line_number)
+                    continue
+                if (
+                    pending is not None
+                    and not raw_record_start(message)
+                    and pending_lines < MAX_RAW_CONTINUATION_LINES
+                ):
+                    pending["message"] = truncate_utf8(
+                        pending["message"] + "\n" + message, MAX_EVENT_MESSAGE_BYTES
+                    )
+                    pending_lines += 1
+                    continue
+                if pending is not None:
+                    yield pending
+                pending = build(message, line_number)
+                pending_lines = 1
+            if pending is not None:
+                yield pending
 
 
 def runtime_source(stem: str, scope: str) -> str:
@@ -1622,7 +1783,9 @@ def read_hermes_logs(home: Path, *, root: Path, box: str) -> Iterator[dict[str, 
                 path, root=root, box=box, source="hermes", fallback_kind="hermes.log"
             )
         else:
-            yield from read_raw(path, root=root, box=box, source="hermes")
+            yield from read_raw(
+                path, root=root, box=box, source="hermes", group_continuations=True
+            )
 
 
 def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int, dict[str, Any]]]:
@@ -1652,6 +1815,7 @@ def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int
             for path in hermes_db_paths(agent_home, root=agent_root)
         )
 
+    minimum_level = LEVELS[args.level] if getattr(args, "level", "") else None
     exact_values = token_env_values()
     sequence = 0
     for stream in streams:
@@ -1662,6 +1826,13 @@ def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int
             timestamp = parse_timestamp(event.get("timestamp")) or dt.datetime.fromtimestamp(0, UTC)
             if since is not None and timestamp < since:
                 continue
+            if minimum_level is not None:
+                # Events without a recognized level filter as "info" so that
+                # --level warn quiets unleveled chatter while --level info
+                # (and below) still shows everything.
+                effective = LEVELS.get(str(event.get("level", "")), LEVELS["info"])
+                if effective < minimum_level:
+                    continue
             searchable = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
             if args.grep and args.grep.casefold() not in searchable.casefold():
                 continue
@@ -1696,10 +1867,12 @@ def query_command(args: argparse.Namespace) -> int:
             if args.json:
                 print(json.dumps(event, ensure_ascii=False, separators=(",", ":")))
             else:
-                print(
-                    f"{event['timestamp']} [{event['box']}/{event['source']}/{event['stream']}] "
-                    f"{event.get('message', '')}"
-                )
+                label = f"{event['box']}/{event['source']}/{event['stream']}"
+                level = event.get("level")
+                if isinstance(level, str) and level:
+                    label += f"/{level}"
+                message = str(event.get("message", "")).replace("\n", "\n    ")
+                print(f"{event['timestamp']} [{label}] {message}")
     except BrokenPipeError:
         return 0
     return 0
@@ -1767,6 +1940,7 @@ def export_command(args: argparse.Namespace) -> int:
                 else redact_text(args.grep, token_env_values())
             )
             or None,
+            "level": args.level or None,
             "tail": args.tail,
             "redacted": not args.no_redact,
         },
@@ -1796,6 +1970,12 @@ def add_query_options(parser: argparse.ArgumentParser, *, default_tail: int | No
     parser.add_argument("--tail", type=lambda value: positive_int(value), default=default_tail)
     parser.add_argument("--since", default="", help="duration such as 24h or RFC3339 timestamp")
     parser.add_argument("--grep", default="", help="case-insensitive text filter")
+    parser.add_argument(
+        "--level",
+        default="",
+        choices=["", "debug", "info", "warn", "error"],
+        help="only events at this level or above; events without a level count as info",
+    )
     parser.add_argument("--no-redact", action="store_true", help="do not redact query/export source values")
 
 

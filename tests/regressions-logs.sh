@@ -622,8 +622,13 @@ done
 [[ ! -s "$tmp/legacy-hermes-as-agent.jsonl" ]]
 jq -e 'select(.message == "spoofed-native-source") | .source == "codex" and .stream == "event" and .type == "codex.event"' \
   "$tmp/query.jsonl" >/dev/null
-jq -e 'select(.source == "codex" and .timestamp == "2026-01-03T00:00:00.000Z") | .stream == "event" and .type == "codex.event" and .message == ""' \
-  "$tmp/query.jsonl" >/dev/null
+# Records with no extractable text used to surface as empty-message events;
+# they are pure noise (~80% of codex events on live boxes) and are dropped.
+if jq -e 'select(.source == "codex" and .timestamp == "2026-01-03T00:00:00.000Z")' \
+    "$tmp/query.jsonl" >/dev/null; then
+  echo "query emitted an empty-message native event" >&2
+  exit 1
+fi
 "$helper" query --agent-root "$agent_root" --executor-root "$executor_root" \
   --box fixture-box --source codex --tail 100 >"$tmp/codex.txt"
 grep -q 'spoofed-native-source' "$tmp/codex.txt"
@@ -774,5 +779,101 @@ remote_hint="$({
     bash -c 'source "$1"; logs executor' _ "$PROJECT_ROOT/guest/hb"
 } 2>&1)"
 grep -q 'tx9 logs fixture-box --source executor' <<<"$remote_hint"
+
+# Consecutive identical lines collapse into one structured event plus a
+# repeat-count summary; the raw log and the mirrored stream stay faithful,
+# and blank lines never become structured events.
+dedup_dir="$tmp/dedup"
+"$helper" capture --source executor --log-dir "$dedup_dir" -- \
+  bash -c 'printf "same-line\nsame-line\nsame-line\n\n   \ndifferent-line\n"' \
+  >"$tmp/dedup.stdout"
+[[ "$(grep -c 'same-line' "$tmp/dedup.stdout")" == 3 ]]
+[[ "$(grep -c 'same-line' "$dedup_dir/executor.log")" == 3 ]]
+[[ "$(jq -r 'select(.type == "output" and .message == "same-line") | .message' \
+  "$dedup_dir/executor.jsonl" | wc -l | tr -d ' ')" == 1 ]]
+jq -e 'select(.type == "output_repeated") | .data.count == 2 and .data.message == "same-line"' \
+  "$dedup_dir/executor.jsonl" >/dev/null
+jq -e 'select(.type == "output" and .message == "different-line")' \
+  "$dedup_dir/executor.jsonl" >/dev/null
+if jq -e 'select(.type == "output" and (.message | gsub("\\s"; "") == ""))' \
+    "$dedup_dir/executor.jsonl" >/dev/null; then
+  echo "capture persisted a blank structured event" >&2
+  exit 1
+fi
+
+# Hermes raw logs group continuation lines (tracebacks, embedded files, ps
+# output) into the record that introduced them, parse severity levels, ignore
+# the possibly mid-write final line of the active file, and never turn
+# loadavg-like numeric fragments into 1970 timestamps.
+grouping_home="$tmp/grouping-agent"
+mkdir -p "$grouping_home/home/agent/.hermes/logs" "$grouping_home/logs"
+printf '%s\n' \
+  'WARNING gateway.run: first record' \
+  '  continuation detail A' \
+  '  continuation detail B' \
+  '0.16 0.16 0.11 2/1393 31834' \
+  '2026-05-01T00:00:00Z INFO plain second record' \
+  'ERROR loop: third record' \
+  >"$grouping_home/home/agent/.hermes/logs/gateway.log"
+printf 'WARNING tail: partial record without newline' \
+  >>"$grouping_home/home/agent/.hermes/logs/gateway.log"
+"$helper" query --agent-root "$grouping_home" --executor-root "$executor_root" \
+  --box fixture-box --source hermes --tail 100 --json >"$tmp/grouping.jsonl"
+jq -e 'select(.message | startswith("WARNING gateway.run: first record")) |
+  (.message | contains("continuation detail B")) and
+  (.message | contains("0.16 0.16 0.11")) and
+  .level == "warn"' "$tmp/grouping.jsonl" >/dev/null
+jq -e 'select(.message | contains("third record")) | .level == "error"' \
+  "$tmp/grouping.jsonl" >/dev/null
+if grep -q '"timestamp":"1970' "$tmp/grouping.jsonl"; then
+  echo "a numeric fragment became an epoch timestamp" >&2
+  exit 1
+fi
+if grep -q 'partial record without newline' "$tmp/grouping.jsonl"; then
+  echo "query emitted the unterminated tail of an active raw log" >&2
+  exit 1
+fi
+[[ "$(jq -r 'select(.stream == "log") | .message' "$tmp/grouping.jsonl" | grep -c 'continuation detail A')" == 1 ]]
+
+# --level keeps this level and above; events without a level count as info.
+"$helper" query --agent-root "$grouping_home" --executor-root "$executor_root" \
+  --box fixture-box --source hermes --tail 100 --level warn --json >"$tmp/level-warn.jsonl"
+jq -e 'select(.level == "warn")' "$tmp/level-warn.jsonl" >/dev/null
+jq -e 'select(.level == "error")' "$tmp/level-warn.jsonl" >/dev/null
+if grep -q 'plain second record' "$tmp/level-warn.jsonl"; then
+  echo "--level warn kept an info event" >&2
+  exit 1
+fi
+"$helper" query --agent-root "$grouping_home" --executor-root "$executor_root" \
+  --box fixture-box --source hermes --tail 100 --level info --json >"$tmp/level-info.jsonl"
+grep -q 'plain second record' "$tmp/level-info.jsonl"
+
+# Text output renders grouped records with indented continuation lines and a
+# level segment in the header when one is known.
+"$helper" query --agent-root "$grouping_home" --executor-root "$executor_root" \
+  --box fixture-box --source hermes --tail 100 >"$tmp/grouping.txt"
+grep -q '\[fixture-box/hermes/log/warn\] WARNING gateway.run: first record' "$tmp/grouping.txt"
+grep -q '^      continuation detail A' "$tmp/grouping.txt"
+
+# A schema-v1 record with a bogus level value has it dropped rather than
+# forwarded, and a valid one is preserved.
+level_home="$tmp/level-agent"
+mkdir -p "$level_home/logs"
+printf '%s\n' \
+  '{"schema":"tx9.event.v1","timestamp":"2026-05-02T00:00:00Z","source":"agent","stream":"event","type":"fixture","message":"bogus-level-record","level":"loud"}' \
+  '{"schema":"tx9.event.v1","timestamp":"2026-05-02T00:00:01Z","source":"agent","stream":"event","type":"fixture","message":"valid-level-record","level":"warning"}' \
+  '{"schema":"tx9.event.v1","timestamp":"2026-05-02T00:00:02Z","source":"agent","stream":"event","type":"fixture","message":"   "}' \
+  >"$level_home/logs/agent.jsonl"
+"$helper" query --agent-root "$level_home" --executor-root "$executor_root" \
+  --box fixture-box --source agent --tail 100 --json >"$tmp/level-schema.jsonl"
+jq -e 'select(.message == "bogus-level-record") | has("level") | not' \
+  "$tmp/level-schema.jsonl" >/dev/null
+jq -e 'select(.message == "valid-level-record") | .level == "warn"' \
+  "$tmp/level-schema.jsonl" >/dev/null
+if jq -e 'select(.type == "fixture" and (.message | gsub("\\s"; "") == ""))' \
+    "$tmp/level-schema.jsonl" >/dev/null; then
+  echo "query emitted a whitespace-only schema-v1 event" >&2
+  exit 1
+fi
 
 echo "log capture/query/export regression checks passed"

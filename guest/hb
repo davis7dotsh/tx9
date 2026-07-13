@@ -41,6 +41,25 @@ EXECUTOR_HOST="${EXECUTOR_HOST:-127.0.0.1}"
 _exec_remote() { [[ "$EXECUTOR_HOST" != 127.0.0.1 ]]; }
 _executor_url() { printf 'http://%s:%s/mcp' "$EXECUTOR_HOST" "${EXECUTOR_PORT:-4788}"; }
 
+# Steady-state reporting: the reconcile loop re-checks Executor every cycle,
+# so unchanged results must not re-log — they flooded the durable agent
+# stream with one identical line per cycle. Non-durable state under /tmp
+# resets with the container, so the first check after a restart always logs.
+HB_RUNTIME_STATE_DIR="${HB_RUNTIME_STATE_DIR:-/tmp/hermes-box-runtime}"
+HB_STEADY_QUIET="${HB_STEADY_QUIET:-0}"
+_steady_report() {  # <key> <state> <message> [stderr]
+  local key="$1" state="$2" message="$3" fd="${4:-stdout}" state_file
+  if [[ "$HB_STEADY_QUIET" != 1 ]]; then
+    if [[ "$fd" == stderr ]]; then echo "$message" >&2; else echo "$message"; fi
+    return 0
+  fi
+  state_file="$HB_RUNTIME_STATE_DIR/$key.state"
+  [[ "$(cat "$state_file" 2>/dev/null)" != "$state" ]] || return 0
+  mkdir -p "$HB_RUNTIME_STATE_DIR" 2>/dev/null || true
+  printf '%s' "$state" >"$state_file" 2>/dev/null || true
+  if [[ "$fd" == stderr ]]; then echo "$message" >&2; else echo "$message"; fi
+}
+
 init() {
   local managed=(
     "$AGENT_HOME" "$AGENT_HOME/.claude" "$AGENT_HOME/.codex" "$AGENT_HOME/.hermes"
@@ -152,8 +171,8 @@ _spawn_without_lock_fd() {
 _executor_up() {
   init
   if _exec_remote; then
-    _wait_port open || { echo "remote executor unreachable at $EXECUTOR_HOST:${EXECUTOR_PORT:-4788}" >&2; return 1; }
-    echo "executor daemon: reachable (remote)"
+    _wait_port open || { _steady_report executor unreachable "remote executor unreachable at $EXECUTOR_HOST:${EXECUTOR_PORT:-4788}" stderr; return 1; }
+    _steady_report executor reachable "executor daemon: reachable (remote)"
     return 0
   fi
   command -v executor >/dev/null 2>&1 || {
@@ -163,7 +182,7 @@ _executor_up() {
   }
   _acquire_daemon_lock "$EXECUTOR_LOCK" || { echo "could not acquire Executor lock" >&2; return 1; }
   if _port_open; then
-    echo "executor daemon: running"
+    _steady_report executor running "executor daemon: running"
     _release_daemon_lock "$EXECUTOR_LOCK"
     return 0
   fi
@@ -323,7 +342,7 @@ up() {
 reconcile() {
   init
   [[ ! -e "$QUIESCE_FILE" ]] || return 0
-  _executor_up || return 1
+  HB_STEADY_QUIET=1 _executor_up || return 1
   _start_gateway
 }
 

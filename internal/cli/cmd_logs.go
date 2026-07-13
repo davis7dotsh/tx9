@@ -21,8 +21,17 @@ type logsQueryOptions struct {
 	Tail     int
 	Since    string
 	Contains string
+	Level    string
 	JSON     bool
 	NoRedact bool
+}
+
+func validateLogsLevel(level string) error {
+	switch level {
+	case "", "debug", "info", "warn", "error":
+		return nil
+	}
+	return fmt.Errorf("--level must be one of debug, info, warn, error")
 }
 
 func cmdLogs(args []string) error {
@@ -37,6 +46,7 @@ func cmdLogs(args []string) error {
 	fs.IntVar(&opts.Tail, "tail", 200, "show the newest N matching events")
 	fs.StringVar(&opts.Since, "since", "", "only events after a duration or RFC3339 timestamp (for example 24h)")
 	fs.StringVar(&opts.Contains, "grep", "", "only events containing text")
+	fs.StringVar(&opts.Level, "level", "", "only events at this level or above: debug|info|warn|error (unleveled events count as info)")
 	fs.BoolVar(&opts.JSON, "json", false, "emit normalized JSONL")
 	fs.BoolVar(&opts.NoRedact, "no-redact", false, "include sensitive values instead of redacting known token forms")
 	if err := parseFlagsAnywhere(fs, args); err != nil {
@@ -48,6 +58,9 @@ func cmdLogs(args []string) error {
 	}
 	if opts.Tail < 1 {
 		return fmt.Errorf("logs %s: --tail must be at least 1", name)
+	}
+	if err := validateLogsLevel(opts.Level); err != nil {
+		return fmt.Errorf("logs %s: %w", name, err)
 	}
 
 	return withBoxLock(name, func(ctx context.Context, cli *docker.Client) error {
@@ -79,6 +92,7 @@ func cmdLogsExport(args []string) error {
 	fs.StringVar(&opts.Source, "source", "all", "comma-separated sources: agent,executor,hermes,codex,claude")
 	fs.StringVar(&opts.Since, "since", "", "only events after a duration or RFC3339 timestamp (for example 24h)")
 	fs.StringVar(&opts.Contains, "grep", "", "only events containing text")
+	fs.StringVar(&opts.Level, "level", "", "only events at this level or above: debug|info|warn|error (unleveled events count as info)")
 	fs.BoolVar(&opts.NoRedact, "no-redact", false, "include sensitive values instead of redacting known token forms")
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
@@ -86,6 +100,9 @@ func cmdLogsExport(args []string) error {
 	name, err := requireBoxName(fs, "logs export")
 	if err != nil {
 		return err
+	}
+	if err := validateLogsLevel(opts.Level); err != nil {
+		return fmt.Errorf("logs export %s: %w", name, err)
 	}
 
 	destination := *output
@@ -189,6 +206,9 @@ func logsHelperArgs(action, name string, opts logsQueryOptions) []string {
 	}
 	if opts.Contains != "" {
 		cmd = append(cmd, "--grep", opts.Contains)
+	}
+	if opts.Level != "" {
+		cmd = append(cmd, "--level", opts.Level)
 	}
 	if opts.JSON {
 		cmd = append(cmd, "--json")
