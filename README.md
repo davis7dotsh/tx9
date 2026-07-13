@@ -100,16 +100,17 @@ agent/Executor filesystem boundary:
 tx9 logs media-bot --source executor,codex --since 24h --grep failed
 tx9 logs media-bot --level warn --since 24h
 tx9 logs media-bot --json | jq .
-tx9 logs export media-bot --output media-bot-logs.tar.gz
+tx9 logs export media-bot --level warn --output media-bot-logs.tar.gz
 ```
 
 Events carry a best-effort `level` (debug/info/warn/error) parsed from known
 log formats; `--level` keeps that level and above, counting unleveled events
-as info. Steady-state noise is kept out of the durable streams: the reconcile
-loop logs Executor reachability only when it changes, capture collapses
-consecutive identical lines into one event plus a repeat-count summary (the
-raw text logs stay byte-faithful), and multi-line Hermes records (tracebacks,
-embedded files) are grouped into single events.
+as info. The same threshold filters an export's `events.jsonl` and is recorded
+as `manifest.filters.level`. Steady-state noise is kept out of the durable
+streams: the reconcile loop logs Executor reachability only when it changes,
+and capture collapses consecutive identical lines into one event plus a
+repeat-count summary while raw text logs stay byte-faithful. Multi-line Hermes
+records (tracebacks, embedded files) are grouped into single events.
 
 Known bearer-token forms are redacted by default. Log exports are created
 mode `0600`; they can still contain prompts, tool output, and private work, so

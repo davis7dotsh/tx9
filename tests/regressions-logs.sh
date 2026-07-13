@@ -51,6 +51,36 @@ args = parser.parse_args(["capture", "--source", "agent", "--", "true"])
 assert args.restart_delay is None
 PY
 
+# Source reads stop at the first unterminated snapshot boundary instead of
+# reframing bytes appended during the query as a separate record. A record that
+# fills the entire byte budget without room for its newline is already oversized.
+python3 - "$helper" "$tmp/record-snapshot.log" <<'PY'
+import importlib.machinery
+import importlib.util
+import sys
+
+loader = importlib.machinery.SourceFileLoader("tx9_logs_records", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+path = sys.argv[2]
+
+with open(path, "wb") as handle:
+    handle.write(b"prefix")
+with open(path, "rb") as handle:
+    records = module.iter_bounded_records(handle)
+    assert next(records) == (1, b"prefix", False)
+    with open(path, "ab") as writer:
+        writer.write(b"-suffix\nnext\n")
+    assert list(records) == []
+
+with open(path, "wb") as handle:
+    handle.write(b"x" * module.MAX_SOURCE_RECORD_BYTES)
+with open(path, "rb") as handle:
+    assert list(module.iter_bounded_records(handle)) == [(1, None, False)]
+PY
+
 # Capture preserves the wrapped command's status and stdout/stderr split while
 # redacting all supported token forms before either mirroring or persistence.
 set +e
@@ -801,22 +831,48 @@ if jq -e 'select(.type == "output" and (.message | gsub("\\s"; "") == ""))' \
   exit 1
 fi
 
+# Repeat summaries retain the repeated record's severity so matching query and
+# export thresholds do not hide the count.
+repeat_home="$tmp/repeat-agent"
+mkdir -p "$repeat_home/logs"
+"$helper" capture --source agent --log-dir "$repeat_home/logs" -- \
+  bash -c 'printf "WARNING repeat-warning\nWARNING repeat-warning\nWARNING repeat-warning\nERROR repeat-error\nERROR repeat-error\nERROR repeat-error\n"' \
+  >/dev/null
+"$helper" query --agent-root "$repeat_home" --executor-root "$executor_root" \
+  --box fixture-box --source agent --tail 100 --level warn --json >"$tmp/repeat-level.jsonl"
+jq -e 'select(.type == "output_repeated" and .data.message == "WARNING repeat-warning") |
+  .level == "warn" and .data.count == 2' "$tmp/repeat-level.jsonl" >/dev/null
+jq -e 'select(.type == "output_repeated" and .data.message == "ERROR repeat-error") |
+  .level == "error" and .data.count == 2' "$tmp/repeat-level.jsonl" >/dev/null
+"$helper" export --agent-root "$repeat_home" --executor-root "$executor_root" \
+  --box fixture-box --source agent --level warn >"$tmp/repeat-level.tar.gz"
+mkdir "$tmp/repeat-level"
+tar -xzf "$tmp/repeat-level.tar.gz" -C "$tmp/repeat-level"
+jq -e 'select(.type == "output_repeated" and .level == "warn")' \
+  "$tmp/repeat-level/events.jsonl" >/dev/null
+jq -e 'select(.type == "output_repeated" and .level == "error")' \
+  "$tmp/repeat-level/events.jsonl" >/dev/null
+jq -e '.filters.level == "warn"' "$tmp/repeat-level/manifest.json" >/dev/null
+
 # Hermes raw logs group continuation lines (tracebacks, embedded files, ps
-# output) into the record that introduced them, parse severity levels, ignore
-# the possibly mid-write final line of the active file, and never turn
-# loadavg-like numeric fragments into 1970 timestamps.
+# output) into the record that introduced them, parse severity levels, withhold
+# a possibly mid-write tail, and never turn loadavg-like numeric fragments into
+# 1970 timestamps.
 grouping_home="$tmp/grouping-agent"
-mkdir -p "$grouping_home/home/agent/.hermes/logs" "$grouping_home/logs"
+hermes_logs="$grouping_home/home/agent/.hermes/logs"
+mkdir -p "$hermes_logs" "$grouping_home/logs"
 printf '%s\n' \
   'WARNING gateway.run: first record' \
   '  continuation detail A' \
   '  continuation detail B' \
   '0.16 0.16 0.11 2/1393 31834' \
   '2026-05-01T00:00:00Z INFO plain second record' \
+  '2026-05-01T00:00:01Z plain unlabeled record' \
   'ERROR loop: third record' \
-  >"$grouping_home/home/agent/.hermes/logs/gateway.log"
-printf 'WARNING tail: partial record without newline' \
-  >>"$grouping_home/home/agent/.hermes/logs/gateway.log"
+  >"$hermes_logs/gateway.log"
+printf 'WARNING tail: partial record without newline' >>"$hermes_logs/gateway.log"
+printf '%s\n' 'WARNING grouped prefix' >"$hermes_logs/continuation.log"
+printf '  ' >>"$hermes_logs/continuation.log"
 "$helper" query --agent-root "$grouping_home" --executor-root "$executor_root" \
   --box fixture-box --source hermes --tail 100 --json >"$tmp/grouping.jsonl"
 jq -e 'select(.message | startswith("WARNING gateway.run: first record")) |
@@ -833,20 +889,65 @@ if grep -q 'partial record without newline' "$tmp/grouping.jsonl"; then
   echo "query emitted the unterminated tail of an active raw log" >&2
   exit 1
 fi
+if grep -q 'WARNING grouped prefix' "$tmp/grouping.jsonl"; then
+  echo "query emitted a grouped record with an incomplete continuation" >&2
+  exit 1
+fi
 [[ "$(jq -r 'select(.stream == "log") | .message' "$tmp/grouping.jsonl" | grep -c 'continuation detail A')" == 1 ]]
 
-# --level keeps this level and above; events without a level count as info.
+# An oversized active tail still reports a bounded truncation marker and does
+# not hide the preceding complete grouped record.
+oversized_grouping_home="$tmp/oversized-grouping-agent"
+oversized_hermes_logs="$oversized_grouping_home/home/agent/.hermes/logs"
+mkdir -p "$oversized_hermes_logs" "$oversized_grouping_home/logs"
+python3 - "$oversized_hermes_logs/oversized.log" <<'PY'
+import sys
+
+with open(sys.argv[1], "wb") as handle:
+    handle.write(b"WARNING preceding oversized record\n")
+    handle.write(b"ERROR " + b"x" * (2 * 1024 * 1024))
+PY
+"$helper" query --agent-root "$oversized_grouping_home" \
+  --executor-root "$executor_root" --box fixture-box --source hermes --tail 100 \
+  --json >"$tmp/oversized-grouping.jsonl" 2>"$tmp/oversized-grouping.stderr"
+grep -q 'preceding oversized record' "$tmp/oversized-grouping.jsonl"
+jq -e 'select(.type == "truncated" and
+  .message == "record omitted because it exceeds the query size limit")' \
+  "$tmp/oversized-grouping.jsonl" >/dev/null
+grep -q 'omitted oversized source record' "$tmp/oversized-grouping.stderr"
+
+printf 'incomplete continuation\n' >>"$hermes_logs/continuation.log"
+"$helper" query --agent-root "$grouping_home" --executor-root "$executor_root" \
+  --box fixture-box --source hermes --tail 100 --json >"$tmp/grouping-complete.jsonl"
+jq -e 'select(.message | startswith("WARNING grouped prefix")) |
+  (.message | contains("incomplete continuation")) and .level == "warn"' \
+  "$tmp/grouping-complete.jsonl" >/dev/null
+
+# --level keeps this level and above; events without a level count as info in
+# both queries and exported bundles.
 "$helper" query --agent-root "$grouping_home" --executor-root "$executor_root" \
   --box fixture-box --source hermes --tail 100 --level warn --json >"$tmp/level-warn.jsonl"
 jq -e 'select(.level == "warn")' "$tmp/level-warn.jsonl" >/dev/null
 jq -e 'select(.level == "error")' "$tmp/level-warn.jsonl" >/dev/null
-if grep -q 'plain second record' "$tmp/level-warn.jsonl"; then
-  echo "--level warn kept an info event" >&2
+if grep -qE 'plain second record|plain unlabeled record' "$tmp/level-warn.jsonl"; then
+  echo "--level warn kept an info or unlabeled event" >&2
   exit 1
 fi
 "$helper" query --agent-root "$grouping_home" --executor-root "$executor_root" \
   --box fixture-box --source hermes --tail 100 --level info --json >"$tmp/level-info.jsonl"
 grep -q 'plain second record' "$tmp/level-info.jsonl"
+grep -q 'plain unlabeled record' "$tmp/level-info.jsonl"
+"$helper" export --agent-root "$grouping_home" --executor-root "$executor_root" \
+  --box fixture-box --source hermes --level warn >"$tmp/level-warn.tar.gz"
+mkdir "$tmp/level-warn"
+tar -xzf "$tmp/level-warn.tar.gz" -C "$tmp/level-warn"
+jq -e 'select(.level == "warn")' "$tmp/level-warn/events.jsonl" >/dev/null
+jq -e 'select(.level == "error")' "$tmp/level-warn/events.jsonl" >/dev/null
+if grep -qE 'plain second record|plain unlabeled record' "$tmp/level-warn/events.jsonl"; then
+  echo "--level warn export kept an info or unlabeled event" >&2
+  exit 1
+fi
+jq -e '.filters.level == "warn"' "$tmp/level-warn/manifest.json" >/dev/null
 
 # Text output renders grouped records with indented continuation lines and a
 # level segment in the header when one is known.
@@ -862,7 +963,8 @@ mkdir -p "$level_home/logs"
 printf '%s\n' \
   '{"schema":"tx9.event.v1","timestamp":"2026-05-02T00:00:00Z","source":"agent","stream":"event","type":"fixture","message":"bogus-level-record","level":"loud"}' \
   '{"schema":"tx9.event.v1","timestamp":"2026-05-02T00:00:01Z","source":"agent","stream":"event","type":"fixture","message":"valid-level-record","level":"warning"}' \
-  '{"schema":"tx9.event.v1","timestamp":"2026-05-02T00:00:02Z","source":"agent","stream":"event","type":"fixture","message":"   "}' \
+  '{"schema":"tx9.event.v1","timestamp":"2026-05-02T00:00:02Z","source":"agent","stream":"stdout","type":"output_repeated","message":"previous line repeated 2 more times","data":{"count":2,"message":"ERROR historical repeated output"}}' \
+  '{"schema":"tx9.event.v1","timestamp":"2026-05-02T00:00:03Z","source":"agent","stream":"event","type":"fixture","message":"   "}' \
   >"$level_home/logs/agent.jsonl"
 "$helper" query --agent-root "$level_home" --executor-root "$executor_root" \
   --box fixture-box --source agent --tail 100 --json >"$tmp/level-schema.jsonl"
@@ -870,10 +972,57 @@ jq -e 'select(.message == "bogus-level-record") | has("level") | not' \
   "$tmp/level-schema.jsonl" >/dev/null
 jq -e 'select(.message == "valid-level-record") | .level == "warn"' \
   "$tmp/level-schema.jsonl" >/dev/null
+jq -e 'select(.type == "output_repeated") |
+  .level == "error" and .data.message == "ERROR historical repeated output"' \
+  "$tmp/level-schema.jsonl" >/dev/null
+"$helper" query --agent-root "$level_home" --executor-root "$executor_root" \
+  --box fixture-box --source agent --tail 100 --level error --json \
+  >"$tmp/level-schema-error.jsonl"
+jq -e 'select(.type == "output_repeated" and .level == "error")' \
+  "$tmp/level-schema-error.jsonl" >/dev/null
 if jq -e 'select(.type == "fixture" and (.message | gsub("\\s"; "") == ""))' \
     "$tmp/level-schema.jsonl" >/dev/null; then
   echo "query emitted a whitespace-only schema-v1 event" >&2
   exit 1
 fi
+
+# A complete active JSONL object is safe to parse without a trailing newline;
+# a partial object remains hidden until a later query can read it completely.
+complete_json_home="$tmp/complete-json-agent"
+mkdir -p "$complete_json_home/logs"
+printf '%s' \
+  '{"schema":"tx9.event.v1","timestamp":"2026-05-03T00:00:00Z","source":"agent","stream":"event","type":"fixture","message":"complete JSON without newline","level":"error"}' \
+  >"$complete_json_home/logs/agent.jsonl"
+"$helper" query --agent-root "$complete_json_home" --executor-root "$executor_root" \
+  --box fixture-box --source agent --tail 100 --json >"$tmp/complete-json.jsonl"
+jq -e 'select(.message == "complete JSON without newline") | .level == "error"' \
+  "$tmp/complete-json.jsonl" >/dev/null
+"$helper" export --agent-root "$complete_json_home" --executor-root "$executor_root" \
+  --box fixture-box --source agent --level error >"$tmp/complete-json.tar.gz"
+mkdir "$tmp/complete-json"
+tar -xzf "$tmp/complete-json.tar.gz" -C "$tmp/complete-json"
+jq -e 'select(.message == "complete JSON without newline")' \
+  "$tmp/complete-json/events.jsonl" >/dev/null
+jq -e '.event_count == 1 and .filters.level == "error"' \
+  "$tmp/complete-json/manifest.json" >/dev/null
+
+partial_json_home="$tmp/partial-json-agent"
+mkdir -p "$partial_json_home/logs"
+printf '%s' \
+  '{"schema":"tx9.event.v1","timestamp":"2026-05-03T00:00:01Z","message":"partial JSON without newline"' \
+  >"$partial_json_home/logs/agent.jsonl"
+"$helper" query --agent-root "$partial_json_home" --executor-root "$executor_root" \
+  --box fixture-box --source agent --tail 100 --json >"$tmp/partial-json.jsonl" \
+  2>"$tmp/partial-json.stderr"
+if grep -q 'partial JSON without newline' "$tmp/partial-json.jsonl"; then
+  echo "query emitted a partial active JSONL record" >&2
+  exit 1
+fi
+grep -q 'ignored unterminated active JSONL record' "$tmp/partial-json.stderr"
+printf '}\n' >>"$partial_json_home/logs/agent.jsonl"
+"$helper" query --agent-root "$partial_json_home" --executor-root "$executor_root" \
+  --box fixture-box --source agent --tail 100 --json >"$tmp/completed-json.jsonl"
+jq -e 'select(.message == "partial JSON without newline")' \
+  "$tmp/completed-json.jsonl" >/dev/null
 
 echo "log capture/query/export regression checks passed"

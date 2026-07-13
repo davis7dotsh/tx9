@@ -560,8 +560,12 @@ def iter_bounded_records(handle: BinaryIO) -> Iterator[tuple[int, bytes | None, 
             return
         record_number += 1
         terminated = payload.endswith(b"\n")
-        if len(payload) <= MAX_SOURCE_RECORD_BYTES:
+        if len(payload) < MAX_SOURCE_RECORD_BYTES or (
+            len(payload) == MAX_SOURCE_RECORD_BYTES and terminated
+        ):
             yield record_number, payload, terminated
+            if not terminated:
+                return
             continue
 
         while not terminated:
@@ -570,6 +574,16 @@ def iter_bounded_records(handle: BinaryIO) -> Iterator[tuple[int, bytes | None, 
                 break
             terminated = remainder.endswith(b"\n")
         yield record_number, None, terminated
+        if not terminated:
+            return
+
+
+def file_unchanged(handle: BinaryIO, opened: os.stat_result) -> bool:
+    current = os.fstat(handle.fileno())
+    return (
+        current.st_size == opened.st_size
+        and current.st_mtime_ns == opened.st_mtime_ns
+    )
 
 
 def open_directory_under(root: Path, path: Path) -> int:
@@ -898,6 +912,9 @@ class Capture:
         event = self._base_event(
             stream, "output_repeated", f"previous line repeated {count - 1} more times"
         )
+        level = parse_level(message)
+        if level is not None:
+            event["level"] = level
         event["data"] = {"count": count - 1, "message": message}
         self._persist("structured", self.jsonl, event_bytes(event, self.max_bytes))
 
@@ -1376,8 +1393,10 @@ def read_jsonl(
             warn(f"cannot read {rotated}: {exc}")
             continue
         with handle:
-            modified_at = os.fstat(handle.fileno()).st_mtime
+            opened = os.fstat(handle.fileno())
+            modified_at = opened.st_mtime
             for line_number, payload, terminated in iter_bounded_records(handle):
+                active_unterminated = rotated == path and not terminated
                 if payload is None:
                     warn(f"omitted oversized source record in {rotated}:{line_number}")
                     yield normalized_event(
@@ -1389,16 +1408,19 @@ def read_jsonl(
                         timestamp=fallback_timestamp(modified_at, line_number),
                     )
                     continue
-                if rotated == path and not terminated:
-                    warn(f"ignored unterminated active JSONL record in {rotated}:{line_number}")
-                    continue
                 line = payload.decode("utf-8", errors="replace")
                 stripped = line.rstrip("\r\n")
                 if not stripped:
                     continue
+                if active_unterminated and not file_unchanged(handle, opened):
+                    warn(f"ignored changing active JSONL record in {rotated}:{line_number}")
+                    continue
                 try:
                     record = json.loads(stripped)
                 except ValueError:
+                    if active_unterminated:
+                        warn(f"ignored unterminated active JSONL record in {rotated}:{line_number}")
+                        continue
                     yield normalized_event(
                         box=box,
                         source=source,
@@ -1410,6 +1432,8 @@ def read_jsonl(
                     continue
                 except RecursionError:
                     warn(f"ignored excessively nested JSONL record in {rotated}:{line_number}")
+                    if active_unterminated:
+                        continue
                     yield normalized_event(
                         box=box,
                         source=source,
@@ -1418,6 +1442,9 @@ def read_jsonl(
                         message="record omitted because its nesting exceeds the query limit",
                         timestamp=fallback_timestamp(modified_at, line_number),
                     )
+                    continue
+                if active_unterminated and not file_unchanged(handle, opened):
+                    warn(f"ignored changing active JSONL record in {rotated}:{line_number}")
                     continue
                 if not isinstance(record, Mapping):
                     record = {"value": record}
@@ -1448,7 +1475,13 @@ def read_jsonl(
                     event["stream"] = stream
                     event["type"] = kind
                     event["message"] = truncate_utf8(message, MAX_EVENT_MESSAGE_BYTES)
-                    level = normalize_level(event.get("level")) or parse_level(message)
+                    level_message = message
+                    data = event.get("data")
+                    if kind == "output_repeated" and isinstance(data, Mapping):
+                        repeated_message = data.get("message")
+                        if isinstance(repeated_message, str):
+                            level_message = repeated_message
+                    level = normalize_level(event.get("level")) or parse_level(level_message)
                     if level in LEVELS:
                         event["level"] = level
                     else:
@@ -1481,7 +1514,8 @@ def raw_record_start(message: str) -> bool:
     timestamp or a level-led logging prefix; anything else continues the
     previous record (tracebacks, embedded file contents, ps output)."""
 
-    first = message.split(maxsplit=1)[0] if message else ""
+    parts = message.split(maxsplit=1)
+    first = parts[0] if parts else ""
     if parse_timestamp(first) is not None:
         return True
     return LEVEL_PREFIX_RE.match(message[:256]) is not None
@@ -1521,6 +1555,7 @@ def read_raw(
                 )
 
             for line_number, payload, terminated in iter_bounded_records(handle):
+                active_unterminated = rotated == path and not terminated
                 if payload is None:
                     if pending is not None:
                         yield pending
@@ -1535,13 +1570,25 @@ def read_raw(
                         timestamp=fallback_timestamp(modified_at, line_number),
                     )
                     continue
-                if rotated == path and not terminated:
-                    # The active file's final line may still be mid-write; a
-                    # later query sees the complete line, so emitting the
-                    # fragment now would surface truncated duplicates.
-                    continue
                 line = payload.decode("utf-8", errors="replace")
                 message = line.rstrip("\r\n")
+                if active_unterminated:
+                    # The active file's final line may still be mid-write. If it
+                    # would continue a grouped record, withhold that whole record
+                    # so a later query cannot surface a longer duplicate.
+                    if (
+                        group_continuations
+                        and pending is not None
+                        and not raw_record_start(message)
+                        and pending_lines < MAX_RAW_CONTINUATION_LINES
+                    ):
+                        extended = truncate_utf8(
+                            pending["message"] + "\n" + message,
+                            MAX_EVENT_MESSAGE_BYTES,
+                        )
+                        if extended != pending["message"]:
+                            pending = None
+                    continue
                 if not message.strip():
                     continue
                 if not group_continuations:
