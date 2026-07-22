@@ -44,6 +44,18 @@ wait_for_absent() {
   return 1
 }
 
+wait_for_process_exit() {
+  local pid="$1" attempt state
+  for ((attempt = 0; attempt < 150; attempt++)); do
+    if ! kill -0 "$pid" 2>/dev/null; then return 0; fi
+    state="$(ps -o stat= -p "$pid" 2>/dev/null || true)"
+    [[ "$state" == Z* ]] && return 0
+    sleep 0.02
+  done
+  echo "timed out waiting for process $pid to exit" >&2
+  return 1
+}
+
 cat >"$definitions/healthy" <<'EOF'
 #!/usr/bin/env bash
 printf 'start %s\n' "$$" >>"$SERVICE_TEST_EVENTS/healthy.starts"
@@ -278,6 +290,58 @@ kill -0 "$keep_child"
 helper_failure_services "$missing_helper" stop-all >/dev/null
 wait_for_absent "$helper_failure_runtime/keep.state"
 wait_for_count 1 "$helper_failure_events/keep.terms"
+
+# Unexpected SIGKILL of a capture wrapper cannot orphan its direct foreground
+# service. Reconcile replaces the stale wrapper with one service, and stop-all
+# leaves no managed capture or foreground service behind.
+pdeath_config="$tmp/pdeath-config"
+pdeath_definitions="$pdeath_config/services.d"
+pdeath_runtime="$tmp/pdeath-runtime"
+pdeath_logs="$tmp/pdeath-logs"
+pdeath_events="$tmp/pdeath-events"
+mkdir -p "$pdeath_definitions" "$pdeath_runtime" "$pdeath_logs" "$pdeath_events"
+cat >"$pdeath_definitions/guarded" <<'EOF'
+#!/usr/bin/env bash
+printf 'start %s\n' "$$" >>"$PDEATH_SERVICE_EVENTS/starts"
+exec python3 -c 'import signal; signal.pause()' >/dev/null 2>&1
+EOF
+chmod 0700 "$pdeath_definitions/guarded"
+
+pdeath_services() {
+  env PDEATH_SERVICE_EVENTS="$pdeath_events" \
+    TX9_SERVICES_CONFIG_ROOT="$pdeath_config" \
+    TX9_SERVICES_STATE_DIR="$pdeath_runtime" \
+    TX9_SERVICES_LOG_DIR="$pdeath_logs" \
+    TX9_SERVICES_LOG_HELPER="$PROJECT_ROOT/guest/tx9-logs" \
+    TX9_SERVICES_RESTART_DELAY=0.2 \
+    TX9_SERVICES_STOP_TIMEOUT=2 \
+    "$services" "$@"
+}
+
+pdeath_services reconcile >/dev/null
+wait_for_count 1 "$pdeath_events/starts"
+old_pdeath_capture="$(cut -f1 "$pdeath_runtime/guarded.state")"
+old_pdeath_service="$(awk 'NR == 1 { print $2 }' "$pdeath_events/starts")"
+pids+=("$old_pdeath_capture")
+kill -KILL "$old_pdeath_capture"
+wait_for_process_exit "$old_pdeath_capture"
+wait_for_process_exit "$old_pdeath_service"
+
+pdeath_services reconcile >/dev/null
+wait_for_count 2 "$pdeath_events/starts"
+new_pdeath_capture="$(cut -f1 "$pdeath_runtime/guarded.state")"
+new_pdeath_service="$(awk 'NR == 2 { print $2 }' "$pdeath_events/starts")"
+pids+=("$new_pdeath_capture")
+[[ "$new_pdeath_capture" != "$old_pdeath_capture" ]]
+[[ "$new_pdeath_service" != "$old_pdeath_service" ]]
+kill -0 "$new_pdeath_capture"
+kill -0 "$new_pdeath_service"
+[[ "$(wc -l <"$pdeath_events/starts" | tr -d ' ')" == 2 ]]
+
+pdeath_services stop-all >/dev/null
+wait_for_absent "$pdeath_runtime/guarded.state"
+wait_for_process_exit "$new_pdeath_capture"
+wait_for_process_exit "$new_pdeath_service"
 
 # Runtime logging configuration is part of supervisor identity. Status reports
 # drift in each setting, and reconcile uses the stored settings to stop the old

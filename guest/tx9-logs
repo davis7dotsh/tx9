@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import datetime as dt
 import hashlib
 import heapq
@@ -51,6 +52,8 @@ CAPTURE_READER_DRAIN_SECONDS = 0.5
 CAPTURE_DEDUP_WINDOW_SECONDS = 60.0
 CAPTURE_DEDUP_MAX_REPEATS = 1000
 MAX_RAW_CONTINUATION_LINES = 1000
+PARENT_DEATH_EXEC_ACTION = "__parent-death-exec"
+PR_SET_PDEATHSIG = 1
 # Numeric values below this many epoch seconds (2001-09-09) cannot be event
 # times; loadavg fragments and counters otherwise parse as 1970 timestamps.
 MIN_PLAUSIBLE_EPOCH_SECONDS = 1_000_000_000
@@ -511,6 +514,58 @@ def nonnegative_float(value: str) -> float:
     if not math.isfinite(parsed) or parsed < 0:
         raise argparse.ArgumentTypeError("must be finite and non-negative")
     return parsed
+
+
+def parent_death_exec(arguments: Sequence[str]) -> int:
+    """Arm Linux parent-death SIGKILL, close the setup race, then exec.
+
+    Capture's supported lifecycle contract is the direct foreground child. A
+    command that daemonizes descendants outside that child's process group is
+    outside this guarantee.
+    """
+
+    if len(arguments) < 3 or arguments[1] != "--":
+        print("tx9-logs: invalid internal parent-death invocation", file=sys.stderr)
+        return 126
+    try:
+        expected_parent = positive_int(arguments[0])
+    except argparse.ArgumentTypeError as exc:
+        print(f"tx9-logs: invalid internal parent pid: {exc}", file=sys.stderr)
+        return 126
+    command = list(arguments[2:])
+    if not command:
+        print("tx9-logs: internal parent-death exec requires a command", file=sys.stderr)
+        return 126
+
+    libc = ctypes.CDLL(None, use_errno=True)
+    prctl = libc.prctl
+    prctl.argtypes = [
+        ctypes.c_int,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+        ctypes.c_ulong,
+    ]
+    prctl.restype = ctypes.c_int
+    if prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+        error = ctypes.get_errno()
+        print(
+            f"tx9-logs: could not arm parent-death signal: {os.strerror(error)}",
+            file=sys.stderr,
+        )
+        return 126
+
+    # PR_SET_PDEATHSIG is not retroactive. If capture died between Popen's
+    # fork and the prctl call, fail closed instead of execing an orphan.
+    if os.getppid() != expected_parent:
+        os.kill(os.getpid(), signal.SIGKILL)
+        os._exit(128 + signal.SIGKILL)
+
+    try:
+        os.execvpe(command[0], command, os.environ)
+    except OSError as exc:
+        print(f"tx9-logs: could not exec {Path(command[0]).name}: {exc}", file=sys.stderr)
+        return 127 if isinstance(exc, FileNotFoundError) else 126
 
 
 def path_parts_under(root: Path, path: Path) -> tuple[Path, tuple[str, ...]]:
@@ -1028,9 +1083,21 @@ class Capture:
         child_env = dict(os.environ)
         child_env["TX9_LOG_MIRROR_STDOUT_FD"] = str(self.mirror_out)
         child_env["TX9_LOG_MIRROR_STDERR_FD"] = str(self.mirror_err)
+        # Re-exec this module as a tiny setup shim instead of using
+        # subprocess.preexec_fn, whose Python callback is unsafe around the
+        # reader threads used by capture. Popen creates the new session first;
+        # the fresh interpreter then arms parent death and execs the command.
+        launch_command = [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            PARENT_DEATH_EXEC_ACTION,
+            str(os.getpid()),
+            "--",
+            *command,
+        ]
         try:
             child = subprocess.Popen(
-                command,
+                launch_command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=child_env,
@@ -2076,6 +2143,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if sys.argv[1:2] == [PARENT_DEATH_EXEC_ACTION]:
+        return parent_death_exec(sys.argv[2:])
     parser = build_parser()
     args = parser.parse_args()
     return int(args.handler(args))

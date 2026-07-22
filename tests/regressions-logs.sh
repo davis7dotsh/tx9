@@ -278,6 +278,38 @@ signal_status=$?
 set -e
 [[ "$signal_status" == 143 ]]
 
+# Capture arms its direct foreground child with a Linux parent-death SIGKILL.
+# Abrupt wrapper death therefore cannot leave the supported command orphaned.
+pdeath_dir="$tmp/parent-death"
+pdeath_pid_file="$tmp/parent-death.pid"
+PDEATH_PID_FILE="$pdeath_pid_file" \
+  "$helper" capture --source agent --log-dir "$pdeath_dir" -- \
+    python3 -c 'import os, pathlib, signal; pathlib.Path(os.environ["PDEATH_PID_FILE"]).write_text(str(os.getpid())); signal.pause()' \
+    >/dev/null 2>&1 &
+pdeath_capture_pid=$!
+pids+=("$pdeath_capture_pid")
+wait_for_file "$pdeath_pid_file"
+pdeath_child_pid="$(cat "$pdeath_pid_file")"
+kill -0 "$pdeath_child_pid"
+kill -KILL "$pdeath_capture_pid"
+set +e
+wait "$pdeath_capture_pid" 2>/dev/null
+pdeath_capture_status=$?
+set -e
+[[ "$pdeath_capture_status" == 137 ]]
+for _ in {1..150}; do
+  if ! kill -0 "$pdeath_child_pid" 2>/dev/null ||
+    [[ "$(ps -o stat= -p "$pdeath_child_pid" 2>/dev/null)" == Z* ]]; then
+    break
+  fi
+  sleep 0.02
+done
+if kill -0 "$pdeath_child_pid" 2>/dev/null &&
+  [[ "$(ps -o stat= -p "$pdeath_child_pid" 2>/dev/null)" != Z* ]]; then
+  echo "captured foreground child survived SIGKILL of its wrapper" >&2
+  exit 1
+fi
+
 # Internal cleanup gives a same-group descendant a bounded TERM grace before
 # cancellation/escalation, so normal shutdown handlers can flush state.
 graceful_dir="$tmp/graceful-descendant"
