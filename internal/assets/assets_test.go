@@ -6,6 +6,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -51,9 +52,11 @@ func TestBuildContextTar(t *testing.T) {
 	if mode != 0o755 {
 		t.Errorf("guest/hb mode = %o, want 0755", mode)
 	}
-	for _, want := range []string{"box.env", "provision/provision.sh", "docker/entrypoint.sh", "docker/executor-entrypoint.sh", "guest/hb-workload", "guest/hermes-state"} {
+	for _, want := range []string{"box.env", "provision/provision.sh", "docker/entrypoint.sh", "docker/executor-entrypoint.sh", "guest/hb-workload", "guest/tx9-services", "guest/hermes-state"} {
 		if _, ok := modes[want]; !ok {
 			t.Errorf("%s missing from build context tar", want)
+		} else if strings.HasPrefix(want, "guest/") && modes[want] != 0o755 {
+			t.Errorf("%s mode = %o, want 0755", want, modes[want])
 		}
 	}
 	for name := range modes {

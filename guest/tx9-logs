@@ -74,6 +74,7 @@ SOURCE_ALIASES = {
     "socat": "agent",
     "hermes-api-socat": "hermes",
 }
+SERVICE_SOURCE_RE = re.compile(r"service-[a-z0-9][a-z0-9_-]{0,62}")
 
 BEARER_RE = re.compile(r"(?i)(\bbearer[ \t]+)([^\s,;\"']+)")
 AUTHORIZATION_RE = re.compile(r"(?i)(\b(?:proxy-)?authorization\b[ \t]*[=:][ \t]*)([^\r\n]+)")
@@ -1146,7 +1147,12 @@ def selected_sources(value: str) -> set[str] | None:
     if not values or "all" in values:
         return None
     normalized = {normalize_source(item) for item in values}
-    unknown = normalized - {"agent", "executor", "hermes", "codex", "claude"}
+    unknown = {
+        source
+        for source in normalized
+        if source not in {"agent", "executor", "hermes", "codex", "claude"}
+        and SERVICE_SOURCE_RE.fullmatch(source) is None
+    }
     if unknown:
         raise ValueError("unknown source(s): " + ", ".join(sorted(unknown)))
     return normalized
@@ -1616,7 +1622,10 @@ def runtime_source(stem: str, scope: str) -> str:
         return "executor"
     stem = stem.partition(".legacy-")[0]
     source = normalize_source(stem)
-    if source not in {"agent", "hermes", "codex", "claude"}:
+    if (
+        source not in {"agent", "hermes", "codex", "claude"}
+        and SERVICE_SOURCE_RE.fullmatch(source) is None
+    ):
         return "agent"
     return source
 
@@ -1641,7 +1650,10 @@ def read_runtime_logs(root: Path, *, scope: str, box: str) -> Iterator[dict[str,
         if replacement and replacement in names:
             continue
         source = runtime_source(active.stem, scope)
-        if source not in {"agent", "executor", "hermes", "codex", "claude"}:
+        if (
+            source not in {"agent", "executor", "hermes", "codex", "claude"}
+            and SERVICE_SOURCE_RE.fullmatch(source) is None
+        ):
             source = "agent" if scope == "agent" else "executor"
         yield from read_raw(active, root=root, box=box, source=source)
 
@@ -1842,7 +1854,9 @@ def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int
     agent_home = home_for_root(agent_root)
 
     streams: list[Iterable[dict[str, Any]]] = []
-    if selected is None or selected & {"agent", "hermes", "codex", "claude"}:
+    if selected is None or selected & {"agent", "hermes", "codex", "claude"} or any(
+        SERVICE_SOURCE_RE.fullmatch(source) is not None for source in selected
+    ):
         streams.append(read_runtime_logs(agent_root, scope="agent", box=args.box))
     if source_wanted("executor", selected):
         streams.append(read_runtime_logs(executor_root, scope="executor", box=args.box))
@@ -2012,7 +2026,11 @@ def add_query_options(parser: argparse.ArgumentParser, *, default_tail: int | No
     parser.add_argument("--agent-root", required=True, help="read-only agent volume root")
     parser.add_argument("--executor-root", required=True, help="read-only Executor volume root")
     parser.add_argument("--box", required=True, help="box name used in normalized events")
-    parser.add_argument("--source", default="all", help="comma-separated agent,executor,hermes,codex,claude")
+    parser.add_argument(
+        "--source",
+        default="all",
+        help="comma-separated agent,executor,hermes,codex,claude,service-<name>",
+    )
     parser.add_argument("--tail", type=lambda value: positive_int(value), default=default_tail)
     parser.add_argument("--since", default="", help="duration such as 24h or RFC3339 timestamp")
     parser.add_argument("--grep", default="", help="case-insensitive text filter")

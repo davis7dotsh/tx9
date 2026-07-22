@@ -42,7 +42,7 @@ func cmdLogs(args []string) error {
 
 	fs := flag.NewFlagSet("logs", flag.ContinueOnError)
 	opts := logsQueryOptions{}
-	fs.StringVar(&opts.Source, "source", "all", "comma-separated sources: agent,executor,hermes,codex,claude")
+	fs.StringVar(&opts.Source, "source", "all", "comma-separated sources: agent,executor,hermes,codex,claude,service-<name>")
 	fs.IntVar(&opts.Tail, "tail", 200, "show the newest N matching events")
 	fs.StringVar(&opts.Since, "since", "", "only events after a duration or RFC3339 timestamp (for example 24h)")
 	fs.StringVar(&opts.Contains, "grep", "", "only events containing text")
@@ -89,7 +89,7 @@ func cmdLogsExport(args []string) error {
 	fs := flag.NewFlagSet("logs export", flag.ContinueOnError)
 	opts := logsQueryOptions{}
 	output := fs.String("output", "", "output .tar.gz path (default: <box>-logs-<timestamp>.tar.gz)")
-	fs.StringVar(&opts.Source, "source", "all", "comma-separated sources: agent,executor,hermes,codex,claude")
+	fs.StringVar(&opts.Source, "source", "all", "comma-separated sources: agent,executor,hermes,codex,claude,service-<name>")
 	fs.StringVar(&opts.Since, "since", "", "only events after a duration or RFC3339 timestamp (for example 24h)")
 	fs.StringVar(&opts.Contains, "grep", "", "only events containing text")
 	fs.StringVar(&opts.Level, "level", "", "only events at this level or above: debug|info|warn|error (unleveled events count as info)")

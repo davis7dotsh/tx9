@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # Container PID-1 workload (run under docker --init so signals behave).
-# Reuses guest/hb-workload verbatim: it reconciles Executor, the Hermes
-# gateway, and the 0.0.0.0 socat bridges every 20s. tx9-logs supervises the
-# loop process itself; Docker's restart policy supervises the container.
+# Reuses guest/hb-workload verbatim: it reconciles custom services, Executor,
+# the Hermes gateway, and the 0.0.0.0 socat bridges every 20s. tx9-logs
+# supervises the loop process itself; Docker's restart policy supervises the
+# container.
 set -uo pipefail
 
 trap 'exit 143' TERM

@@ -59,6 +59,14 @@ func TestUsageShowsAliasesFromCommandSpecs(t *testing.T) {
 	}
 }
 
+func TestUsageMentionsCustomServiceLogs(t *testing.T) {
+	var usage bytes.Buffer
+	printUsage(&usage)
+	if !strings.Contains(usage.String(), "custom-service events") {
+		t.Fatalf("logs help does not mention custom services:\n%s", usage.String())
+	}
+}
+
 func TestNoArgumentsShowsOverviewAndCommands(t *testing.T) {
 	var stdout, stderr bytes.Buffer
 	status := runWithOverview([]string{"tx9"}, nil, func(w io.Writer) error {

@@ -359,6 +359,92 @@ HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" gateway-enable \
   [[ ! -e "$tmp/up-gateway-started" ]]
 )
 
+# Interactive startup reports a custom-service failure after still starting
+# Executor and Hermes. Resume preserves the same contract via hb up.
+(
+  HB_DATA="$tmp/up-service-failure-data"
+  HOME="$HB_DATA/home/agent"
+  mkdir -p "$HOME"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+
+  calls="$tmp/up-service-failure.calls"
+  init() { mkdir -p "$STATE_DIR"; }
+  _services_reconcile() {
+    echo services >>"$calls"
+    return 1
+  }
+  _executor_up() {
+    echo executor >>"$calls"
+    return 0
+  }
+  _start_gateway() {
+    echo gateway >>"$calls"
+    return 0
+  }
+
+  if up >"$tmp/up-service-failure.stdout" 2>"$tmp/up-service-failure.stderr"; then
+    echo "hb up masked custom-service reconciliation failure" >&2
+    exit 1
+  fi
+  [[ "$(cat "$calls")" == $'services\nexecutor\ngateway' ]]
+  grep -q 'custom service reconciliation failed' "$tmp/up-service-failure.stderr"
+
+  : >"$calls"
+  touch "$QUIESCE_FILE"
+  if resume >"$tmp/resume-service-failure.stdout" 2>"$tmp/resume-service-failure.stderr"; then
+    echo "hb resume masked custom-service reconciliation failure" >&2
+    exit 1
+  fi
+  [[ ! -e "$QUIESCE_FILE" ]]
+  [[ "$(cat "$calls")" == $'services\nexecutor\ngateway' ]]
+  grep -q 'custom service reconciliation failed' "$tmp/resume-service-failure.stderr"
+)
+
+# Custom-service failures are isolated from the first-party lifecycle. Both
+# core reconciliation steps still run, hb reconcile returns their success,
+# and hb-workload is allowed to bring up the Hermes API bridge.
+(
+  HB_DATA="$tmp/service-isolation-data"
+  HOME="$HB_DATA/home/agent"
+  mkdir -p "$HOME/.config/hermes-box" "$tmp/service-isolation-logs"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init() { :; }
+  _services_reconcile() { touch "$tmp/service-isolation-services"; return 1; }
+  _executor_up() { touch "$tmp/service-isolation-executor"; return 0; }
+  _start_gateway() { touch "$tmp/service-isolation-gateway"; return 0; }
+  reconcile >"$tmp/service-isolation.stdout" 2>"$tmp/service-isolation.stderr"
+  [[ -e "$tmp/service-isolation-services" ]]
+  [[ -e "$tmp/service-isolation-executor" ]]
+  [[ -e "$tmp/service-isolation-gateway" ]]
+  grep -q 'continuing core reconciliation' "$tmp/service-isolation.stderr"
+  services() { touch "$tmp/service-isolation-status"; return 0; }
+  if services_reload; then
+    echo "services-reload masked custom reconciliation failure" >&2
+    exit 1
+  fi
+  [[ -e "$tmp/service-isolation-status" ]]
+
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb-workload"
+  PORT=4788
+  HERMES_BRIDGE_PORT=8659
+  LOGS="$tmp/service-isolation-logs"
+  BOX_ENV="$tmp/service-isolation-box.env"
+  LEGACY_QUIESCE_FILE="$tmp/service-isolation-legacy"
+  printf 'EXECUTOR_PORT=4788\nHERMES_API_PORT=8642\n' >"$BOX_ENV"
+  rm -f "$GATEWAY_DISABLED" "$QUIESCE_FILE"
+  hb() { [[ "$1" == reconcile ]] && reconcile; }
+  pgrep() { return 1; }
+  pkill() { :; }
+  _wait_api_ready() { return 0; }
+  socat() { printf '%s\n' "$*" >>"$tmp/service-isolation-bridge"; }
+  reconcile_once
+  wait
+  grep -q 'TCP-LISTEN:8659,' "$tmp/service-isolation-bridge"
+)
+
 # The reconcile loop re-checks Executor every cycle; unchanged reachability
 # must log only on state changes so the durable agent stream is not flooded
 # with one identical line per cycle. Interactive paths always report.
@@ -413,6 +499,27 @@ HB_DATA="$gateway_data" "$PROJECT_ROOT/guest/hb" gateway-enable \
   output="$(INSTALL_HERMES=0 INSTALL_EXECUTOR=0 WIRE_EXECUTOR_MCP=0 doctor)"
   grep -q 'Hermes state check skipped' <<<"$output"
   [[ ! -e "$tmp/hermes-state-called" ]]
+)
+
+# Top-level status links to custom-service detail, while doctor explicitly
+# avoids presenting arbitrary processes as generically health-checkable.
+(
+  HB_DATA="$tmp/services-discoverability-data"
+  HERMES_HOME="$HB_DATA/home/agent/.hermes"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  _port_open() { return 1; }
+  _gateway_running() { return 1; }
+  status >"$tmp/services-discoverability.status"
+  grep -Fq "services: 0 drop-in entries (run 'hb services')" \
+    "$tmp/services-discoverability.status"
+  _check() { return 0; }
+  INSTALL_HERMES=0 INSTALL_EXECUTOR=0 WIRE_EXECUTOR_MCP=0 \
+    doctor >"$tmp/services-discoverability.doctor"
+  grep -Fq "custom services have no generic health contract" \
+    "$tmp/services-discoverability.doctor"
+  grep -Fq "'hb services'" "$tmp/services-discoverability.doctor"
 )
 
 # Doctor validates Codex MCP wiring against the configured Executor port.

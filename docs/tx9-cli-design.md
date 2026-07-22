@@ -52,7 +52,7 @@ Docker overview can be read. `tx9 help` remains Docker-independent.
 | `tx9 backup <box>` (aliases `export`, `save`) | Flags: `--path` (default `~/Downloads`), `--password`/env/prompt, `--no-encrypt`. Quiesce → archive agent /data → validate → (encrypt) → verify → `<box>-<timestamp>.tx9`. |
 | `tx9 import <file.tx9>` (aliases `load`, `restore`) | Flags: `--name`, `--password`/env/prompt. Validate before creating anything; restore staged; arrive quiesced + gateway-disabled + fresh token; fail on name collision. |
 | `tx9 mount <add\|list\|remove> ...` | Persist host-directory bind mounts for an agent and recreate only its disposable container. Targets must be below `/mnt`, outside the portable `/data` volume. `add` supports `--read-only` and `--require-mountpoint`. |
-| `tx9 logs <box>` | Query durable agent, Executor, Hermes, Codex, and Claude events. Filters include source, age, text, severity (`--level`, this level and above; unleveled events count as info), count, and normalized JSONL. `tx9 logs export <box>` creates a mode-0600 portable log bundle from both isolated volumes. |
+| `tx9 logs <box>` | Query durable agent, Executor, Hermes, Codex, Claude, and custom-service events. Filters include source, age, text, severity (`--level`, this level and above; unleveled events count as info), count, and normalized JSONL. Custom sources use `service-<name>`. `tx9 logs export <box>` creates a mode-0600 portable log bundle from both isolated volumes. |
 | `tx9 resources <box>` | Show actual container CPU/RAM limits and volume usage versus advisory budgets. `resources set` updates limits live and persists them; `resources reset` restores 4 CPU/8 GiB (agent) and 2 CPU/2 GiB (Executor). |
 | `tx9 gateway <status\|enable\|disable> <box>` | Inspect or control the container-supervised Hermes gateway. Enable requires `--confirm-single-writer`. |
 | `tx9 open <box>` | Print (or open) the authenticated dashboard URL (`?_token=`). |
@@ -108,6 +108,20 @@ the port:
   SQLite histories. Executor data is never mounted into the agent container.
   This provides complete tx9-owned runtime output, not an independent audit
   trail for operations that Executor does not emit to any durable sink.
+- **Portable custom services**: direct executable regular-file children of
+  `${XDG_CONFIG_HOME:-$HOME/.config}/hermes-box/services.d` are supervised as
+  the agent. Names are limited to `[a-z0-9][a-z0-9_-]{0,62}`. The absolute
+  file path is passed as argv directly, never sourced or evaluated; scripts
+  stay foreground and should `exec` their daemon. Each service has an
+  independent `tx9-logs` capture and bounded restart loop under source
+  `service-<name>`. Runtime PID/lock state stays outside `/data`, while the
+  definitions and logs remain on `/data` and therefore travel in backups.
+  `hb services` reports status and ignored entries; `hb services-reload`
+  reconciles immediately in addition to the normal 20-second loop. Quiesce
+  synchronously stops every custom service and blocks restart until
+  `hb up`/`hb resume`; Hermes gateway enable/disable is independent. Drop-ins
+  run with the agent's ordinary access and are trusted executable code, not a
+  sandbox boundary.
 - **Gateway single-writer**: restored boxes never auto-enable the Hermes
   gateway. `tx9 gateway enable <box> --confirm-single-writer` delegates to
   `hb gateway-enable` and stays the only host-side path.
