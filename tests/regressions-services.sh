@@ -95,6 +95,92 @@ kill -0 "$decoy_pid"
 kill "$decoy_pid"
 wait "$decoy_pid" 2>/dev/null || true
 
+# Stop escalation remains bound to the exact capture and service identities
+# observed before TERM. Reused numeric PIDs/PGIDs are never sent SIGKILL.
+(
+  # shellcheck disable=SC1090
+  source "$services"
+  STATE_DIR="$tmp/reused-stop-runtime"
+  STOP_TIMEOUT=1
+  mkdir -p "$STATE_DIR"
+  touch "$STATE_DIR/reused.state"
+  signal_log="$tmp/reused-stop.signals"
+  capture_reads="$tmp/reused-capture.reads"
+  child_reads="$tmp/reused-child.reads"
+
+  _state_process_matches() {
+    STATE_PID=4242
+    STATE_START=100
+    return 0
+  }
+  _direct_children() { printf '6262\n'; }
+  _pid_alive() { return 0; }
+  _process_start_time() {
+    local pid="$1" reads_file count=0
+    if [[ "$pid" == 4242 ]]; then
+      reads_file="$capture_reads"
+      [[ -f "$reads_file" ]] && count="$(wc -l <"$reads_file")"
+      printf 'read\n' >>"$reads_file"
+      if [[ "$count" == 0 ]]; then printf '100\n'; else printf '200\n'; fi
+      return
+    fi
+    reads_file="$child_reads"
+    [[ -f "$reads_file" ]] && count="$(wc -l <"$reads_file")"
+    printf 'read\n' >>"$reads_file"
+    if ((count < 2)); then printf '300\n'; else printf '400\n'; fi
+  }
+  ps() { printf '6262\n'; }
+  kill() { printf '%s\n' "$*" >>"$signal_log"; }
+  sleep() { :; }
+
+  _stop_one reused "$definitions/reused" >/dev/null
+  grep -Fxq -- '-TERM 4242' "$signal_log"
+  if grep -Fq -- '-KILL' "$signal_log"; then
+    echo "stop sent SIGKILL after capture or service PID identity changed" >&2
+    exit 1
+  fi
+  [[ ! -e "$STATE_DIR/reused.state" ]]
+)
+
+# A genuinely stuck capture and same-identity service group are both
+# escalated. If they survive SIGKILL, stop fails and retains state for retry.
+(
+  # shellcheck disable=SC1090
+  source "$services"
+  STATE_DIR="$tmp/stuck-stop-runtime"
+  STOP_TIMEOUT=0
+  mkdir -p "$STATE_DIR"
+  touch "$STATE_DIR/stuck.state"
+  signal_log="$tmp/stuck-stop.signals"
+
+  _state_process_matches() {
+    STATE_PID=5252
+    STATE_START=500
+    return 0
+  }
+  _direct_children() { printf '7272\n'; }
+  _pid_alive() { return 0; }
+  _process_start_time() {
+    if [[ "$1" == 5252 ]]; then printf '500\n'; else printf '700\n'; fi
+  }
+  ps() { printf '7272\n'; }
+  kill() { printf '%s\n' "$*" >>"$signal_log"; }
+  sleep() { :; }
+
+  if _stop_one stuck "$definitions/stuck" \
+    >"$tmp/stuck-stop.stdout" 2>"$tmp/stuck-stop.stderr"; then
+    echo "stop succeeded after same-identity processes survived SIGKILL" >&2
+    exit 1
+  fi
+  : "$STOP_TIMEOUT" "$STATE_PID" "$STATE_START"
+  grep -Fxq -- '-TERM 5252' "$signal_log"
+  grep -Fxq -- '-KILL -- -7272' "$signal_log"
+  grep -Fxq -- '-KILL 5252' "$signal_log"
+  grep -Fq 'capture survived stop' "$tmp/stuck-stop.stderr"
+  grep -Fq 'process group survived stop' "$tmp/stuck-stop.stderr"
+  [[ -e "$STATE_DIR/stuck.state" ]]
+)
+
 "$services" status >"$tmp/services.status"
 grep -Fq $'healthy\trunning' "$tmp/services.status"
 grep -Fq $'broken\trestarting' "$tmp/services.status"

@@ -183,6 +183,21 @@ _pid_alive() {
   [[ "$state" != Z* ]]
 }
 
+_pid_identity_alive() {
+  local pid="$1" expected_start="$2" current_start
+  _pid_alive "$pid" || return 1
+  current_start="$(_process_start_time "$pid")" || return 1
+  [[ "$current_start" == "$expected_start" ]]
+}
+
+_process_group_identity_alive() {
+  local leader="$1" expected_start="$2" expected_group="$3" current_group
+  _pid_identity_alive "$leader" "$expected_start" || return 1
+  current_group="$(ps -o pgid= -p "$leader" 2>/dev/null)" || return 1
+  current_group="${current_group//[[:space:]]/}"
+  [[ "$current_group" == "$expected_group" ]]
+}
+
 _supervised_child_running() {
   local capture_pid="$1" child start current_start
   local -a children
@@ -203,37 +218,69 @@ _supervised_child_running() {
 }
 
 _stop_one() {
-  local name="$1" definition="$2" attempt failed=0
+  local name="$1" definition="$2" attempt child start group index alive failed=0
   local state_file="$STATE_DIR/$name.state"
   local -a child_groups=()
+  local -a child_starts=()
   if ! _state_process_matches "$state_file" "$name" "$definition"; then
     rm -f "$state_file"
     return 0
   fi
-  mapfile -t child_groups < <(_direct_children "$STATE_PID")
+
+  while IFS= read -r child; do
+    start="$(_process_start_time "$child")" || continue
+    group="$(ps -o pgid= -p "$child" 2>/dev/null)" || continue
+    group="${group//[[:space:]]/}"
+    [[ "$group" == "$child" ]] || continue
+    _process_group_identity_alive "$child" "$start" "$group" || continue
+    child_groups+=("$group")
+    child_starts+=("$start")
+  done < <(_direct_children "$STATE_PID")
+
+  if ! _pid_identity_alive "$STATE_PID" "$STATE_START"; then
+    rm -f "$state_file"
+    return 0
+  fi
   kill -TERM "$STATE_PID" 2>/dev/null || true
   for ((attempt = 0; attempt < STOP_TIMEOUT * 10; attempt++)); do
-    _pid_alive "$STATE_PID" || break
+    alive=0
+    _pid_identity_alive "$STATE_PID" "$STATE_START" && alive=1
+    for ((index = 0; index < ${#child_groups[@]}; index++)); do
+      _process_group_identity_alive \
+        "${child_groups[index]}" "${child_starts[index]}" "${child_groups[index]}" && alive=1
+    done
+    [[ "$alive" == 1 ]] || break
     sleep 0.1
   done
-  if _pid_alive "$STATE_PID"; then
-    local group
-    for group in "${child_groups[@]}"; do
-      kill -KILL -- "-$group" 2>/dev/null || true
-    done
+
+  for ((index = 0; index < ${#child_groups[@]}; index++)); do
+    if _process_group_identity_alive \
+      "${child_groups[index]}" "${child_starts[index]}" "${child_groups[index]}"; then
+      kill -KILL -- "-${child_groups[index]}" 2>/dev/null || true
+    fi
+  done
+  if _pid_identity_alive "$STATE_PID" "$STATE_START"; then
     kill -KILL "$STATE_PID" 2>/dev/null || true
-    for ((attempt = 0; attempt < 20; attempt++)); do
-      _pid_alive "$STATE_PID" || break
-      sleep 0.05
-    done
   fi
-  if _pid_alive "$STATE_PID"; then
+
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    alive=0
+    _pid_identity_alive "$STATE_PID" "$STATE_START" && alive=1
+    for ((index = 0; index < ${#child_groups[@]}; index++)); do
+      _process_group_identity_alive \
+        "${child_groups[index]}" "${child_starts[index]}" "${child_groups[index]}" && alive=1
+    done
+    [[ "$alive" == 1 ]] || break
+    sleep 0.05
+  done
+
+  if _pid_identity_alive "$STATE_PID" "$STATE_START"; then
     echo "tx9-services: $name capture survived stop" >&2
     failed=1
   fi
-  local group
-  for group in "${child_groups[@]}"; do
-    if kill -0 -- "-$group" 2>/dev/null; then
+  for ((index = 0; index < ${#child_groups[@]}; index++)); do
+    if _process_group_identity_alive \
+      "${child_groups[index]}" "${child_starts[index]}" "${child_groups[index]}"; then
       echo "tx9-services: $name process group survived stop" >&2
       failed=1
     fi
