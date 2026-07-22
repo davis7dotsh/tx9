@@ -17,6 +17,7 @@ _safe_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; }
 
 _ensure_dirs() {
   mkdir -p "$DEFINITIONS" "$STATE_DIR" "$LOG_DIR" || return 1
+  LOG_DIR="$(cd -- "$LOG_DIR" && pwd -P)" || return 1
   chmod 0700 "$DEFINITIONS" 2>/dev/null || true
   chmod 0700 "$STATE_DIR" 2>/dev/null || true
 }
@@ -79,12 +80,12 @@ _process_start_time() {
 
 _read_state() {
   local state_file="$1"
-  IFS=$'\t' read -r STATE_PID STATE_START STATE_FINGERPRINT STATE_HELPER STATE_DELAY 2>/dev/null <"$state_file" || return 1
-  [[ "$STATE_PID" =~ ^[1-9][0-9]*$ && "$STATE_START" =~ ^[0-9]+$ && -n "$STATE_FINGERPRINT" && "$STATE_HELPER" == /* && -n "$STATE_DELAY" ]]
+  IFS=$'\t' read -r STATE_PID STATE_START STATE_FINGERPRINT STATE_HELPER STATE_LOG_DIR STATE_DELAY 2>/dev/null <"$state_file" || return 1
+  [[ "$STATE_PID" =~ ^[1-9][0-9]*$ && "$STATE_START" =~ ^[0-9]+$ && -n "$STATE_FINGERPRINT" && "$STATE_HELPER" == /* && "$STATE_LOG_DIR" == /* && -n "$STATE_DELAY" ]]
 }
 
 _capture_argv_matches() {
-  local pid="$1" name="$2" definition="$3" helper="$4" delay="$5" index
+  local pid="$1" name="$2" definition="$3" helper="$4" log_dir="$5" delay="$6" index
   local -a argv expected
   mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || return 1
   ((${#argv[@]} > 0)) || return 1
@@ -96,7 +97,7 @@ _capture_argv_matches() {
     return 1
   fi
   expected=(
-    "$helper" capture --source "service-$name" --log-dir "$LOG_DIR"
+    "$helper" capture --source "service-$name" --log-dir "$log_dir"
     --restart-delay "$delay" -- "$definition"
   )
   ((${#argv[@]} - index == ${#expected[@]})) || return 1
@@ -113,21 +114,23 @@ _state_process_matches() {
   [[ "$current_start" == "$STATE_START" ]] || return 1
   current_uid="$(stat -c '%u' -- "/proc/$STATE_PID" 2>/dev/null)" || return 1
   [[ "$current_uid" == "$(id -u)" ]] || return 1
-  _capture_argv_matches "$STATE_PID" "$name" "$definition" "$STATE_HELPER" "$STATE_DELAY"
+  _capture_argv_matches "$STATE_PID" "$name" "$definition" \
+    "$STATE_HELPER" "$STATE_LOG_DIR" "$STATE_DELAY"
 }
 
 _write_state() {
-  local state_file="$1" pid="$2" start="$3" fingerprint="$4" helper="$5" delay="$6" tmp
+  local state_file="$1" pid="$2" start="$3" fingerprint="$4" helper="$5" log_dir="$6" delay="$7" tmp
   tmp="$state_file.tmp.$$"
   umask 077
-  printf '%s\t%s\t%s\t%s\t%s\n' "$pid" "$start" "$fingerprint" "$helper" "$delay" >"$tmp" || return 1
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$pid" "$start" "$fingerprint" "$helper" "$log_dir" "$delay" >"$tmp" || return 1
   mv "$tmp" "$state_file"
 }
 
 _start_one() {
-  local name="$1" definition="$2" fingerprint="$3" helper pid start attempt state_file
+  local name="$1" definition="$2" fingerprint="$3" helper="$4" pid start attempt state_file
   state_file="$STATE_DIR/$name.state"
-  helper="$(_log_helper)" || return 1
+  [[ -n "$helper" ]] || return 1
   (
     # flock locks are tied to open file descriptions and survive fork. The
     # long-lived capture must never inherit the reconciliation lock.
@@ -141,7 +144,8 @@ _start_one() {
     echo "tx9-services: $name failed before supervision started" >&2
     return 1
   }
-  _write_state "$state_file" "$pid" "$start" "$fingerprint" "$helper" "$RESTART_DELAY" || {
+  _write_state "$state_file" "$pid" "$start" "$fingerprint" \
+    "$helper" "$LOG_DIR" "$RESTART_DELAY" || {
     kill -TERM "$pid" 2>/dev/null || true
     wait "$pid" 2>/dev/null || true
     return 1
@@ -251,7 +255,7 @@ _definition_reason() {
 }
 
 _reconcile_locked() {
-  local path name fingerprint state_file failed=0
+  local path name fingerprint state_file current_helper='' failed=0
   local -A desired=()
   while IFS= read -r -d '' path; do
     name="${path##*/}"
@@ -266,6 +270,10 @@ _reconcile_locked() {
     desired["$name"]="$fingerprint"
   done < <(find "$DEFINITIONS" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
 
+  if ((${#desired[@]} > 0)); then
+    current_helper="$(_log_helper)" || failed=1
+  fi
+
   shopt -s nullglob
   for state_file in "$STATE_DIR"/*.state; do
     name="${state_file##*/}"
@@ -276,7 +284,9 @@ _reconcile_locked() {
       continue
     fi
     if _state_process_matches "$state_file" "$name" "$path" &&
-      _read_state "$state_file" && [[ "$STATE_FINGERPRINT" == "${desired[$name]}" ]]; then
+      [[ "$STATE_FINGERPRINT" == "${desired[$name]}" &&
+        "$STATE_HELPER" == "$current_helper" && "$STATE_LOG_DIR" == "$LOG_DIR" &&
+        "$STATE_DELAY" == "$RESTART_DELAY" ]]; then
       continue
     fi
     _stop_one "$name" "$path" || failed=1
@@ -288,10 +298,12 @@ _reconcile_locked() {
     state_file="$STATE_DIR/$name.state"
     path="$DEFINITIONS/$name"
     if _state_process_matches "$state_file" "$name" "$path" &&
-      _read_state "$state_file" && [[ "$STATE_FINGERPRINT" == "${desired[$name]}" ]]; then
+      [[ "$STATE_FINGERPRINT" == "${desired[$name]}" &&
+        "$STATE_HELPER" == "$current_helper" && "$STATE_LOG_DIR" == "$LOG_DIR" &&
+        "$STATE_DELAY" == "$RESTART_DELAY" ]]; then
       continue
     fi
-    _start_one "$name" "$path" "${desired[$name]}" || failed=1
+    _start_one "$name" "$path" "${desired[$name]}" "$current_helper" || failed=1
   done
   return "$failed"
 }
@@ -326,8 +338,9 @@ stop_all() {
 }
 
 _status_locked() {
-  local path name reason fingerprint state_file rows=0
+  local path name reason fingerprint state_file current_helper rows=0
   local -A seen=()
+  current_helper="$(_log_helper 2>/dev/null || true)"
   printf 'NAME\tSTATUS\tDEFINITION\n'
   while IFS= read -r -d '' path; do
     name="${path##*/}"
@@ -341,7 +354,9 @@ _status_locked() {
     state_file="$STATE_DIR/$name.state"
     fingerprint="$(_definition_fingerprint "$path" 2>/dev/null || true)"
     if _state_process_matches "$state_file" "$name" "$path" && _read_state "$state_file"; then
-      if [[ "$STATE_FINGERPRINT" == "$fingerprint" ]]; then
+      if [[ "$STATE_FINGERPRINT" == "$fingerprint" &&
+        "$STATE_HELPER" == "$current_helper" && "$STATE_LOG_DIR" == "$LOG_DIR" &&
+        "$STATE_DELAY" == "$RESTART_DELAY" ]]; then
         if _supervised_child_running "$STATE_PID"; then
           printf '%s\trunning\t%s\n' "$name" "$path"
         else

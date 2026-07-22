@@ -85,8 +85,9 @@ sleep 30 &
 decoy_pid=$!
 pids+=("$decoy_pid")
 decoy_start="$(awk '{print $22}' "/proc/$decoy_pid/stat")"
-printf '%s\t%s\tstale\t%s\t%s\n' "$decoy_pid" "$decoy_start" \
-  "$TX9_SERVICES_LOG_HELPER" "$TX9_SERVICES_RESTART_DELAY" \
+printf '%s\t%s\tstale\t%s\t%s\t%s\n' "$decoy_pid" "$decoy_start" \
+  "$TX9_SERVICES_LOG_HELPER" "$TX9_SERVICES_LOG_DIR" \
+  "$TX9_SERVICES_RESTART_DELAY" \
   >"$runtime/ghost.state"
 "$services" reconcile >/dev/null 2>&1
 kill -0 "$decoy_pid"
@@ -113,6 +114,99 @@ for _ in 1 2 3 4 5 6 7 8; do
 done
 wait
 [[ "$(wc -l <"$events/healthy.starts" | tr -d ' ')" == 1 ]]
+
+# Runtime logging configuration is part of supervisor identity. Status reports
+# drift in each setting, and reconcile uses the stored settings to stop the old
+# process before starting exactly one replacement with the current settings.
+drift_config="$tmp/drift-config"
+drift_definitions="$drift_config/services.d"
+drift_runtime="$tmp/drift-runtime"
+drift_logs_a="$tmp/drift-logs-a"
+drift_logs_b="$tmp/drift-logs-b"
+drift_events="$tmp/drift-events"
+drift_helper_b="$tmp/tx9-logs-b"
+mkdir -p "$drift_definitions" "$drift_runtime" "$drift_logs_a" \
+  "$drift_logs_b" "$drift_events"
+cp "$PROJECT_ROOT/guest/tx9-logs" "$drift_helper_b"
+chmod 0700 "$drift_helper_b"
+cat >"$drift_definitions/drift" <<'EOF'
+#!/usr/bin/env bash
+printf 'start %s\n' "$$" >>"$SERVICE_DRIFT_EVENTS/starts"
+printf 'drift-log %s\n' "$$"
+trap 'printf "term %s\n" "$$" >>"$SERVICE_DRIFT_EVENTS/terms"; exit 0' TERM INT
+while :; do sleep 1; done
+EOF
+chmod 0700 "$drift_definitions/drift"
+
+drift_services() {
+  local log_dir="$1" helper="$2" delay="$3"
+  shift 3
+  env SERVICE_DRIFT_EVENTS="$drift_events" \
+    TX9_SERVICES_CONFIG_ROOT="$drift_config" \
+    TX9_SERVICES_STATE_DIR="$drift_runtime" \
+    TX9_SERVICES_LOG_DIR="$log_dir" \
+    TX9_SERVICES_LOG_HELPER="$helper" \
+    TX9_SERVICES_RESTART_DELAY="$delay" \
+    TX9_SERVICES_STOP_TIMEOUT=2 \
+    "$services" "$@"
+}
+
+drift_services "$drift_logs_a" "$PROJECT_ROOT/guest/tx9-logs" 0.2 reconcile >/dev/null
+wait_for_count 1 "$drift_events/starts"
+IFS=$'\t' read -r old_capture _old_start _old_fingerprint old_helper \
+  old_log_dir old_delay <"$drift_runtime/drift.state"
+pids+=("$old_capture")
+[[ "$old_helper" == "$PROJECT_ROOT/guest/tx9-logs" ]]
+[[ "$old_log_dir" == "$drift_logs_a" ]]
+[[ "$old_delay" == 0.2 ]]
+
+drift_services "$drift_logs_b" "$PROJECT_ROOT/guest/tx9-logs" 0.2 status \
+  >"$tmp/drift-log-dir.status"
+grep -Fq $'drift\treload pending' "$tmp/drift-log-dir.status"
+drift_services "$drift_logs_a" "$drift_helper_b" 0.2 status \
+  >"$tmp/drift-helper.status"
+grep -Fq $'drift\treload pending' "$tmp/drift-helper.status"
+drift_services "$drift_logs_a" "$PROJECT_ROOT/guest/tx9-logs" 0.7 status \
+  >"$tmp/drift-delay.status"
+grep -Fq $'drift\treload pending' "$tmp/drift-delay.status"
+
+drift_services "$drift_logs_b" "$drift_helper_b" 0.7 reconcile >/dev/null
+wait_for_count 1 "$drift_events/terms"
+wait_for_count 2 "$drift_events/starts"
+wait_for_pattern drift-log "$drift_logs_b/service-drift.jsonl"
+IFS=$'\t' read -r new_capture _new_start _new_fingerprint new_helper \
+  new_log_dir new_delay <"$drift_runtime/drift.state"
+pids+=("$new_capture")
+[[ "$new_capture" != "$old_capture" ]]
+[[ "$new_helper" == "$drift_helper_b" ]]
+[[ "$new_log_dir" == "$drift_logs_b" ]]
+[[ "$new_delay" == 0.7 ]]
+old_service="$(awk 'NR == 1 { print $2 }' "$drift_events/starts")"
+new_service="$(awk 'NR == 2 { print $2 }' "$drift_events/starts")"
+for _ in {1..100}; do
+  if ! kill -0 "$old_capture" 2>/dev/null ||
+    [[ "$(ps -o stat= -p "$old_capture" 2>/dev/null)" == Z* ]]; then
+    break
+  fi
+  sleep 0.02
+done
+if kill -0 "$old_capture" 2>/dev/null &&
+  [[ "$(ps -o stat= -p "$old_capture" 2>/dev/null)" != Z* ]]; then
+  echo "old service supervisor survived runtime-config reconciliation" >&2
+  exit 1
+fi
+if kill -0 "$old_service" 2>/dev/null &&
+  [[ "$(ps -o stat= -p "$old_service" 2>/dev/null)" != Z* ]]; then
+  echo "old custom service survived runtime-config reconciliation" >&2
+  exit 1
+fi
+kill -0 "$new_capture"
+kill -0 "$new_service"
+[[ "$(wc -l <"$drift_events/starts" | tr -d ' ')" == 2 ]]
+[[ "$(wc -l <"$drift_events/terms" | tr -d ' ')" == 1 ]]
+drift_services "$drift_logs_b" "$drift_helper_b" 0.7 stop-all >/dev/null
+wait_for_count 2 "$drift_events/terms"
+wait_for_absent "$drift_runtime/drift.state"
 
 # Definition identity includes the content digest, not just whole-second stat
 # metadata. Rewrite a same-size script in place, restore its original mtime,
