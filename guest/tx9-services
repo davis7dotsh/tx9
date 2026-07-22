@@ -302,7 +302,7 @@ _definition_reason() {
 }
 
 _reconcile_locked() {
-  local path name fingerprint state_file current_helper='' failed=0
+  local path name fingerprint state_file current_helper='' helper_available=1 failed=0
   local -A desired=()
   while IFS= read -r -d '' path; do
     name="${path##*/}"
@@ -318,7 +318,10 @@ _reconcile_locked() {
   done < <(find "$DEFINITIONS" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
 
   if ((${#desired[@]} > 0)); then
-    current_helper="$(_log_helper)" || failed=1
+    if ! current_helper="$(_log_helper)"; then
+      helper_available=0
+      failed=1
+    fi
   fi
 
   shopt -s nullglob
@@ -330,6 +333,10 @@ _reconcile_locked() {
       _stop_one "$name" "$path" || failed=1
       continue
     fi
+    # A helper is required to replace a configured supervisor. Preserve the
+    # existing launch when helper resolution is transiently unavailable;
+    # otherwise stopping it here would turn a recoverable error into downtime.
+    [[ "$helper_available" == 1 ]] || continue
     if _state_process_matches "$state_file" "$name" "$path" &&
       [[ "$STATE_FINGERPRINT" == "${desired[$name]}" &&
         "$STATE_HELPER" == "$current_helper" && "$STATE_LOG_DIR" == "$LOG_DIR" &&
@@ -344,6 +351,7 @@ _reconcile_locked() {
   for name in "${!desired[@]}"; do
     state_file="$STATE_DIR/$name.state"
     path="$DEFINITIONS/$name"
+    [[ "$helper_available" == 1 ]] || continue
     if _state_process_matches "$state_file" "$name" "$path" &&
       [[ "$STATE_FINGERPRINT" == "${desired[$name]}" &&
         "$STATE_HELPER" == "$current_helper" && "$STATE_LOG_DIR" == "$LOG_DIR" &&

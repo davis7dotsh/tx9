@@ -201,6 +201,84 @@ done
 wait
 [[ "$(wc -l <"$events/healthy.starts" | tr -d ' ')" == 1 ]]
 
+# A transiently missing current helper cannot replace configured services, so
+# reconcile fails without stopping or duplicating their existing supervisors.
+# Removed definitions and explicit stop-all still use stored identity to stop.
+helper_failure_config="$tmp/helper-failure-config"
+helper_failure_definitions="$helper_failure_config/services.d"
+helper_failure_runtime="$tmp/helper-failure-runtime"
+helper_failure_logs="$tmp/helper-failure-logs"
+helper_failure_events="$tmp/helper-failure-events"
+missing_helper="$tmp/missing-tx9-logs"
+mkdir -p "$helper_failure_definitions" "$helper_failure_runtime" \
+  "$helper_failure_logs" "$helper_failure_events"
+cat >"$helper_failure_definitions/keep" <<'EOF'
+#!/usr/bin/env bash
+name="${0##*/}"
+printf 'start %s\n' "$$" >>"$HELPER_FAILURE_EVENTS/$name.starts"
+trap 'printf "term %s\n" "$$" >>"$HELPER_FAILURE_EVENTS/$name.terms"; exit 0' TERM INT
+while :; do sleep 1; done
+EOF
+cp "$helper_failure_definitions/keep" "$helper_failure_definitions/remove"
+chmod 0700 "$helper_failure_definitions/keep" "$helper_failure_definitions/remove"
+
+helper_failure_services() {
+  local helper="$1"
+  shift
+  env HELPER_FAILURE_EVENTS="$helper_failure_events" \
+    TX9_SERVICES_CONFIG_ROOT="$helper_failure_config" \
+    TX9_SERVICES_STATE_DIR="$helper_failure_runtime" \
+    TX9_SERVICES_LOG_DIR="$helper_failure_logs" \
+    TX9_SERVICES_LOG_HELPER="$helper" \
+    TX9_SERVICES_RESTART_DELAY=0.2 \
+    TX9_SERVICES_STOP_TIMEOUT=2 \
+    "$services" "$@"
+}
+
+helper_failure_services "$PROJECT_ROOT/guest/tx9-logs" reconcile >/dev/null
+wait_for_count 1 "$helper_failure_events/keep.starts"
+wait_for_count 1 "$helper_failure_events/remove.starts"
+keep_state="$(cat "$helper_failure_runtime/keep.state")"
+remove_state="$(cat "$helper_failure_runtime/remove.state")"
+keep_capture="${keep_state%%$'\t'*}"
+remove_capture="${remove_state%%$'\t'*}"
+keep_child="$(awk 'NR == 1 { print $2 }' "$helper_failure_events/keep.starts")"
+remove_child="$(awk 'NR == 1 { print $2 }' "$helper_failure_events/remove.starts")"
+pids+=("$keep_capture" "$remove_capture")
+
+if helper_failure_services "$missing_helper" reconcile \
+  >"$tmp/helper-failure.stdout" 2>"$tmp/helper-failure.stderr"; then
+  echo "reconcile succeeded without an available log helper" >&2
+  exit 1
+fi
+grep -Fq 'tx9-logs is unavailable' "$tmp/helper-failure.stderr"
+[[ "$(cat "$helper_failure_runtime/keep.state")" == "$keep_state" ]]
+[[ "$(cat "$helper_failure_runtime/remove.state")" == "$remove_state" ]]
+kill -0 "$keep_capture"
+kill -0 "$remove_capture"
+kill -0 "$keep_child"
+kill -0 "$remove_child"
+[[ "$(wc -l <"$helper_failure_events/keep.starts" | tr -d ' ')" == 1 ]]
+[[ "$(wc -l <"$helper_failure_events/remove.starts" | tr -d ' ')" == 1 ]]
+[[ ! -e "$helper_failure_events/keep.terms" ]]
+[[ ! -e "$helper_failure_events/remove.terms" ]]
+
+rm -f "$helper_failure_definitions/remove"
+if helper_failure_services "$missing_helper" reconcile >/dev/null 2>&1; then
+  echo "reconcile masked helper failure after removing a definition" >&2
+  exit 1
+fi
+wait_for_absent "$helper_failure_runtime/remove.state"
+wait_for_count 1 "$helper_failure_events/remove.terms"
+[[ "$(cat "$helper_failure_runtime/keep.state")" == "$keep_state" ]]
+kill -0 "$keep_capture"
+kill -0 "$keep_child"
+[[ "$(wc -l <"$helper_failure_events/keep.starts" | tr -d ' ')" == 1 ]]
+
+helper_failure_services "$missing_helper" stop-all >/dev/null
+wait_for_absent "$helper_failure_runtime/keep.state"
+wait_for_count 1 "$helper_failure_events/keep.terms"
+
 # Runtime logging configuration is part of supervisor identity. Status reports
 # drift in each setting, and reconcile uses the stored settings to stop the old
 # process before starting exactly one replacement with the current settings.
