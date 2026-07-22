@@ -473,17 +473,21 @@ after_early="$(wc -l <"$events/broken.starts" | tr -d ' ')"
 wait_for_count $((before + 1)) "$events/broken.starts"
 [[ "$(wc -l <"$events/healthy.starts" | tr -d ' ')" == 1 ]]
 
-# Each custom source is independently queryable, and `all` includes it.
+# Each custom source is independently queryable, and `all` includes it. The
+# crash-looping broken service floods the shared stream, so the all-source
+# check filters before the tail; an unfiltered tail legitimately evicts old
+# events. Assertions aggregate the stream: a matching record must exist even
+# when later records differ.
 wait_for_pattern healthy-log "$logs/service-healthy.jsonl"
 "$PROJECT_ROOT/guest/tx9-logs" query --agent-root "$data" \
   --executor-root "$tmp/empty-executor" --box fixture --source service-healthy \
   --tail 100 --json >"$tmp/service-query.jsonl"
-jq -e 'select(.source == "service-healthy" and .message == "healthy-log")' \
+jq -se 'any(.[]; .source == "service-healthy" and .message == "healthy-log")' \
   "$tmp/service-query.jsonl" >/dev/null
 "$PROJECT_ROOT/guest/tx9-logs" query --agent-root "$data" \
   --executor-root "$tmp/empty-executor" --box fixture --source all \
-  --tail 100 --json >"$tmp/all-query.jsonl"
-jq -e 'select(.source == "service-healthy" and .message == "healthy-log")' \
+  --grep healthy-log --tail 100 --json >"$tmp/all-query.jsonl"
+jq -se 'any(.[]; .source == "service-healthy" and .message == "healthy-log")' \
   "$tmp/all-query.jsonl" >/dev/null
 
 # Removing execute permission removes the desired service and synchronously
