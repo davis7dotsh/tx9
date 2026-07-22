@@ -12,6 +12,7 @@ import argparse
 import base64
 import ctypes
 import datetime as dt
+import errno
 import hashlib
 import heapq
 import io
@@ -516,6 +517,14 @@ def nonnegative_float(value: str) -> float:
     return parsed
 
 
+def write_exec_failure(status_fd: int, stage: str, error: int) -> None:
+    payload = f"{stage}:{error}\n".encode("ascii")
+    try:
+        os.write(status_fd, payload)
+    except OSError:
+        pass
+
+
 def parent_death_exec(arguments: Sequence[str]) -> int:
     """Arm Linux parent-death SIGKILL, close the setup race, then exec.
 
@@ -524,35 +533,40 @@ def parent_death_exec(arguments: Sequence[str]) -> int:
     outside this guarantee.
     """
 
-    if len(arguments) < 3 or arguments[1] != "--":
+    if len(arguments) < 4 or arguments[2] != "--":
         print("tx9-logs: invalid internal parent-death invocation", file=sys.stderr)
         return 126
     try:
         expected_parent = positive_int(arguments[0])
+        status_fd = positive_int(arguments[1])
     except argparse.ArgumentTypeError as exc:
-        print(f"tx9-logs: invalid internal parent pid: {exc}", file=sys.stderr)
+        print(f"tx9-logs: invalid internal parent-death argument: {exc}", file=sys.stderr)
         return 126
-    command = list(arguments[2:])
+    command = list(arguments[3:])
     if not command:
         print("tx9-logs: internal parent-death exec requires a command", file=sys.stderr)
         return 126
 
-    libc = ctypes.CDLL(None, use_errno=True)
-    prctl = libc.prctl
-    prctl.argtypes = [
-        ctypes.c_int,
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-        ctypes.c_ulong,
-    ]
-    prctl.restype = ctypes.c_int
-    if prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
-        error = ctypes.get_errno()
-        print(
-            f"tx9-logs: could not arm parent-death signal: {os.strerror(error)}",
-            file=sys.stderr,
-        )
+    try:
+        # Popen clears CLOEXEC for pass_fds so this fresh interpreter can
+        # report setup/exec errors. Restore it before the target exec: EOF on
+        # the parent end is then the unambiguous success handshake.
+        os.set_inheritable(status_fd, False)
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        prctl.restype = ctypes.c_int
+        if prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+    except OSError as exc:
+        write_exec_failure(status_fd, "setup", exc.errno or 0)
         return 126
 
     # PR_SET_PDEATHSIG is not retroactive. If capture died between Popen's
@@ -564,7 +578,7 @@ def parent_death_exec(arguments: Sequence[str]) -> int:
     try:
         os.execvpe(command[0], command, os.environ)
     except OSError as exc:
-        print(f"tx9-logs: could not exec {Path(command[0]).name}: {exc}", file=sys.stderr)
+        write_exec_failure(status_fd, "exec", exc.errno or 0)
         return 127 if isinstance(exc, FileNotFoundError) else 126
 
 
@@ -1087,59 +1101,119 @@ class Capture:
         # subprocess.preexec_fn, whose Python callback is unsafe around the
         # reader threads used by capture. Popen creates the new session first;
         # the fresh interpreter then arms parent death and execs the command.
-        launch_command = [
-            sys.executable,
-            str(Path(__file__).resolve()),
-            PARENT_DEATH_EXEC_ACTION,
-            str(os.getpid()),
-            "--",
-            *command,
-        ]
+        status_read_fd = -1
+        status_write_fd = -1
+        reader_stop = threading.Event()
+        reader_cancelled = threading.Event()
+        readers: list[threading.Thread] = []
         try:
+            status_read_fd, status_write_fd = os.pipe()
+            launch_command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                PARENT_DEATH_EXEC_ACTION,
+                str(os.getpid()),
+                str(status_write_fd),
+                "--",
+                *command,
+            ]
             child = subprocess.Popen(
                 launch_command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=child_env,
                 start_new_session=True,
-                pass_fds=(self.mirror_out, self.mirror_err),
+                pass_fds=(self.mirror_out, self.mirror_err, status_write_fd),
             )
             self.child = child
             self.active_pgid = child.pid
+            os.close(status_write_fd)
+            status_write_fd = -1
+            assert self.child.stdout is not None
+            assert self.child.stderr is not None
+            readers = [
+                threading.Thread(
+                    target=self._reader,
+                    args=("stdout", self.child.stdout, reader_stop, reader_cancelled),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=self._reader,
+                    args=("stderr", self.child.stderr, reader_stop, reader_cancelled),
+                    daemon=True,
+                ),
+            ]
+            for reader in readers:
+                reader.start()
             # A signal can arrive after Popen creates the process group but
             # before the assignment above. Honor it before waiting so that
             # startup cannot lose Docker's shutdown request.
             if self.received_signal is not None:
                 self._forward_signal(self.received_signal, None)
+            read_fd = status_read_fd
+            status_read_fd = -1
+            with os.fdopen(read_fd, "rb", buffering=0) as status_pipe:
+                exec_status = status_pipe.read(128)
         except OSError as exc:
+            if status_read_fd >= 0:
+                os.close(status_read_fd)
+            if status_write_fd >= 0:
+                os.close(status_write_fd)
+            if self.child is not None:
+                self._signal_process_group(signal.SIGKILL)
+                self.child.wait()
+            reader_stop.set()
+            for reader in readers:
+                reader.join()
+            if reader_cancelled.is_set():
+                self._signal_process_group(signal.SIGKILL)
+            self.active_pgid = None
+            self.child = None
+            self.flush_repeats()
             message = f"could not start {Path(command[0]).name}: {exc}"
             self.output("stderr", (message + "\n").encode())
             self.structured("process_start_failed", message)
-            return 127 if isinstance(exc, FileNotFoundError) else 126
+            status = 127 if isinstance(exc, FileNotFoundError) else 126
+            if self.received_signal is not None:
+                return 128 + self.received_signal
+            return status
+
+        if exec_status:
+            try:
+                stage, error_text = exec_status.decode("ascii").strip().split(":", 1)
+                error = int(error_text)
+                if stage not in {"setup", "exec"} or error < 0:
+                    raise ValueError
+            except (UnicodeDecodeError, ValueError):
+                stage = "setup"
+                error = 0
+            self.child.wait()
+            reader_stop.set()
+            for reader in readers:
+                reader.join()
+            if reader_cancelled.is_set():
+                self._signal_process_group(signal.SIGKILL)
+            self.active_pgid = None
+            self.child = None
+            self.flush_repeats()
+            if stage == "exec":
+                detail = OSError(error, os.strerror(error), command[0])
+                status = 127 if error == errno.ENOENT else 126
+            else:
+                detail = OSError(error, os.strerror(error))
+                status = 126
+            message = f"could not start {Path(command[0]).name}: {detail}"
+            self.output("stderr", (message + "\n").encode())
+            self.structured("process_start_failed", message)
+            if self.received_signal is not None:
+                return 128 + self.received_signal
+            return status
 
         self.structured(
             "process_start",
             f"{Path(command[0]).name} started",
             {"pid": self.child.pid, "command": Path(command[0]).name},
         )
-        assert self.child.stdout is not None
-        assert self.child.stderr is not None
-        reader_stop = threading.Event()
-        reader_cancelled = threading.Event()
-        readers = [
-            threading.Thread(
-                target=self._reader,
-                args=("stdout", self.child.stdout, reader_stop, reader_cancelled),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=self._reader,
-                args=("stderr", self.child.stderr, reader_stop, reader_cancelled),
-                daemon=True,
-            ),
-        ]
-        for reader in readers:
-            reader.start()
         return_code = self.child.wait()
         # The direct child owns the capture lifecycle. Stop background
         # descendants in its process group, then let readers drain buffered

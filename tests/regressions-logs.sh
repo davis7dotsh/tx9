@@ -51,6 +51,80 @@ args = parser.parse_args(["capture", "--source", "agent", "--", "true"])
 assert args.restart_delay is None
 PY
 
+# The parent-death re-exec shim preserves Popen's lifecycle contract: actual
+# exec failures are process_start_failed events, never successful starts.
+start_failure_root="$tmp/start-failures"
+mkdir -p "$start_failure_root"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$start_failure_root/non-executable"
+chmod 0600 "$start_failure_root/non-executable"
+printf '#!/definitely/missing/tx9-interpreter\nexit 0\n' \
+  >"$start_failure_root/bad-shebang"
+chmod 0700 "$start_failure_root/bad-shebang"
+
+assert_start_failed() {
+  local label="$1" expected_status="$2" status log_dir
+  shift 2
+  log_dir="$start_failure_root/$label-logs"
+  set +e
+  "$helper" capture --source agent --log-dir "$log_dir" -- "$@" \
+    >"$start_failure_root/$label.stdout" 2>"$start_failure_root/$label.stderr"
+  status=$?
+  set -e
+  [[ "$status" == "$expected_status" ]]
+  jq -e 'select(.type == "process_start_failed")' "$log_dir/agent.jsonl" >/dev/null
+  if jq -e 'select(.type == "process_start")' "$log_dir/agent.jsonl" >/dev/null; then
+    echo "$label exec failure was reported as a successful process start" >&2
+    exit 1
+  fi
+}
+
+assert_start_failed missing 127 tx9-definitely-missing-command
+assert_start_failed non-executable 126 "$start_failure_root/non-executable"
+assert_start_failed bad-shebang 127 "$start_failure_root/bad-shebang"
+
+# The shim can emit more than a pipe buffer before exec (for example Python's
+# verbose import trace). Readers must drain concurrently with the handshake.
+verbose_start_dir="$start_failure_root/verbose-start-logs"
+if ! timeout 15 env PYTHONVERBOSE=2 \
+  "$helper" capture --source agent --log-dir "$verbose_start_dir" -- true \
+  >"$start_failure_root/verbose-start.stdout" \
+  2>"$start_failure_root/verbose-start.stderr"; then
+  echo "capture deadlocked while the exec shim filled stderr" >&2
+  exit 1
+fi
+jq -e 'select(.type == "process_start")' "$verbose_start_dir/agent.jsonl" >/dev/null
+jq -e 'select(.type == "process_exit" and .data.status == 0)' \
+  "$verbose_start_dir/agent.jsonl" >/dev/null
+
+# A signal received while startup is resolving overrides an exec failure's
+# 126/127 status just as it overrides a normal child exit.
+python3 - "$helper" "$start_failure_root/signal-override-logs" \
+  >"$start_failure_root/signal-override.stdout" \
+  2>"$start_failure_root/signal-override.stderr" <<'PY'
+import importlib.machinery
+import importlib.util
+import pathlib
+import signal
+import sys
+
+loader = importlib.machinery.SourceFileLoader("tx9_logs_signal_override", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+capture = module.Capture("agent", pathlib.Path(sys.argv[2]), 1024 * 1024, 2)
+capture.received_signal = signal.SIGTERM
+# Preserve the already-recorded signal without killing the short-lived shim,
+# making the exec-failure branch deterministic.
+capture._forward_signal = lambda _signum, _frame: None
+try:
+    assert capture.run_once(["tx9-definitely-missing-on-signal"]) == 143
+finally:
+    capture.close()
+PY
+jq -e 'select(.type == "process_start_failed")' \
+  "$start_failure_root/signal-override-logs/agent.jsonl" >/dev/null
+
 # Source reads stop at the first unterminated snapshot boundary instead of
 # reframing bytes appended during the query as a separate record. A record that
 # exactly fills the byte budget is retained; only a larger record is oversized.
