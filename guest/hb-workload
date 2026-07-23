@@ -17,6 +17,8 @@ EXECUTOR_TARGET_PORT="${EXECUTOR_PORT:-4788}"
 HERMES_TARGET_PORT="${HERMES_API_PORT:-8642}"
 LOGS="${HB_WORKLOAD_LOGS:-/data/logs}"
 BOX_ENV="${HB_BOX_ENV:-/etc/hermes-box.env}"
+SERVICES_HELPER="${HB_SERVICES_HELPER:-$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/tx9-services}"
+WORKLOAD_SLEEP_PID=''
 
 _exec_up() { (exec 3<>"/dev/tcp/127.0.0.1/$EXECUTOR_TARGET_PORT") 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
 _api_up() { (exec 3<>"/dev/tcp/127.0.0.1/$HERMES_TARGET_PORT") 2>/dev/null && { exec 3>&-; return 0; }; return 1; }
@@ -54,6 +56,22 @@ _spawn_logged() {
   fi
 }
 
+_stop_custom_services() {
+  [[ -x "$SERVICES_HELPER" ]] || return 0
+  TX9_SERVICES_CONFIG_ROOT="$(dirname "$QUIESCE_FILE")" \
+    TX9_SERVICES_LOG_DIR="$LOGS" "$SERVICES_HELPER" stop-all
+}
+
+_shutdown() {
+  local exit_status="$1"
+  trap - TERM INT
+  [[ -z "$WORKLOAD_SLEEP_PID" ]] || kill -TERM "$WORKLOAD_SLEEP_PID" 2>/dev/null || true
+  _stop_custom_services || echo "custom service shutdown failed during workload termination" >&2
+  _stop_executor_bridge
+  _stop_api_bridge
+  exit "$exit_status"
+}
+
 _gateway_reload_pending() {
   [ -d "$GATEWAY_RELOAD_REQUESTS" ] &&
     [ -n "$(find "$GATEWAY_RELOAD_REQUESTS" -maxdepth 1 -type f -name 'request.*' -print -quit)" ]
@@ -89,6 +107,10 @@ reconcile_once() {
     return
   fi
   if [ -e "$QUIESCE_FILE" ] || [ -e "$LEGACY_QUIESCE_FILE" ]; then
+    # Reconciliation while quiesced is a stop-only operation for portable
+    # custom services. Explicit hb pause performs the synchronous gate; this
+    # also covers a durable marker restored or created between loop cycles.
+    _stop_custom_services || echo "custom service shutdown reconciliation failed" >&2
     _stop_executor_bridge
     _stop_api_bridge
     return
@@ -121,11 +143,19 @@ reconcile_once() {
 }
 
 main() {
+  # Install lifecycle traps only for the executed workload. Regression tests
+  # source this file to exercise reconcile_once and must retain their own
+  # process-level trap policy.
+  trap '_shutdown 143' TERM
+  trap '_shutdown 130' INT
   mkdir -p "$LOGS"
   while true; do
     reconcile_once
     [[ "${HB_WORKLOAD_ONCE:-0}" != 1 ]] || break
-    sleep 20
+    sleep 20 &
+    WORKLOAD_SLEEP_PID=$!
+    wait "$WORKLOAD_SLEEP_PID" 2>/dev/null || true
+    WORKLOAD_SLEEP_PID=''
   done
 }
 

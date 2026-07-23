@@ -51,6 +51,80 @@ args = parser.parse_args(["capture", "--source", "agent", "--", "true"])
 assert args.restart_delay is None
 PY
 
+# The parent-death re-exec shim preserves Popen's lifecycle contract: actual
+# exec failures are process_start_failed events, never successful starts.
+start_failure_root="$tmp/start-failures"
+mkdir -p "$start_failure_root"
+printf '#!/usr/bin/env bash\nexit 0\n' >"$start_failure_root/non-executable"
+chmod 0600 "$start_failure_root/non-executable"
+printf '#!/definitely/missing/tx9-interpreter\nexit 0\n' \
+  >"$start_failure_root/bad-shebang"
+chmod 0700 "$start_failure_root/bad-shebang"
+
+assert_start_failed() {
+  local label="$1" expected_status="$2" status log_dir
+  shift 2
+  log_dir="$start_failure_root/$label-logs"
+  set +e
+  "$helper" capture --source agent --log-dir "$log_dir" -- "$@" \
+    >"$start_failure_root/$label.stdout" 2>"$start_failure_root/$label.stderr"
+  status=$?
+  set -e
+  [[ "$status" == "$expected_status" ]]
+  jq -e 'select(.type == "process_start_failed")' "$log_dir/agent.jsonl" >/dev/null
+  if jq -e 'select(.type == "process_start")' "$log_dir/agent.jsonl" >/dev/null; then
+    echo "$label exec failure was reported as a successful process start" >&2
+    exit 1
+  fi
+}
+
+assert_start_failed missing 127 tx9-definitely-missing-command
+assert_start_failed non-executable 126 "$start_failure_root/non-executable"
+assert_start_failed bad-shebang 127 "$start_failure_root/bad-shebang"
+
+# The shim can emit more than a pipe buffer before exec (for example Python's
+# verbose import trace). Readers must drain concurrently with the handshake.
+verbose_start_dir="$start_failure_root/verbose-start-logs"
+if ! timeout 15 env PYTHONVERBOSE=2 \
+  "$helper" capture --source agent --log-dir "$verbose_start_dir" -- true \
+  >"$start_failure_root/verbose-start.stdout" \
+  2>"$start_failure_root/verbose-start.stderr"; then
+  echo "capture deadlocked while the exec shim filled stderr" >&2
+  exit 1
+fi
+jq -e 'select(.type == "process_start")' "$verbose_start_dir/agent.jsonl" >/dev/null
+jq -e 'select(.type == "process_exit" and .data.status == 0)' \
+  "$verbose_start_dir/agent.jsonl" >/dev/null
+
+# A signal received while startup is resolving overrides an exec failure's
+# 126/127 status just as it overrides a normal child exit.
+python3 - "$helper" "$start_failure_root/signal-override-logs" \
+  >"$start_failure_root/signal-override.stdout" \
+  2>"$start_failure_root/signal-override.stderr" <<'PY'
+import importlib.machinery
+import importlib.util
+import pathlib
+import signal
+import sys
+
+loader = importlib.machinery.SourceFileLoader("tx9_logs_signal_override", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+capture = module.Capture("agent", pathlib.Path(sys.argv[2]), 1024 * 1024, 2)
+capture.received_signal = signal.SIGTERM
+# Preserve the already-recorded signal without killing the short-lived shim,
+# making the exec-failure branch deterministic.
+capture._forward_signal = lambda _signum, _frame: None
+try:
+    assert capture.run_once(["tx9-definitely-missing-on-signal"]) == 143
+finally:
+    capture.close()
+PY
+jq -e 'select(.type == "process_start_failed")' \
+  "$start_failure_root/signal-override-logs/agent.jsonl" >/dev/null
+
 # Source reads stop at the first unterminated snapshot boundary instead of
 # reframing bytes appended during the query as a separate record. A record that
 # exactly fills the byte budget is retained; only a larger record is oversized.
@@ -277,6 +351,38 @@ wait "$capture_pid"
 signal_status=$?
 set -e
 [[ "$signal_status" == 143 ]]
+
+# Capture arms its direct foreground child with a Linux parent-death SIGKILL.
+# Abrupt wrapper death therefore cannot leave the supported command orphaned.
+pdeath_dir="$tmp/parent-death"
+pdeath_pid_file="$tmp/parent-death.pid"
+PDEATH_PID_FILE="$pdeath_pid_file" \
+  "$helper" capture --source agent --log-dir "$pdeath_dir" -- \
+    python3 -c 'import os, pathlib, signal; pathlib.Path(os.environ["PDEATH_PID_FILE"]).write_text(str(os.getpid())); signal.pause()' \
+    >/dev/null 2>&1 &
+pdeath_capture_pid=$!
+pids+=("$pdeath_capture_pid")
+wait_for_file "$pdeath_pid_file"
+pdeath_child_pid="$(cat "$pdeath_pid_file")"
+kill -0 "$pdeath_child_pid"
+kill -KILL "$pdeath_capture_pid"
+set +e
+wait "$pdeath_capture_pid" 2>/dev/null
+pdeath_capture_status=$?
+set -e
+[[ "$pdeath_capture_status" == 137 ]]
+for _ in {1..150}; do
+  if ! kill -0 "$pdeath_child_pid" 2>/dev/null ||
+    [[ "$(ps -o stat= -p "$pdeath_child_pid" 2>/dev/null)" == Z* ]]; then
+    break
+  fi
+  sleep 0.02
+done
+if kill -0 "$pdeath_child_pid" 2>/dev/null &&
+  [[ "$(ps -o stat= -p "$pdeath_child_pid" 2>/dev/null)" != Z* ]]; then
+  echo "captured foreground child survived SIGKILL of its wrapper" >&2
+  exit 1
+fi
 
 # Internal cleanup gives a same-group descendant a bounded TERM grace before
 # cancellation/escalation, so normal shutdown handlers can flush state.

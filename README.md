@@ -72,6 +72,8 @@ Inside the agent container:
 hb status / hb doctor / hb versions
 hb down            # durable pause; the reconcile loop won't restart services
 hb up
+hb services        # status for portable custom service drop-ins
+hb services-reload # reconcile custom services immediately
 hb gateway-enable --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY
 hb gateway-disable
 hb verify-state
@@ -86,6 +88,54 @@ tx9 gateway status <box>
 tx9 gateway enable <box> --confirm-single-writer
 tx9 gateway disable <box>
 ```
+
+### Portable custom services
+
+An executable regular file placed directly in
+`~/.config/hermes-box/services.d/` defines a custom service. Names must match
+`[a-z0-9][a-z0-9_-]{0,62}`; directories, symlinks, non-executable files, and
+unsafe names are ignored and reported by `hb services`. Definitions live on
+the portable `/data` volume, so they survive backup, import, and upgrade.
+
+Each file is executed directly by absolute path, without shell sourcing,
+evaluation, arguments, or interpolation. Scripts must remain in the
+foreground and should `exec` their daemon. For example:
+
+```bash
+install -d -m 700 ~/.config/hermes-box/services.d
+cat >~/.config/hermes-box/services.d/signal <<'EOF'
+#!/usr/bin/env bash
+exec signal-cli daemon
+EOF
+chmod 700 ~/.config/hermes-box/services.d/signal
+hb services-reload
+```
+
+The existing 20-second workload loop also reconciles definitions
+automatically. Each service is supervised independently with a bounded
+restart delay; one crashing service cannot block the others. `hb pause` and
+`hb down` synchronously stop all custom services and prevent restart, while
+`hb up`/`hb resume` start them again. Disabling only the Hermes gateway does
+not affect custom services. Container termination is forwarded through the
+log supervisor to each foreground process.
+
+`hb services` distinguishes a stable foreground child (`running`) from a
+live capture wrapper waiting to restart it (`restarting`). This is process
+state, not an application health check; `hb doctor` cannot infer a generic
+health contract for arbitrary service code.
+
+Service output uses the same rotating, redacted durable log pipeline as other
+tx9-owned processes. Sources are distinct and collision-free:
+
+```bash
+tx9 logs media-bot --source service-signal
+tx9 logs media-bot --source all
+```
+
+Drop-ins have the same permissions and network/filesystem access as the
+`agent` user. Treat installing one as installing executable code in the box;
+the filename and regular non-symlink checks prevent accidental shell
+evaluation or symlink execution, but do not sandbox trusted service code.
 
 ## Logs and resource allocation
 

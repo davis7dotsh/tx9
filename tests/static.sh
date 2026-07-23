@@ -12,6 +12,7 @@ regression_files=(tests/regressions-*.sh)
 files=(
   guest/hb
   guest/hb-workload
+  guest/tx9-services
   guest/lib-mcp.sh
   guest/profile.sh
   guest/agent-bash-profile.sh
@@ -26,7 +27,7 @@ files=(
 bash -n "${files[@]}"
 python3 -c 'compile(open("guest/hermes-state", encoding="utf-8").read(), "guest/hermes-state", "exec")'
 python3 -c 'compile(open("guest/tx9-logs", encoding="utf-8").read(), "guest/tx9-logs", "exec")'
-for file in guest/hb guest/hb-workload guest/hermes-state guest/tx9-logs provision/provision.sh tests/hermes-state.sh "${regression_files[@]}"; do
+for file in guest/hb guest/hb-workload guest/tx9-services guest/hermes-state guest/tx9-logs provision/provision.sh tests/hermes-state.sh "${regression_files[@]}"; do
   [[ -x "$file" ]] || { echo "not executable: $file" >&2; exit 1; }
 done
 
@@ -66,6 +67,13 @@ grep -q '_refresh_targets' guest/hb-workload
 grep -q '\. "$BOX_ENV"' guest/hb-workload
 grep -q '_stop_executor_bridge' guest/hb-workload
 
+# --- guest/tx9-services invariants ---------------------------------------
+grep -q 'services.d' guest/tx9-services
+grep -q -- '--source "service-\$name"' guest/tx9-services
+grep -q -- '--restart-delay' guest/tx9-services
+grep -q '_services_reconcile' guest/hb
+grep -q '_services_stop' guest/hb
+
 # --- provisioning / config invariants ------------------------------------
 grep -q 'tools) tools_only ;;' provision/provision.sh
 grep -q 'assets) assets_only ;;' provision/provision.sh
@@ -92,6 +100,7 @@ grep -q 'tx9-logs capture' docker/entrypoint.sh
 grep -q -- '--source agent' docker/entrypoint.sh
 grep -q 'tx9-logs capture --source executor' docker/executor-entrypoint.sh
 grep -q 'tx9-logs.*OPT/bin/tx9-logs' provision/provision.sh
+grep -q 'tx9-services.*OPT/bin/tx9-services' provision/provision.sh
 grep -Fq '[ -t 0 ] && [ -t 1 ]' guest/agent-bash-profile.sh
 
 grep -qi 'networking is always enabled' README.md

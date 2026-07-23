@@ -102,7 +102,7 @@ func fileMode(p string) int64 {
 	switch {
 	case strings.HasSuffix(p, ".sh"):
 		return 0o755
-	case p == "guest/hb" || strings.HasPrefix(p, "guest/hb-"):
+	case p == "guest/hb" || strings.HasPrefix(p, "guest/hb-") || p == "guest/tx9-services":
 		return 0o755
 	case p == "guest/hermes-state":
 		return 0o755

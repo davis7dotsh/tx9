@@ -10,7 +10,9 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
 import datetime as dt
+import errno
 import hashlib
 import heapq
 import io
@@ -51,6 +53,8 @@ CAPTURE_READER_DRAIN_SECONDS = 0.5
 CAPTURE_DEDUP_WINDOW_SECONDS = 60.0
 CAPTURE_DEDUP_MAX_REPEATS = 1000
 MAX_RAW_CONTINUATION_LINES = 1000
+PARENT_DEATH_EXEC_ACTION = "__parent-death-exec"
+PR_SET_PDEATHSIG = 1
 # Numeric values below this many epoch seconds (2001-09-09) cannot be event
 # times; loadavg fragments and counters otherwise parse as 1970 timestamps.
 MIN_PLAUSIBLE_EPOCH_SECONDS = 1_000_000_000
@@ -74,6 +78,7 @@ SOURCE_ALIASES = {
     "socat": "agent",
     "hermes-api-socat": "hermes",
 }
+SERVICE_SOURCE_RE = re.compile(r"service-[a-z0-9][a-z0-9_-]{0,62}")
 
 BEARER_RE = re.compile(r"(?i)(\bbearer[ \t]+)([^\s,;\"']+)")
 AUTHORIZATION_RE = re.compile(r"(?i)(\b(?:proxy-)?authorization\b[ \t]*[=:][ \t]*)([^\r\n]+)")
@@ -510,6 +515,71 @@ def nonnegative_float(value: str) -> float:
     if not math.isfinite(parsed) or parsed < 0:
         raise argparse.ArgumentTypeError("must be finite and non-negative")
     return parsed
+
+
+def write_exec_failure(status_fd: int, stage: str, error: int) -> None:
+    payload = f"{stage}:{error}\n".encode("ascii")
+    try:
+        os.write(status_fd, payload)
+    except OSError:
+        pass
+
+
+def parent_death_exec(arguments: Sequence[str]) -> int:
+    """Arm Linux parent-death SIGKILL, close the setup race, then exec.
+
+    Capture's supported lifecycle contract is the direct foreground child. A
+    command that daemonizes descendants outside that child's process group is
+    outside this guarantee.
+    """
+
+    if len(arguments) < 4 or arguments[2] != "--":
+        print("tx9-logs: invalid internal parent-death invocation", file=sys.stderr)
+        return 126
+    try:
+        expected_parent = positive_int(arguments[0])
+        status_fd = positive_int(arguments[1])
+    except argparse.ArgumentTypeError as exc:
+        print(f"tx9-logs: invalid internal parent-death argument: {exc}", file=sys.stderr)
+        return 126
+    command = list(arguments[3:])
+    if not command:
+        print("tx9-logs: internal parent-death exec requires a command", file=sys.stderr)
+        return 126
+
+    try:
+        # Popen clears CLOEXEC for pass_fds so this fresh interpreter can
+        # report setup/exec errors. Restore it before the target exec: EOF on
+        # the parent end is then the unambiguous success handshake.
+        os.set_inheritable(status_fd, False)
+        libc = ctypes.CDLL(None, use_errno=True)
+        prctl = libc.prctl
+        prctl.argtypes = [
+            ctypes.c_int,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+            ctypes.c_ulong,
+        ]
+        prctl.restype = ctypes.c_int
+        if prctl(PR_SET_PDEATHSIG, signal.SIGKILL, 0, 0, 0) != 0:
+            error = ctypes.get_errno()
+            raise OSError(error, os.strerror(error))
+    except OSError as exc:
+        write_exec_failure(status_fd, "setup", exc.errno or 0)
+        return 126
+
+    # PR_SET_PDEATHSIG is not retroactive. If capture died between Popen's
+    # fork and the prctl call, fail closed instead of execing an orphan.
+    if os.getppid() != expected_parent:
+        os.kill(os.getpid(), signal.SIGKILL)
+        os._exit(128 + signal.SIGKILL)
+
+    try:
+        os.execvpe(command[0], command, os.environ)
+    except OSError as exc:
+        write_exec_failure(status_fd, "exec", exc.errno or 0)
+        return 127 if isinstance(exc, FileNotFoundError) else 126
 
 
 def path_parts_under(root: Path, path: Path) -> tuple[Path, tuple[str, ...]]:
@@ -1027,51 +1097,123 @@ class Capture:
         child_env = dict(os.environ)
         child_env["TX9_LOG_MIRROR_STDOUT_FD"] = str(self.mirror_out)
         child_env["TX9_LOG_MIRROR_STDERR_FD"] = str(self.mirror_err)
+        # Re-exec this module as a tiny setup shim instead of using
+        # subprocess.preexec_fn, whose Python callback is unsafe around the
+        # reader threads used by capture. Popen creates the new session first;
+        # the fresh interpreter then arms parent death and execs the command.
+        status_read_fd = -1
+        status_write_fd = -1
+        reader_stop = threading.Event()
+        reader_cancelled = threading.Event()
+        readers: list[threading.Thread] = []
         try:
+            status_read_fd, status_write_fd = os.pipe()
+            launch_command = [
+                sys.executable,
+                str(Path(__file__).resolve()),
+                PARENT_DEATH_EXEC_ACTION,
+                str(os.getpid()),
+                str(status_write_fd),
+                "--",
+                *command,
+            ]
             child = subprocess.Popen(
-                command,
+                launch_command,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 env=child_env,
                 start_new_session=True,
-                pass_fds=(self.mirror_out, self.mirror_err),
+                pass_fds=(self.mirror_out, self.mirror_err, status_write_fd),
             )
             self.child = child
             self.active_pgid = child.pid
+            os.close(status_write_fd)
+            status_write_fd = -1
+            assert self.child.stdout is not None
+            assert self.child.stderr is not None
+            readers = [
+                threading.Thread(
+                    target=self._reader,
+                    args=("stdout", self.child.stdout, reader_stop, reader_cancelled),
+                    daemon=True,
+                ),
+                threading.Thread(
+                    target=self._reader,
+                    args=("stderr", self.child.stderr, reader_stop, reader_cancelled),
+                    daemon=True,
+                ),
+            ]
+            for reader in readers:
+                reader.start()
             # A signal can arrive after Popen creates the process group but
             # before the assignment above. Honor it before waiting so that
             # startup cannot lose Docker's shutdown request.
             if self.received_signal is not None:
                 self._forward_signal(self.received_signal, None)
+            read_fd = status_read_fd
+            status_read_fd = -1
+            with os.fdopen(read_fd, "rb", buffering=0) as status_pipe:
+                exec_status = status_pipe.read(128)
         except OSError as exc:
+            if status_read_fd >= 0:
+                os.close(status_read_fd)
+            if status_write_fd >= 0:
+                os.close(status_write_fd)
+            if self.child is not None:
+                self._signal_process_group(signal.SIGKILL)
+                self.child.wait()
+            reader_stop.set()
+            for reader in readers:
+                reader.join()
+            if reader_cancelled.is_set():
+                self._signal_process_group(signal.SIGKILL)
+            self.active_pgid = None
+            self.child = None
+            self.flush_repeats()
             message = f"could not start {Path(command[0]).name}: {exc}"
             self.output("stderr", (message + "\n").encode())
             self.structured("process_start_failed", message)
-            return 127 if isinstance(exc, FileNotFoundError) else 126
+            status = 127 if isinstance(exc, FileNotFoundError) else 126
+            if self.received_signal is not None:
+                return 128 + self.received_signal
+            return status
+
+        if exec_status:
+            try:
+                stage, error_text = exec_status.decode("ascii").strip().split(":", 1)
+                error = int(error_text)
+                if stage not in {"setup", "exec"} or error < 0:
+                    raise ValueError
+            except (UnicodeDecodeError, ValueError):
+                stage = "setup"
+                error = 0
+            self.child.wait()
+            reader_stop.set()
+            for reader in readers:
+                reader.join()
+            if reader_cancelled.is_set():
+                self._signal_process_group(signal.SIGKILL)
+            self.active_pgid = None
+            self.child = None
+            self.flush_repeats()
+            if stage == "exec":
+                detail = OSError(error, os.strerror(error), command[0])
+                status = 127 if error == errno.ENOENT else 126
+            else:
+                detail = OSError(error, os.strerror(error))
+                status = 126
+            message = f"could not start {Path(command[0]).name}: {detail}"
+            self.output("stderr", (message + "\n").encode())
+            self.structured("process_start_failed", message)
+            if self.received_signal is not None:
+                return 128 + self.received_signal
+            return status
 
         self.structured(
             "process_start",
             f"{Path(command[0]).name} started",
             {"pid": self.child.pid, "command": Path(command[0]).name},
         )
-        assert self.child.stdout is not None
-        assert self.child.stderr is not None
-        reader_stop = threading.Event()
-        reader_cancelled = threading.Event()
-        readers = [
-            threading.Thread(
-                target=self._reader,
-                args=("stdout", self.child.stdout, reader_stop, reader_cancelled),
-                daemon=True,
-            ),
-            threading.Thread(
-                target=self._reader,
-                args=("stderr", self.child.stderr, reader_stop, reader_cancelled),
-                daemon=True,
-            ),
-        ]
-        for reader in readers:
-            reader.start()
         return_code = self.child.wait()
         # The direct child owns the capture lifecycle. Stop background
         # descendants in its process group, then let readers drain buffered
@@ -1146,7 +1288,12 @@ def selected_sources(value: str) -> set[str] | None:
     if not values or "all" in values:
         return None
     normalized = {normalize_source(item) for item in values}
-    unknown = normalized - {"agent", "executor", "hermes", "codex", "claude"}
+    unknown = {
+        source
+        for source in normalized
+        if source not in {"agent", "executor", "hermes", "codex", "claude"}
+        and SERVICE_SOURCE_RE.fullmatch(source) is None
+    }
     if unknown:
         raise ValueError("unknown source(s): " + ", ".join(sorted(unknown)))
     return normalized
@@ -1616,7 +1763,10 @@ def runtime_source(stem: str, scope: str) -> str:
         return "executor"
     stem = stem.partition(".legacy-")[0]
     source = normalize_source(stem)
-    if source not in {"agent", "hermes", "codex", "claude"}:
+    if (
+        source not in {"agent", "hermes", "codex", "claude"}
+        and SERVICE_SOURCE_RE.fullmatch(source) is None
+    ):
         return "agent"
     return source
 
@@ -1641,7 +1791,10 @@ def read_runtime_logs(root: Path, *, scope: str, box: str) -> Iterator[dict[str,
         if replacement and replacement in names:
             continue
         source = runtime_source(active.stem, scope)
-        if source not in {"agent", "executor", "hermes", "codex", "claude"}:
+        if (
+            source not in {"agent", "executor", "hermes", "codex", "claude"}
+            and SERVICE_SOURCE_RE.fullmatch(source) is None
+        ):
             source = "agent" if scope == "agent" else "executor"
         yield from read_raw(active, root=root, box=box, source=source)
 
@@ -1842,7 +1995,9 @@ def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int
     agent_home = home_for_root(agent_root)
 
     streams: list[Iterable[dict[str, Any]]] = []
-    if selected is None or selected & {"agent", "hermes", "codex", "claude"}:
+    if selected is None or selected & {"agent", "hermes", "codex", "claude"} or any(
+        SERVICE_SOURCE_RE.fullmatch(source) is not None for source in selected
+    ):
         streams.append(read_runtime_logs(agent_root, scope="agent", box=args.box))
     if source_wanted("executor", selected):
         streams.append(read_runtime_logs(executor_root, scope="executor", box=args.box))
@@ -2012,7 +2167,11 @@ def add_query_options(parser: argparse.ArgumentParser, *, default_tail: int | No
     parser.add_argument("--agent-root", required=True, help="read-only agent volume root")
     parser.add_argument("--executor-root", required=True, help="read-only Executor volume root")
     parser.add_argument("--box", required=True, help="box name used in normalized events")
-    parser.add_argument("--source", default="all", help="comma-separated agent,executor,hermes,codex,claude")
+    parser.add_argument(
+        "--source",
+        default="all",
+        help="comma-separated agent,executor,hermes,codex,claude,service-<name>",
+    )
     parser.add_argument("--tail", type=lambda value: positive_int(value), default=default_tail)
     parser.add_argument("--since", default="", help="duration such as 24h or RFC3339 timestamp")
     parser.add_argument("--grep", default="", help="case-insensitive text filter")
@@ -2058,6 +2217,8 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> int:
+    if sys.argv[1:2] == [PARENT_DEATH_EXEC_ACTION]:
+        return parent_death_exec(sys.argv[2:])
     parser = build_parser()
     args = parser.parse_args()
     return int(args.handler(args))

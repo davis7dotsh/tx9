@@ -4,8 +4,9 @@ set -uo pipefail
 # shellcheck disable=SC1091
 [ -f /etc/profile.d/hermes-box.sh ] && . /etc/profile.d/hermes-box.sh
 export TX9_LOG_MAX_BYTES TX9_LOG_MAX_FILES
+HB_BIN_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=guest/lib-mcp.sh
-. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib-mcp.sh"
+. "$HB_BIN_DIR/lib-mcp.sh"
 
 DATA="${HB_DATA:-/data}"
 AGENT_HOME="$DATA/home/agent"
@@ -20,6 +21,7 @@ GATEWAY_LOCK="$STATE_DIR/gateway.lock"
 GATEWAY_RELOAD_REQUESTS="$STATE_DIR/gateway-reload-requests"
 GATEWAY_RELOAD_LOCK="$STATE_DIR/gateway-reload.lock"
 EXECUTOR_LOCK="$STATE_DIR/executor.lock"
+SERVICES_DIR="$STATE_DIR/services.d"
 WIRE_VERSION=http-v3
 WIRED="$AGENT_HOME/.hermes-box-wired"
 TOKEN_FILE="$AGENT_HOME/.executor/server-control/auth.json"
@@ -64,9 +66,11 @@ init() {
   local managed=(
     "$AGENT_HOME" "$AGENT_HOME/.claude" "$AGENT_HOME/.codex" "$AGENT_HOME/.hermes"
     "$AGENT_HOME/workspace" "$AGENT_HOME/.config" "$AGENT_HOME/.config/hermes-box"
-    "$AGENT_HOME/.local" "$AGENT_HOME/.local/share" "$AGENT_HOME/.local/state" "$LOGS"
+    "$SERVICES_DIR" "$AGENT_HOME/.local" "$AGENT_HOME/.local/share"
+    "$AGENT_HOME/.local/state" "$LOGS"
   )
   mkdir -p "${managed[@]}"
+  chmod 0700 "$SERVICES_DIR" 2>/dev/null || true
   id agent >/dev/null 2>&1 && chown agent:agent "${managed[@]}" 2>/dev/null || true
   if [[ -e "$LEGACY_QUIESCE_FILE" ]]; then
     touch "$QUIESCE_FILE" || return 1
@@ -80,6 +84,20 @@ init() {
   # to recreate and remove them.
   id agent >/dev/null 2>&1 && chown agent:agent "$GATEWAY_DISABLED" "$GATEWAY_POLICY" 2>/dev/null || true
 }
+
+_services_helper() {
+  local helper
+  helper="$(command -v tx9-services 2>/dev/null || true)"
+  [[ -n "$helper" ]] || helper="$HB_BIN_DIR/tx9-services"
+  [[ -x "$helper" ]] || {
+    echo "tx9-services is unavailable" >&2
+    return 1
+  }
+  TX9_SERVICES_CONFIG_ROOT="$STATE_DIR" TX9_SERVICES_LOG_DIR="$LOGS" "$helper" "$@"
+}
+
+_services_reconcile() { _services_helper reconcile; }
+_services_stop() { _services_helper stop-all; }
 
 _port_open() {
   (exec 3<>"/dev/tcp/$EXECUTOR_HOST/${EXECUTOR_PORT:-4788}") 2>/dev/null && { exec 3>&-; return 0; }
@@ -333,15 +351,29 @@ _start_gateway() {
 }
 
 up() {
+  local services_failed=0
+  local gateway_status
+
   init
   rm -f "$QUIESCE_FILE"
+  _services_reconcile || {
+    services_failed=1
+    echo "warning: custom service reconciliation failed; run 'hb services-reload' for details" >&2
+  }
   _executor_up || return 1
   _start_gateway
+  gateway_status=$?
+  [[ "$gateway_status" == 0 ]] || return "$gateway_status"
+  [[ "$services_failed" == 0 ]]
 }
 
 reconcile() {
   init
-  [[ ! -e "$QUIESCE_FILE" ]] || return 0
+  if [[ -e "$QUIESCE_FILE" ]]; then
+    _services_stop
+    return
+  fi
+  _services_reconcile || echo "warning: custom service reconciliation failed; continuing core reconciliation" >&2
   HB_STEADY_QUIET=1 _executor_up || return 1
   _start_gateway
 }
@@ -372,13 +404,14 @@ pause() {
   local failed=0
   init
   touch "$QUIESCE_FILE"
+  _services_stop || failed=1
   _stop_gateway || failed=1
   _stop_executor || failed=1
   if command -v hermes-state >/dev/null 2>&1; then
     hermes-state verify --checkpoint >/dev/null || failed=1
   fi
   [[ "$failed" == 0 ]] || return 1
-  echo "Hermes gateway and Executor: quiesced"
+  echo "Custom services, Hermes gateway, and Executor: quiesced"
 }
 
 resume() {
@@ -729,7 +762,7 @@ write_manifest() {
 }
 
 status() {
-  local gateway_status
+  local gateway_status services_count
   if [[ -e "$GATEWAY_DISABLED" ]]; then
     gateway_status=disabled
   elif _gateway_running; then
@@ -747,7 +780,18 @@ status() {
     printf 'platform: no runtime state\n'
   fi
   printf 'mcp:      %s\n' "$([[ -f "$WIRED" ]] && cat "$WIRED" || echo unwired)"
+  services_count="$(find "$SERVICES_DIR" -mindepth 1 -maxdepth 1 -printf x 2>/dev/null | wc -c | tr -d ' ')"
+  printf "services: %s drop-in entries (run 'hb services')\n" "$services_count"
   printf 'data:     %s\n' "$(du -sh "$DATA" 2>/dev/null | cut -f1)"
+}
+
+services() { _services_helper status; }
+
+services_reload() {
+  local failed=0
+  _services_reconcile || failed=1
+  services || failed=1
+  return "$failed"
 }
 
 versions() {
@@ -822,6 +866,7 @@ doctor() {
     _check "Codex HTTP MCP config" grep -qF "url = \"$(_executor_url)\"" "$CODEX_HOME/config.toml" || failed=1
     _check "Hermes HTTP MCP config" _hermes_http_config || failed=1
   fi
+  echo "info custom services have no generic health contract; inspect process state with 'hb services'"
   [[ "$failed" == 0 ]]
 }
 
@@ -861,9 +906,11 @@ main() {
     write-manifest) write_manifest ;;
     doctor) doctor ;;
     status) status ;;
+    services) services ;;
+    services-reload) services_reload ;;
     versions) versions ;;
     logs) shift; logs "${1:-executor}" ;;
-    *) echo "usage: hb {init|up|reconcile|down|pause|resume|gateway-enable|gateway-disable|gateway-reload-if-requested|verify-state|acknowledge-active-paths|cutover-ready|web|wire-mcp|doctor|status|versions|logs}"; return 1 ;;
+    *) echo "usage: hb {init|up|reconcile|down|pause|resume|services|services-reload|gateway-enable|gateway-disable|gateway-reload-if-requested|verify-state|acknowledge-active-paths|cutover-ready|web|wire-mcp|doctor|status|versions|logs}"; return 1 ;;
   esac
 }
 

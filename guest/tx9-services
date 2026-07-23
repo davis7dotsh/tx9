@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+# Portable guest-side service supervisor for executable drop-ins.
+set -uo pipefail
+
+CONFIG_ROOT="${TX9_SERVICES_CONFIG_ROOT:-${XDG_CONFIG_HOME:-$HOME/.config}/hermes-box}"
+DEFINITIONS="$CONFIG_ROOT/services.d"
+STATE_DIR="${TX9_SERVICES_STATE_DIR:-${XDG_RUNTIME_DIR:-/tmp}/hermes-box-services-$(id -u)}"
+LOG_DIR="${TX9_SERVICES_LOG_DIR:-/data/logs}"
+QUIESCE_FILE="${TX9_SERVICES_QUIESCE_FILE:-$CONFIG_ROOT/quiesced}"
+RESTART_DELAY="${TX9_SERVICES_RESTART_DELAY:-5}"
+STOP_TIMEOUT="${TX9_SERVICES_STOP_TIMEOUT:-5}"
+LOCK_WAIT="${TX9_SERVICES_LOCK_WAIT:-10}"
+LOCK_FILE="$STATE_DIR/reconcile.lock"
+LOCK_FD=''
+
+_safe_name() { [[ "$1" =~ ^[a-z0-9][a-z0-9_-]{0,62}$ ]]; }
+
+_ensure_dirs() {
+  mkdir -p "$DEFINITIONS" "$STATE_DIR" "$LOG_DIR" || return 1
+  LOG_DIR="$(cd -- "$LOG_DIR" && pwd -P)" || return 1
+  chmod 0700 "$DEFINITIONS" 2>/dev/null || true
+  chmod 0700 "$STATE_DIR" 2>/dev/null || true
+}
+
+_log_helper() {
+  local helper="${TX9_SERVICES_LOG_HELPER:-}"
+  if [[ -z "$helper" ]]; then
+    helper="$(command -v tx9-logs 2>/dev/null || true)"
+  fi
+  [[ -n "$helper" && "$helper" == /* && -x "$helper" ]] || {
+    echo "tx9-services: tx9-logs is unavailable" >&2
+    return 1
+  }
+  printf '%s\n' "$helper"
+}
+
+_acquire_lock() {
+  _ensure_dirs || return 1
+  exec {LOCK_FD}>"$LOCK_FILE"
+  if ! flock -w "$LOCK_WAIT" "$LOCK_FD"; then
+    echo "tx9-services: could not acquire reconciliation lock" >&2
+    eval "exec ${LOCK_FD}>&-"
+    LOCK_FD=''
+    return 1
+  fi
+}
+
+_release_lock() {
+  [[ -n "$LOCK_FD" ]] || return 0
+  flock -u "$LOCK_FD" 2>/dev/null || true
+  eval "exec ${LOCK_FD}>&-" 2>/dev/null || true
+  LOCK_FD=''
+}
+
+_definition_fingerprint() {
+  local path="$1" metadata digest
+  metadata="$(stat -c '%d:%i:%s:%a' -- "$path" 2>/dev/null)" || return 1
+  digest="$(sha256sum -- "$path" 2>/dev/null)" || return 1
+  digest="${digest%% *}"
+  digest="${digest#\\}"
+  [[ "$digest" =~ ^[a-f0-9]{64}$ ]] || return 1
+  printf '%s:%s\n' "$metadata" "$digest"
+}
+
+_valid_definition() {
+  local path="$1"
+  [[ ! -L "$path" && -f "$path" && -x "$path" ]]
+}
+
+_process_start_time() {
+  local pid="$1" line rest
+  local -a fields
+  [[ "$pid" =~ ^[1-9][0-9]*$ ]] || return 1
+  IFS= read -r line 2>/dev/null <"/proc/$pid/stat" || return 1
+  rest="${line##*) }"
+  read -r -a fields <<<"$rest"
+  ((${#fields[@]} >= 20)) || return 1
+  printf '%s\n' "${fields[19]}"
+}
+
+_read_state() {
+  local state_file="$1"
+  IFS=$'\t' read -r STATE_PID STATE_START STATE_FINGERPRINT STATE_HELPER STATE_LOG_DIR STATE_DELAY 2>/dev/null <"$state_file" || return 1
+  [[ "$STATE_PID" =~ ^[1-9][0-9]*$ && "$STATE_START" =~ ^[0-9]+$ && -n "$STATE_FINGERPRINT" && "$STATE_HELPER" == /* && "$STATE_LOG_DIR" == /* && -n "$STATE_DELAY" ]]
+}
+
+_capture_argv_matches() {
+  local pid="$1" name="$2" definition="$3" helper="$4" log_dir="$5" delay="$6" index
+  local -a argv expected
+  mapfile -d '' -t argv <"/proc/$pid/cmdline" 2>/dev/null || return 1
+  ((${#argv[@]} > 0)) || return 1
+  if [[ "${argv[0]}" == "$helper" ]]; then
+    index=0
+  elif ((${#argv[@]} > 1)) && [[ "${argv[1]}" == "$helper" ]]; then
+    index=1
+  else
+    return 1
+  fi
+  expected=(
+    "$helper" capture --source "service-$name" --log-dir "$log_dir"
+    --restart-delay "$delay" -- "$definition"
+  )
+  ((${#argv[@]} - index == ${#expected[@]})) || return 1
+  local offset
+  for ((offset = 0; offset < ${#expected[@]}; offset++)); do
+    [[ "${argv[index + offset]}" == "${expected[offset]}" ]] || return 1
+  done
+}
+
+_state_process_matches() {
+  local state_file="$1" name="$2" definition="$3" current_start current_uid
+  _read_state "$state_file" || return 1
+  current_start="$(_process_start_time "$STATE_PID")" || return 1
+  [[ "$current_start" == "$STATE_START" ]] || return 1
+  current_uid="$(stat -c '%u' -- "/proc/$STATE_PID" 2>/dev/null)" || return 1
+  [[ "$current_uid" == "$(id -u)" ]] || return 1
+  _capture_argv_matches "$STATE_PID" "$name" "$definition" \
+    "$STATE_HELPER" "$STATE_LOG_DIR" "$STATE_DELAY"
+}
+
+_write_state() {
+  local state_file="$1" pid="$2" start="$3" fingerprint="$4" helper="$5" log_dir="$6" delay="$7" tmp
+  tmp="$state_file.tmp.$$"
+  umask 077
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' \
+    "$pid" "$start" "$fingerprint" "$helper" "$log_dir" "$delay" >"$tmp" || return 1
+  mv "$tmp" "$state_file"
+}
+
+_start_one() {
+  local name="$1" definition="$2" fingerprint="$3" helper="$4" pid start attempt state_file
+  state_file="$STATE_DIR/$name.state"
+  [[ -n "$helper" ]] || return 1
+  (
+    # flock locks are tied to open file descriptions and survive fork. The
+    # long-lived capture must never inherit the reconciliation lock.
+    [[ -z "$LOCK_FD" ]] || eval "exec ${LOCK_FD}>&-"
+    exec "$helper" capture --source "service-$name" --log-dir "$LOG_DIR" \
+      --restart-delay "$RESTART_DELAY" -- "$definition"
+  ) </dev/null >/dev/null 2>&1 &
+  pid=$!
+  start="$(_process_start_time "$pid")" || {
+    wait "$pid" 2>/dev/null || true
+    echo "tx9-services: $name failed before supervision started" >&2
+    return 1
+  }
+  _write_state "$state_file" "$pid" "$start" "$fingerprint" \
+    "$helper" "$LOG_DIR" "$RESTART_DELAY" || {
+    kill -TERM "$pid" 2>/dev/null || true
+    wait "$pid" 2>/dev/null || true
+    return 1
+  }
+  for ((attempt = 0; attempt < 100; attempt++)); do
+    if _state_process_matches "$state_file" "$name" "$definition"; then
+      echo "tx9-services: started $name"
+      return 0
+    fi
+    kill -0 "$pid" 2>/dev/null || break
+    sleep 0.02
+  done
+  kill -TERM "$pid" 2>/dev/null || true
+  wait "$pid" 2>/dev/null || true
+  rm -f "$state_file"
+  echo "tx9-services: $name capture failed to start" >&2
+  return 1
+}
+
+_direct_children() {
+  local pid="$1" child current_uid
+  [[ -r "/proc/$pid/task/$pid/children" ]] || return 0
+  for child in $(<"/proc/$pid/task/$pid/children"); do
+    [[ "$child" =~ ^[1-9][0-9]*$ ]] || continue
+    current_uid="$(stat -c '%u' -- "/proc/$child" 2>/dev/null)" || continue
+    [[ "$current_uid" == "$(id -u)" ]] || continue
+    printf '%s\n' "$child"
+  done
+}
+
+_pid_alive() {
+  local state
+  kill -0 "$1" 2>/dev/null || return 1
+  state="$(ps -o stat= -p "$1" 2>/dev/null)" || return 1
+  [[ "$state" != Z* ]]
+}
+
+_pid_identity_alive() {
+  local pid="$1" expected_start="$2" current_start
+  _pid_alive "$pid" || return 1
+  current_start="$(_process_start_time "$pid")" || return 1
+  [[ "$current_start" == "$expected_start" ]]
+}
+
+_process_group_identity_alive() {
+  local leader="$1" expected_start="$2" expected_group="$3" current_group
+  _pid_identity_alive "$leader" "$expected_start" || return 1
+  current_group="$(ps -o pgid= -p "$leader" 2>/dev/null)" || return 1
+  current_group="${current_group//[[:space:]]/}"
+  [[ "$current_group" == "$expected_group" ]]
+}
+
+_supervised_child_running() {
+  local capture_pid="$1" child start current_start
+  local -a children
+  mapfile -t children < <(_direct_children "$capture_pid")
+  ((${#children[@]} == 1)) || return 1
+  child="${children[0]}"
+  _pid_alive "$child" || return 1
+  start="$(_process_start_time "$child")" || return 1
+  # A child that merely flashes into existence during a crash loop is not a
+  # running service. Require the same direct child to remain present across a
+  # short observation window; this is process-state reporting, not a generic
+  # application health check.
+  sleep 0.05
+  current_start="$(_process_start_time "$child")" || return 1
+  [[ "$current_start" == "$start" ]] || return 1
+  _pid_alive "$child" || return 1
+  [[ "$(sed -n 's/^PPid:[[:space:]]*//p' "/proc/$child/status" 2>/dev/null)" == "$capture_pid" ]]
+}
+
+_stop_one() {
+  local name="$1" definition="$2" attempt child start group index alive failed=0
+  local state_file="$STATE_DIR/$name.state"
+  local -a child_groups=()
+  local -a child_starts=()
+  if ! _state_process_matches "$state_file" "$name" "$definition"; then
+    rm -f "$state_file"
+    return 0
+  fi
+
+  while IFS= read -r child; do
+    start="$(_process_start_time "$child")" || continue
+    group="$(ps -o pgid= -p "$child" 2>/dev/null)" || continue
+    group="${group//[[:space:]]/}"
+    [[ "$group" == "$child" ]] || continue
+    _process_group_identity_alive "$child" "$start" "$group" || continue
+    child_groups+=("$group")
+    child_starts+=("$start")
+  done < <(_direct_children "$STATE_PID")
+
+  if ! _pid_identity_alive "$STATE_PID" "$STATE_START"; then
+    rm -f "$state_file"
+    return 0
+  fi
+  kill -TERM "$STATE_PID" 2>/dev/null || true
+  for ((attempt = 0; attempt < STOP_TIMEOUT * 10; attempt++)); do
+    alive=0
+    _pid_identity_alive "$STATE_PID" "$STATE_START" && alive=1
+    for ((index = 0; index < ${#child_groups[@]}; index++)); do
+      _process_group_identity_alive \
+        "${child_groups[index]}" "${child_starts[index]}" "${child_groups[index]}" && alive=1
+    done
+    [[ "$alive" == 1 ]] || break
+    sleep 0.1
+  done
+
+  for ((index = 0; index < ${#child_groups[@]}; index++)); do
+    if _process_group_identity_alive \
+      "${child_groups[index]}" "${child_starts[index]}" "${child_groups[index]}"; then
+      kill -KILL -- "-${child_groups[index]}" 2>/dev/null || true
+    fi
+  done
+  if _pid_identity_alive "$STATE_PID" "$STATE_START"; then
+    kill -KILL "$STATE_PID" 2>/dev/null || true
+  fi
+
+  for ((attempt = 0; attempt < 20; attempt++)); do
+    alive=0
+    _pid_identity_alive "$STATE_PID" "$STATE_START" && alive=1
+    for ((index = 0; index < ${#child_groups[@]}; index++)); do
+      _process_group_identity_alive \
+        "${child_groups[index]}" "${child_starts[index]}" "${child_groups[index]}" && alive=1
+    done
+    [[ "$alive" == 1 ]] || break
+    sleep 0.05
+  done
+
+  if _pid_identity_alive "$STATE_PID" "$STATE_START"; then
+    echo "tx9-services: $name capture survived stop" >&2
+    failed=1
+  fi
+  for ((index = 0; index < ${#child_groups[@]}; index++)); do
+    if _process_group_identity_alive \
+      "${child_groups[index]}" "${child_starts[index]}" "${child_groups[index]}"; then
+      echo "tx9-services: $name process group survived stop" >&2
+      failed=1
+    fi
+  done
+  if [[ "$failed" == 0 ]]; then
+    rm -f "$state_file"
+    echo "tx9-services: stopped $name"
+  fi
+  return "$failed"
+}
+
+_definition_reason() {
+  local path="$1" name="$2"
+  if ! _safe_name "$name"; then printf 'unsafe name'; return; fi
+  if [[ -L "$path" ]]; then printf 'symlink'; return; fi
+  if [[ ! -f "$path" ]]; then printf 'not a regular file'; return; fi
+  if [[ ! -x "$path" ]]; then printf 'not executable'; return; fi
+  printf 'valid'
+}
+
+_reconcile_locked() {
+  local path name fingerprint state_file current_helper='' helper_available=1 failed=0
+  local -A desired=()
+  while IFS= read -r -d '' path; do
+    name="${path##*/}"
+    if ! _valid_definition "$path" || ! _safe_name "$name"; then
+      echo "tx9-services: ignored $name ($(_definition_reason "$path" "$name"))" >&2
+      continue
+    fi
+    fingerprint="$(_definition_fingerprint "$path")" || {
+      echo "tx9-services: ignored $name (could not inspect definition)" >&2
+      continue
+    }
+    desired["$name"]="$fingerprint"
+  done < <(find "$DEFINITIONS" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+  if ((${#desired[@]} > 0)); then
+    if ! current_helper="$(_log_helper)"; then
+      helper_available=0
+      failed=1
+    fi
+  fi
+
+  shopt -s nullglob
+  for state_file in "$STATE_DIR"/*.state; do
+    name="${state_file##*/}"
+    name="${name%.state}"
+    path="$DEFINITIONS/$name"
+    if [[ -z "${desired[$name]+yes}" ]]; then
+      _stop_one "$name" "$path" || failed=1
+      continue
+    fi
+    # A helper is required to replace a configured supervisor. Preserve the
+    # existing launch when helper resolution is transiently unavailable;
+    # otherwise stopping it here would turn a recoverable error into downtime.
+    [[ "$helper_available" == 1 ]] || continue
+    if _state_process_matches "$state_file" "$name" "$path" &&
+      [[ "$STATE_FINGERPRINT" == "${desired[$name]}" &&
+        "$STATE_HELPER" == "$current_helper" && "$STATE_LOG_DIR" == "$LOG_DIR" &&
+        "$STATE_DELAY" == "$RESTART_DELAY" ]]; then
+      continue
+    fi
+    _stop_one "$name" "$path" || failed=1
+  done
+  shopt -u nullglob
+
+  [[ ! -e "$QUIESCE_FILE" ]] || return "$failed"
+  for name in "${!desired[@]}"; do
+    state_file="$STATE_DIR/$name.state"
+    path="$DEFINITIONS/$name"
+    [[ "$helper_available" == 1 ]] || continue
+    if _state_process_matches "$state_file" "$name" "$path" &&
+      [[ "$STATE_FINGERPRINT" == "${desired[$name]}" &&
+        "$STATE_HELPER" == "$current_helper" && "$STATE_LOG_DIR" == "$LOG_DIR" &&
+        "$STATE_DELAY" == "$RESTART_DELAY" ]]; then
+      continue
+    fi
+    _start_one "$name" "$path" "${desired[$name]}" "$current_helper" || failed=1
+  done
+  return "$failed"
+}
+
+reconcile() {
+  _acquire_lock || return 1
+  _reconcile_locked
+  local status=$?
+  _release_lock
+  return "$status"
+}
+
+_stop_all_locked() {
+  local state_file name definition failed=0
+  shopt -s nullglob
+  for state_file in "$STATE_DIR"/*.state; do
+    name="${state_file##*/}"
+    name="${name%.state}"
+    definition="$DEFINITIONS/$name"
+    _stop_one "$name" "$definition" || failed=1
+  done
+  shopt -u nullglob
+  return "$failed"
+}
+
+stop_all() {
+  _acquire_lock || return 1
+  _stop_all_locked
+  local status=$?
+  _release_lock
+  return "$status"
+}
+
+_status_locked() {
+  local path name reason fingerprint state_file current_helper rows=0
+  local -A seen=()
+  current_helper="$(_log_helper 2>/dev/null || true)"
+  printf 'NAME\tSTATUS\tDEFINITION\n'
+  while IFS= read -r -d '' path; do
+    name="${path##*/}"
+    seen["$name"]=1
+    rows=$((rows + 1))
+    reason="$(_definition_reason "$path" "$name")"
+    if [[ "$reason" != valid ]]; then
+      printf '%s\tignored (%s)\t%s\n' "$name" "$reason" "$path"
+      continue
+    fi
+    state_file="$STATE_DIR/$name.state"
+    fingerprint="$(_definition_fingerprint "$path" 2>/dev/null || true)"
+    if _state_process_matches "$state_file" "$name" "$path" && _read_state "$state_file"; then
+      if [[ "$STATE_FINGERPRINT" == "$fingerprint" &&
+        "$STATE_HELPER" == "$current_helper" && "$STATE_LOG_DIR" == "$LOG_DIR" &&
+        "$STATE_DELAY" == "$RESTART_DELAY" ]]; then
+        if _supervised_child_running "$STATE_PID"; then
+          printf '%s\trunning\t%s\n' "$name" "$path"
+        else
+          printf '%s\trestarting\t%s\n' "$name" "$path"
+        fi
+      else
+        printf '%s\treload pending\t%s\n' "$name" "$path"
+      fi
+    elif [[ -e "$QUIESCE_FILE" ]]; then
+      printf '%s\tstopped (quiesced)\t%s\n' "$name" "$path"
+    else
+      printf '%s\tstopped\t%s\n' "$name" "$path"
+    fi
+  done < <(find "$DEFINITIONS" -mindepth 1 -maxdepth 1 -print0 2>/dev/null)
+
+  shopt -s nullglob
+  for state_file in "$STATE_DIR"/*.state; do
+    name="${state_file##*/}"
+    name="${name%.state}"
+    if [[ -z "${seen[$name]+yes}" ]]; then
+      rows=$((rows + 1))
+      printf '%s\tstale state\t%s\n' "$name" "$DEFINITIONS/$name"
+    fi
+  done
+  shopt -u nullglob
+  if [[ "$rows" == 0 ]]; then
+    printf 'No custom services configured. Add executable files to %s\n' "$DEFINITIONS"
+  fi
+}
+
+status() {
+  _acquire_lock || return 1
+  _status_locked
+  local result=$?
+  _release_lock
+  return "$result"
+}
+
+main() {
+  case "${1:-status}" in
+    reconcile | reload) reconcile ;;
+    stop-all) stop_all ;;
+    status) status ;;
+    *) echo 'usage: tx9-services {status|reconcile|reload|stop-all}' >&2; return 2 ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then main "$@"; fi

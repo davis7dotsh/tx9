@@ -41,7 +41,7 @@ var commandSpecs = []commandSpec{
 	{name: "enter", help: "exec into a box's agent container (--executor for the executor container)", aliases: []string{"ssh", "shell"}, run: cmdEnter},
 	{name: "start", help: "start a stopped box", run: cmdStart},
 	{name: "stop", help: "stop a running box", run: cmdStop},
-	{name: "logs", help: "query/export durable agent, Executor, Hermes, Codex, and Claude events", run: cmdLogs},
+	{name: "logs", help: "query/export durable agent, Executor, Hermes, Codex, Claude, and custom-service events", run: cmdLogs},
 	{name: "resources", help: "show/update container limits and volume budgets", run: cmdResources},
 	{name: "backup", help: "archive a box to a .tx9 file", aliases: []string{"export", "save"}, run: cmdBackup},
 	{name: "import", help: "restore a box from a .tx9 file", aliases: []string{"load", "restore"}, run: cmdImport},
