@@ -221,9 +221,21 @@ restart_dir="$tmp/restart-delay-child"
 restart_pid_file="$tmp/restart-delay-child.pid"
 restart_generation="$tmp/restart-delay-child.generation"
 mkdir -p "$restart_dir"
+cat >"$tmp/restart-delay-child.sh" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"$RESTART_PID_FILE"
+n=$(cat "$RESTART_GENERATION" 2>/dev/null || echo 0)
+echo $((n + 1)) >"$RESTART_GENERATION"
+if [[ "$n" == 0 ]]; then
+  exit 7
+fi
+trap 'exit 0' TERM
+while :; do sleep 1; done
+EOF
+chmod 0700 "$tmp/restart-delay-child.sh"
 RESTART_PID_FILE="$restart_pid_file" RESTART_GENERATION="$restart_generation" \
   "$helper" capture --source agent --log-dir "$restart_dir" --restart-delay 0.2 -- \
-    bash -c 'printf "%s\n" "$$" >"$RESTART_PID_FILE"; n=$(cat "$RESTART_GENERATION" 2>/dev/null || echo 0); echo $((n + 1)) >"$RESTART_GENERATION"; if [[ "$n" == 0 ]]; then exit 7; fi; trap "exit 0" TERM; while :; do sleep 1; done' \
+    "$tmp/restart-delay-child.sh" \
   >/dev/null 2>&1 &
 restart_wrapper_pid=$!
 pids+=("$restart_wrapper_pid")

@@ -862,7 +862,7 @@ def inherited_open_fd(raw: str | None) -> int | None:
         return None
     try:
         os.fstat(fd)
-    except OSError:
+    except (OSError, OverflowError):
         return None
     return fd
 

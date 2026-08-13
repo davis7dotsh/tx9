@@ -1128,7 +1128,7 @@ EOF
   _spawn_without_lock_fd "$GATEWAY_LOCK" "$LOGS/hermes-gateway.log" hermes gateway run --replace
   wait_for_file "$HERMES_PID_FILE"
   wait_for_file "$TX9_MIRROR_ENV_FILE"
-  [[ "$(cat "$TX9_MIRROR_ENV_FILE")" == $'out=unset\nerr=unset' ]]
+  [[ "$(cat "$TX9_MIRROR_ENV_FILE")" == 'out=unset err=unset' ]]
   grep -Fq -- '--external-supervisor' "$HERMES_ARGS_FILE"
   mapfile -t capture_pids < <(_gateway_capture_pids)
   [[ "${#capture_pids[@]}" == 1 ]]
@@ -1306,11 +1306,15 @@ EOF
   grep -q 'nested tx9-logs exited 1 before Hermes exec' "$tmp/gateway-start-failure.stderr"
   HB_STEADY_QUIET=1
   set +e
-  _start_gateway >"$tmp/gateway-start-failure-quiet.stdout" 2>"$tmp/gateway-start-failure-quiet.stderr"
-  second_status=$?
+  _start_gateway >"$tmp/gateway-start-failure-quiet1.stdout" 2>"$tmp/gateway-start-failure-quiet1.stderr"
+  quiet_first_status=$?
+  _start_gateway >"$tmp/gateway-start-failure-quiet2.stdout" 2>"$tmp/gateway-start-failure-quiet2.stderr"
+  quiet_second_status=$?
   set -e
-  [[ "$second_status" == 1 ]]
-  [[ ! -s "$tmp/gateway-start-failure-quiet.stderr" ]] || {
+  [[ "$quiet_first_status" == 1 ]]
+  [[ "$quiet_second_status" == 1 ]]
+  grep -q 'nested tx9-logs exited 1 before Hermes exec' "$tmp/gateway-start-failure-quiet1.stderr"
+  [[ ! -s "$tmp/gateway-start-failure-quiet2.stderr" ]] || {
     echo "quiet reconcile re-logged an unchanged gateway start failure" >&2
     exit 1
   }
