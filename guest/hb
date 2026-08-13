@@ -33,6 +33,7 @@ TOKEN_ENV="$AGENT_HOME/.config/hermes-box/executor-mcp.env"
 GATEWAY_LOCK_WAIT_SECONDS=10
 GATEWAY_START_WAIT_ATTEMPTS=50
 GATEWAY_START_WAIT_INTERVAL=0.1
+GATEWAY_RESTART_DELAY="${HB_GATEWAY_RESTART_DELAY:-2}"
 
 # Remote-executor mode (Docker compose split): when EXECUTOR_HOST points away
 # from loopback, Executor runs in its own container. hb then only checks
@@ -155,6 +156,30 @@ _release_daemon_lock() {
   unset "_DAEMON_LOCK_FDS[$lock]"
 }
 
+_valid_open_fd() {
+  local candidate="$1"
+  [[ "$candidate" =~ ^[0-9]+$ && -e "/proc/self/fd/$candidate" ]]
+}
+
+# Inherited mirror-FD numbers are an atomic pair. Presence of the strings is
+# not proof the descriptors are still open here: hb-workload keeps the outer
+# capture's environment, then later hb subprocesses can retain the names after
+# those descriptors were closed or reused for a lock.
+_sanitize_log_mirror_fds() {
+  if ! _valid_open_fd "${TX9_LOG_MIRROR_STDOUT_FD:-}" ||
+     ! _valid_open_fd "${TX9_LOG_MIRROR_STDERR_FD:-}"; then
+    unset TX9_LOG_MIRROR_STDOUT_FD TX9_LOG_MIRROR_STDERR_FD
+  fi
+}
+
+_clear_gateway_start_failure() {
+  rm -f "$HB_RUNTIME_STATE_DIR/gateway-start.state" 2>/dev/null || true
+}
+
+_report_gateway_start_failure() {
+  _steady_report gateway-start failed "$1" stderr
+}
+
 # A long-lived daemon spawned with a lock fd still open would inherit it and
 # hold the underlying flock open for its entire lifetime (file description
 # locks survive fork; the kernel only auto-releases once every fd referring
@@ -165,24 +190,39 @@ _release_daemon_lock() {
 # milliseconds right after spawning.
 _spawn_without_lock_fd() {
   shift
-  local logfile="$1" fd source log_dir
+  local logfile="$1" fd source log_dir launcher_log
+  local -a capture_cmd child_cmd
   shift
+  child_cmd=("$@")
   # A daemon start can occur while a higher-level coordination lock is also
   # held (for example, the MCP reload lock around a gateway restart). Close
   # every tracked lock fd in the child so no long-lived daemon inherits and
-  # pins any of them after the spawning shell releases its copies.
+  # pins any of them after the spawning shell releases its copies. Validate
+  # inherited mirror FDs after that cleanup: a lock fd can reuse a stale
+  # mirror number, and closing it must not leave TX9_LOG_MIRROR_*_FD pointing
+  # at a now-closed descriptor.
   (
     for fd in "${_DAEMON_LOCK_FDS[@]}"; do
       eval "exec ${fd}>&-"
     done
+    _sanitize_log_mirror_fds
     if command -v tx9-logs >/dev/null 2>&1; then
       source="$(basename "$logfile" .log)"
       [[ "$source" != hermes-gateway ]] || source=hermes
       log_dir="$(dirname "$logfile")"
-      exec nohup tx9-logs capture --source "$source" --log-dir "$log_dir" -- "$@" \
-        </dev/null >/dev/null 2>&1
+      launcher_log="${logfile%.log}.launcher.log"
+      capture_cmd=(tx9-logs capture --source "$source" --log-dir "$log_dir")
+      if [[ "$source" == hermes ]]; then
+        # The wrapper is Hermes' process manager. Restart unexpected child
+        # exits; --external-supervisor makes in-chat restart/update return
+        # here instead of daemonizing a replacement.
+        capture_cmd+=(--restart-delay "$GATEWAY_RESTART_DELAY")
+        child_cmd+=(--external-supervisor)
+      fi
+      exec nohup "${capture_cmd[@]}" -- "${child_cmd[@]}" \
+        </dev/null >/dev/null 2>>"$launcher_log"
     fi
-    exec nohup "$@" >>"$logfile" 2>&1
+    exec nohup "${child_cmd[@]}" >>"$logfile" 2>&1
   ) &
 }
 
@@ -238,6 +278,10 @@ _gateway_capture_pids() {
 
 _gateway_running() {
   [[ -n "$(_gateway_pids)" ]]
+}
+
+_gateway_or_capture_running() {
+  _gateway_running || [[ -n "$(_gateway_capture_pids)" ]]
 }
 
 # Print the real gateway PID and return 0 once it appears. Return 2 when the
@@ -298,13 +342,14 @@ _start_gateway() {
       return 1
     fi
     printf '%s\n' "${gateway_pids[0]}" >"$GATEWAY_PID"
+    _clear_gateway_start_failure
     _release_daemon_lock "$GATEWAY_LOCK"
     return 0
   fi
   mapfile -t capture_pids < <(_gateway_capture_pids)
   if ((${#capture_pids[@]} > 0)); then
     if ((${#capture_pids[@]} != 1)); then
-      echo "Hermes gateway capture is pending but did not start cleanly" >&2
+      _report_gateway_start_failure "Hermes gateway capture is pending but did not start cleanly"
       _release_daemon_lock "$GATEWAY_LOCK"
       return 1
     fi
@@ -315,8 +360,9 @@ _start_gateway() {
     fi
     if [[ "$wait_status" == 0 ]]; then
       printf '%s\n' "$gateway_pid" >"$GATEWAY_PID"
+      _clear_gateway_start_failure
     elif [[ "$wait_status" != 2 ]]; then
-      echo "Hermes gateway capture is pending but did not start cleanly" >&2
+      _report_gateway_start_failure "Hermes gateway capture is pending but did not start cleanly"
       _release_daemon_lock "$GATEWAY_LOCK"
       return 1
     else
@@ -340,13 +386,16 @@ _start_gateway() {
     _release_daemon_lock "$GATEWAY_LOCK"
     return 0
   elif [[ "$wait_status" != 0 ]]; then
+    local wrapper_status=1
     kill -TERM "$wrapper_pid" 2>/dev/null || true
-    wait "$wrapper_pid" 2>/dev/null || true
-    echo "Hermes gateway failed to start; see: hb logs hermes" >&2
+    wait "$wrapper_pid" 2>/dev/null && wrapper_status=0 || wrapper_status=$?
+    _report_gateway_start_failure \
+      "Hermes gateway failed to start; nested tx9-logs exited ${wrapper_status} before Hermes exec; see: $LOGS/hermes-gateway.launcher.log"
     _release_daemon_lock "$GATEWAY_LOCK"
     return 1
   fi
   printf '%s\n' "$gateway_pid" >"$GATEWAY_PID"
+  _clear_gateway_start_failure
   _release_daemon_lock "$GATEWAY_LOCK"
 }
 
@@ -390,14 +439,17 @@ _stop_executor() {
 
 _stop_gateway() {
   local attempt
+  # The capture argv includes `hermes gateway run`, so this TERM reaches the
+  # wrapper as well as the child. The wrapper must see the signal: otherwise
+  # --restart-delay would bring the gateway back after an intentional stop.
   pkill -TERM -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true
   for ((attempt = 0; attempt < 30; attempt++)); do
-    _gateway_running || break
+    _gateway_or_capture_running || break
     sleep 1
   done
   pkill -KILL -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true
   rm -f "$GATEWAY_PID"
-  ! _gateway_running || { echo "Hermes gateway failed to stop" >&2; return 1; }
+  ! _gateway_or_capture_running || { echo "Hermes gateway failed to stop" >&2; return 1; }
 }
 
 pause() {

@@ -844,6 +844,29 @@ def write_all(fd: int, payload: bytes) -> None:
         view = view[written:]
 
 
+def inherited_open_fd(raw: str | None) -> int | None:
+    """Return a still-open FD from inherited mirror metadata, or None.
+
+    Environment presence is not a validity contract. Nested capture can retain
+    TX9_LOG_MIRROR_*_FD strings after those descriptors were closed, reused
+    for a lock, or never inherited into this process.
+    """
+
+    if raw is None:
+        return None
+    try:
+        fd = int(raw)
+    except (TypeError, ValueError):
+        return None
+    if fd < 0:
+        return None
+    try:
+        os.fstat(fd)
+    except OSError:
+        return None
+    return fd
+
+
 class Capture:
     def __init__(self, source: str, log_dir: Path, max_bytes: int, max_files: int) -> None:
         log_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -872,15 +895,20 @@ class Capture:
         # into a summary. State: (message, repeat count, first monotonic).
         self.dedup_state: dict[str, tuple[str, int, float]] = {}
 
-        inherited_out = os.environ.get("TX9_LOG_MIRROR_STDOUT_FD")
-        inherited_err = os.environ.get("TX9_LOG_MIRROR_STDERR_FD")
-        self.owns_mirror_fds = inherited_out is None or inherited_err is None
-        if self.owns_mirror_fds:
+        raw_inherited_out = os.environ.get("TX9_LOG_MIRROR_STDOUT_FD")
+        raw_inherited_err = os.environ.get("TX9_LOG_MIRROR_STDERR_FD")
+        inherited_out = inherited_open_fd(raw_inherited_out)
+        inherited_err = inherited_open_fd(raw_inherited_err)
+        if inherited_out is None or inherited_err is None:
+            if raw_inherited_out is not None or raw_inherited_err is not None:
+                warn("ignoring invalid inherited TX9_LOG_MIRROR_*_FD values")
+            self.owns_mirror_fds = True
             self.mirror_out = os.dup(sys.stdout.fileno())
             self.mirror_err = os.dup(sys.stderr.fileno())
         else:
-            self.mirror_out = int(inherited_out)
-            self.mirror_err = int(inherited_err)
+            self.owns_mirror_fds = False
+            self.mirror_out = inherited_out
+            self.mirror_err = inherited_err
             # A nested capture must not keep its parent's stdout/stderr pipes
             # open. Mirror directly to the inherited original container fds.
             os.dup2(self.mirror_out, sys.stdout.fileno())

@@ -51,6 +51,218 @@ args = parser.parse_args(["capture", "--source", "agent", "--", "true"])
 assert args.restart_delay is None
 PY
 
+# Inherited mirror-FD metadata is not a validity contract. Closed, missing,
+# half-valid, and malformed values must fall back to owned stdout/stderr dups
+# instead of crashing in Capture.__init__ before the target is exec'd.
+python3 - "$helper" "$tmp/mirror-fds" <<'PY'
+import importlib.machinery
+import importlib.util
+import os
+import pathlib
+import sys
+
+loader = importlib.machinery.SourceFileLoader("tx9_logs_mirror_fds", sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+assert spec is not None
+module = importlib.util.module_from_spec(spec)
+loader.exec_module(module)
+root = pathlib.Path(sys.argv[2])
+root.mkdir(parents=True, exist_ok=True)
+
+assert module.inherited_open_fd(None) is None
+assert module.inherited_open_fd("") is None
+assert module.inherited_open_fd("nope") is None
+assert module.inherited_open_fd("-1") is None
+assert module.inherited_open_fd("93") is None
+assert module.inherited_open_fd("999999999999") is None
+assert module.inherited_open_fd(str(sys.stdout.fileno())) == sys.stdout.fileno()
+assert module.inherited_open_fd(str(sys.stderr.fileno())) == sys.stderr.fileno()
+
+saved_out = os.dup(sys.stdout.fileno())
+saved_err = os.dup(sys.stderr.fileno())
+
+
+def restore_stdio():
+    os.dup2(saved_out, sys.stdout.fileno())
+    os.dup2(saved_err, sys.stderr.fileno())
+
+
+def run_capture(label, env_updates, *, expect_owned, expect_warning):
+    for name in ("TX9_LOG_MIRROR_STDOUT_FD", "TX9_LOG_MIRROR_STDERR_FD"):
+        os.environ.pop(name, None)
+    os.environ.update(env_updates)
+    module.WARNINGS.clear()
+    log_dir = root / label
+    try:
+        capture = module.Capture("agent", log_dir, 1024 * 1024, 2)
+        try:
+            assert capture.owns_mirror_fds is expect_owned
+            warning_text = "\n".join(module.WARNINGS)
+            if expect_warning:
+                assert "invalid inherited TX9_LOG_MIRROR" in warning_text
+            else:
+                assert "invalid inherited TX9_LOG_MIRROR" not in warning_text
+            assert capture.run_once(["/bin/true"]) == 0
+        finally:
+            capture.close()
+    finally:
+        restore_stdio()
+        for name in ("TX9_LOG_MIRROR_STDOUT_FD", "TX9_LOG_MIRROR_STDERR_FD"):
+            os.environ.pop(name, None)
+
+
+run_capture("absent", {}, expect_owned=True, expect_warning=False)
+
+out_read, out_write = os.pipe()
+err_read, err_write = os.pipe()
+try:
+    run_capture(
+        "valid",
+        {
+            "TX9_LOG_MIRROR_STDOUT_FD": str(out_write),
+            "TX9_LOG_MIRROR_STDERR_FD": str(err_write),
+        },
+        expect_owned=False,
+        expect_warning=False,
+    )
+    os.fstat(out_write)
+    os.fstat(err_write)
+finally:
+    os.close(out_read)
+    os.close(out_write)
+    os.close(err_read)
+    os.close(err_write)
+
+closed_read, closed_write = os.pipe()
+closed_out, closed_err = closed_write, closed_read
+os.close(closed_write)
+os.close(closed_read)
+run_capture(
+    "closed",
+    {
+        "TX9_LOG_MIRROR_STDOUT_FD": str(closed_out),
+        "TX9_LOG_MIRROR_STDERR_FD": str(closed_err),
+    },
+    expect_owned=True,
+    expect_warning=True,
+)
+
+half_read, half_write = os.pipe()
+try:
+    run_capture(
+        "half-valid",
+        {
+            "TX9_LOG_MIRROR_STDOUT_FD": str(half_write),
+            "TX9_LOG_MIRROR_STDERR_FD": "94",
+        },
+        expect_owned=True,
+        expect_warning=True,
+    )
+    os.fstat(half_write)
+finally:
+    os.close(half_read)
+    os.close(half_write)
+
+run_capture(
+    "missing-err",
+    {"TX9_LOG_MIRROR_STDOUT_FD": str(sys.stdout.fileno())},
+    expect_owned=True,
+    expect_warning=True,
+)
+run_capture(
+    "nonnumeric",
+    {"TX9_LOG_MIRROR_STDOUT_FD": "nope", "TX9_LOG_MIRROR_STDERR_FD": "also-nope"},
+    expect_owned=True,
+    expect_warning=True,
+)
+run_capture(
+    "negative",
+    {"TX9_LOG_MIRROR_STDOUT_FD": "-1", "TX9_LOG_MIRROR_STDERR_FD": "-2"},
+    expect_owned=True,
+    expect_warning=True,
+)
+run_capture(
+    "huge",
+    {
+        "TX9_LOG_MIRROR_STDOUT_FD": "999999999999",
+        "TX9_LOG_MIRROR_STDERR_FD": "888888888888",
+    },
+    expect_owned=True,
+    expect_warning=True,
+)
+
+os.close(saved_out)
+os.close(saved_err)
+PY
+
+invalid_mirror_dir="$tmp/invalid-mirror-repro"
+mkdir -p "$invalid_mirror_dir"
+set +e
+env \
+  TX9_LOG_MIRROR_STDOUT_FD=93 \
+  TX9_LOG_MIRROR_STDERR_FD=94 \
+  "$helper" capture --source repro --log-dir "$invalid_mirror_dir" -- /bin/true \
+  >"$tmp/invalid-mirror.stdout" 2>"$tmp/invalid-mirror.stderr"
+invalid_mirror_status=$?
+set -e
+[[ "$invalid_mirror_status" == 0 ]]
+if grep -q 'Bad file descriptor' "$tmp/invalid-mirror.stderr"; then
+  echo "capture crashed on invalid inherited mirror FDs" >&2
+  exit 1
+fi
+grep -q 'ignoring invalid inherited TX9_LOG_MIRROR' "$tmp/invalid-mirror.stderr"
+jq -e 'select(.type == "process_start")' "$invalid_mirror_dir/repro.jsonl" >/dev/null
+jq -e 'select(.type == "process_exit" and .data.status == 0)' \
+  "$invalid_mirror_dir/repro.jsonl" >/dev/null
+
+# A child exit with --restart-delay keeps the wrapper alive and records the
+# restart before launching a replacement.
+restart_dir="$tmp/restart-delay-child"
+restart_pid_file="$tmp/restart-delay-child.pid"
+restart_generation="$tmp/restart-delay-child.generation"
+mkdir -p "$restart_dir"
+RESTART_PID_FILE="$restart_pid_file" RESTART_GENERATION="$restart_generation" \
+  "$helper" capture --source agent --log-dir "$restart_dir" --restart-delay 0.2 -- \
+    bash -c 'printf "%s\n" "$$" >"$RESTART_PID_FILE"; n=$(cat "$RESTART_GENERATION" 2>/dev/null || echo 0); echo $((n + 1)) >"$RESTART_GENERATION"; if [[ "$n" == 0 ]]; then exit 7; fi; trap "exit 0" TERM; while :; do sleep 1; done' \
+  >/dev/null 2>&1 &
+restart_wrapper_pid=$!
+pids+=("$restart_wrapper_pid")
+wait_for_file "$restart_pid_file"
+first_child="$(cat "$restart_pid_file")"
+for _ in {1..100}; do
+  [[ "$(cat "$restart_generation" 2>/dev/null || true)" == 2 ]] && break
+  sleep 0.05
+done
+[[ "$(cat "$restart_generation")" == 2 ]]
+second_child="$(cat "$restart_pid_file")"
+[[ "$second_child" != "$first_child" ]]
+kill -0 "$restart_wrapper_pid"
+kill -0 "$second_child"
+jq -e 'select(.type == "process_exit" and .data.status == 7)' \
+  "$restart_dir/agent.jsonl" >/dev/null
+jq -e 'select(.type == "process_restart")' "$restart_dir/agent.jsonl" >/dev/null
+jq -e --argjson pid "$second_child" \
+  'select(.type == "process_start" and .data.pid == $pid)' \
+  "$restart_dir/agent.jsonl" >/dev/null
+kill -TERM "$restart_wrapper_pid"
+set +e
+wait "$restart_wrapper_pid"
+restart_wrapper_status=$?
+set -e
+[[ "$restart_wrapper_status" == 143 ]]
+for _ in {1..50}; do
+  if ! kill -0 "$second_child" 2>/dev/null ||
+    [[ "$(ps -o stat= -p "$second_child" 2>/dev/null)" == Z* ]]; then
+    break
+  fi
+  sleep 0.02
+done
+if kill -0 "$second_child" 2>/dev/null &&
+  [[ "$(ps -o stat= -p "$second_child" 2>/dev/null)" != Z* ]]; then
+  echo "restarting capture left its child running after SIGTERM" >&2
+  exit 1
+fi
+
 # The parent-death re-exec shim preserves Popen's lifecycle contract: actual
 # exec failures are process_start_failed events, never successful starts.
 start_failure_root="$tmp/start-failures"
