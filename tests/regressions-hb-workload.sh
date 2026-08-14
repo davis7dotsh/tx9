@@ -824,6 +824,33 @@ EOF
   [[ "$(cat "$tmp/gateway-reload.events")" == $'gateway-stop\ngateway-start' ]]
 )
 
+# A supervised wrapper can be alive while Hermes is between child processes.
+# Keep pending reload intent through that restart window; the next reconcile
+# will process it after the replacement child appears.
+(
+  HB_DATA="$tmp/gateway-reload-supervisor-only-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  mkdir -p "$GATEWAY_RELOAD_REQUESTS"
+  touch "$GATEWAY_RELOAD_REQUESTS/request.supervisor-only"
+  _gateway_running() { return 1; }
+  _gateway_capture_pids() { printf '4242\n'; }
+  _stop_gateway() {
+    echo "reload stopped a supervisor while its child was restarting" >&2
+    return 1
+  }
+  gateway_reload_if_requested
+  [[ -e "$GATEWAY_RELOAD_REQUESTS/request.supervisor-only" ]]
+
+  # Preserve the pre-supervision behavior: with no wrapper and no child, the
+  # next ordinary gateway start will read current config, so the stale request
+  # can be consumed without manufacturing an extra restart.
+  _gateway_capture_pids() { return 0; }
+  gateway_reload_if_requested
+  [[ ! -e "$GATEWAY_RELOAD_REQUESTS/request.supervisor-only" ]]
+)
+
 # A gateway restart preserves the freshest runtime-injected remote token,
 # falls back to an existing exported token, and only then reads the managed
 # on-disk token. Disabling wiring clears every inherited credential.

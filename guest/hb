@@ -638,6 +638,14 @@ gateway_reload_if_requested() {
     return 0
   fi
   if ! _gateway_running; then
+    # A supervised gateway can be between child processes during its restart
+    # delay. Keep the request until a child is observable: deleting it here
+    # would race the wrapper's automatic restart and could skip the explicit
+    # reload required for a concurrent config change.
+    if [[ -n "$(_gateway_capture_pids)" ]]; then
+      _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
+      return 0
+    fi
     rm -f "${requests[@]}"
     _release_daemon_lock "$GATEWAY_RELOAD_LOCK"
     return 0
