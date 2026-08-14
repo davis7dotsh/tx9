@@ -149,8 +149,8 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
   pgrep() { printf '101\n202\n'; }
   ps() {
     case "${*: -1}" in
-      101) printf 'python3 /opt/hermes-box/bin/tx9-logs capture --source hermes -- hermes gateway run --replace\n' ;;
-      202) printf 'hermes gateway run --replace\n' ;;
+      101) printf 'python3 /opt/hermes-box/bin/tx9-logs capture --source hermes --restart-delay 2 -- hermes gateway run --replace --external-supervisor\n' ;;
+      202) printf 'hermes gateway run --replace --external-supervisor\n' ;;
     esac
   }
   mapfile -t gateway_pids < <(_gateway_pids)
@@ -824,6 +824,33 @@ EOF
   [[ "$(cat "$tmp/gateway-reload.events")" == $'gateway-stop\ngateway-start' ]]
 )
 
+# A supervised wrapper can be alive while Hermes is between child processes.
+# Keep pending reload intent through that restart window; the next reconcile
+# will process it after the replacement child appears.
+(
+  HB_DATA="$tmp/gateway-reload-supervisor-only-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  mkdir -p "$GATEWAY_RELOAD_REQUESTS"
+  touch "$GATEWAY_RELOAD_REQUESTS/request.supervisor-only"
+  _gateway_running() { return 1; }
+  _gateway_capture_pids() { printf '4242\n'; }
+  _stop_gateway() {
+    echo "reload stopped a supervisor while its child was restarting" >&2
+    return 1
+  }
+  gateway_reload_if_requested
+  [[ -e "$GATEWAY_RELOAD_REQUESTS/request.supervisor-only" ]]
+
+  # Preserve the pre-supervision behavior: with no wrapper and no child, the
+  # next ordinary gateway start will read current config, so the stale request
+  # can be consumed without manufacturing an extra restart.
+  _gateway_capture_pids() { return 0; }
+  gateway_reload_if_requested
+  [[ ! -e "$GATEWAY_RELOAD_REQUESTS/request.supervisor-only" ]]
+)
+
 # A gateway restart preserves the freshest runtime-injected remote token,
 # falls back to an existing exported token, and only then reads the managed
 # on-disk token. Disabling wiring clears every inherited credential.
@@ -1033,5 +1060,291 @@ if ! flock -w 2 "$outer_lock_path" -c 'exit 0' 2>/dev/null; then
   exit 1
 fi
 kill -9 "$spawned_pid" 2>/dev/null || true
+
+install_fake_hermes() {
+  local bin="$1"
+  mkdir -p "$bin"
+  cat >"$bin/hermes" <<'EOF'
+#!/usr/bin/env bash
+if [[ "${1:-}" == gateway && "${2:-}" == run ]]; then
+  printf '%s\n' "$$" >"${HERMES_PID_FILE:?}"
+  printf '%s\n' "$*" >"${HERMES_ARGS_FILE:?}"
+  trap 'exit 0' TERM INT
+  while :; do sleep 0.1; done
+fi
+exit 0
+EOF
+  chmod 0700 "$bin/hermes"
+}
+
+wait_for_pid_change() {
+  local file="$1" old_pid="$2" attempt current
+  for ((attempt = 0; attempt < 80; attempt++)); do
+    current="$(cat "$file" 2>/dev/null || true)"
+    if [[ -n "$current" && "$current" != "$old_pid" ]] && kill -0 "$current" 2>/dev/null; then
+      printf '%s\n' "$current"
+      return 0
+    fi
+    sleep 0.1
+  done
+  echo "timed out waiting for a new PID in $file" >&2
+  return 1
+}
+
+# Mirror-FD strings are an atomic pair: missing, nonnumeric, or closed values
+# drop both variables so a nested capture cannot dup2 an invalid descriptor.
+(
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  export TX9_LOG_MIRROR_STDOUT_FD=93 TX9_LOG_MIRROR_STDERR_FD=94
+  _sanitize_log_mirror_fds
+  [[ -z "${TX9_LOG_MIRROR_STDOUT_FD+x}" ]]
+  [[ -z "${TX9_LOG_MIRROR_STDERR_FD+x}" ]]
+
+  export TX9_LOG_MIRROR_STDOUT_FD=1 TX9_LOG_MIRROR_STDERR_FD=2
+  _sanitize_log_mirror_fds
+  [[ "$TX9_LOG_MIRROR_STDOUT_FD" == 1 ]]
+  [[ "$TX9_LOG_MIRROR_STDERR_FD" == 2 ]]
+
+  export TX9_LOG_MIRROR_STDOUT_FD=1 TX9_LOG_MIRROR_STDERR_FD=94
+  _sanitize_log_mirror_fds
+  [[ -z "${TX9_LOG_MIRROR_STDOUT_FD+x}" ]]
+  [[ -z "${TX9_LOG_MIRROR_STDERR_FD+x}" ]]
+
+  export TX9_LOG_MIRROR_STDOUT_FD=1
+  unset TX9_LOG_MIRROR_STDERR_FD
+  _sanitize_log_mirror_fds
+  [[ -z "${TX9_LOG_MIRROR_STDOUT_FD+x}" ]]
+  [[ -z "${TX9_LOG_MIRROR_STDERR_FD+x}" ]]
+
+  export TX9_LOG_MIRROR_STDOUT_FD=nope TX9_LOG_MIRROR_STDERR_FD=-1
+  _sanitize_log_mirror_fds
+  [[ -z "${TX9_LOG_MIRROR_STDOUT_FD+x}" ]]
+  [[ -z "${TX9_LOG_MIRROR_STDERR_FD+x}" ]]
+)
+
+# Closing coordination lock fds happens before mirror validation, so a lock
+# that reused a stale mirror number is not treated as a live docker mirror.
+(
+  HB_DATA="$tmp/mirror-lock-reuse-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  rm -f "$GATEWAY_DISABLED" "$QUIESCE_FILE"
+  INSTALL_HERMES=1
+  HB_GATEWAY_RESTART_DELAY=0.2
+  GATEWAY_RESTART_DELAY=0.2
+  bin="$tmp/mirror-lock-reuse-bin"
+  install_fake_hermes "$bin"
+  cat >"$bin/tx9-logs" <<'EOF'
+#!/usr/bin/env bash
+printf 'out=%s err=%s\n' "${TX9_LOG_MIRROR_STDOUT_FD-unset}" "${TX9_LOG_MIRROR_STDERR_FD-unset}" \
+  >"${TX9_MIRROR_ENV_FILE:?}"
+exec "$REAL_TX9_LOGS" "$@"
+EOF
+  chmod 0700 "$bin/tx9-logs"
+  export PATH="$bin:$PATH"
+  export REAL_TX9_LOGS="$PROJECT_ROOT/guest/tx9-logs"
+  export TX9_MIRROR_ENV_FILE="$tmp/mirror-lock-reuse.env"
+  export HERMES_PID_FILE="$tmp/mirror-lock-reuse.gateway.pid"
+  export HERMES_ARGS_FILE="$tmp/mirror-lock-reuse.args"
+  _acquire_daemon_lock "$GATEWAY_LOCK" || exit 1
+  _acquire_daemon_lock "$EXECUTOR_LOCK" || exit 1
+  export TX9_LOG_MIRROR_STDOUT_FD="${_DAEMON_LOCK_FDS[$GATEWAY_LOCK]}"
+  export TX9_LOG_MIRROR_STDERR_FD="${_DAEMON_LOCK_FDS[$EXECUTOR_LOCK]}"
+  _spawn_without_lock_fd "$GATEWAY_LOCK" "$LOGS/hermes-gateway.log" hermes gateway run --replace
+  wait_for_file "$HERMES_PID_FILE"
+  wait_for_file "$TX9_MIRROR_ENV_FILE"
+  [[ "$(cat "$TX9_MIRROR_ENV_FILE")" == 'out=unset err=unset' ]]
+  grep -Fq -- '--external-supervisor' "$HERMES_ARGS_FILE"
+  mapfile -t capture_pids < <(_gateway_capture_pids)
+  [[ "${#capture_pids[@]}" == 1 ]]
+  args="$(ps -o args= -p "${capture_pids[0]}")"
+  [[ "$args" == *"--restart-delay 0.2"* ]]
+  [[ "$args" == *"--external-supervisor"* ]]
+  pids+=("${capture_pids[0]}" "$(cat "$HERMES_PID_FILE")")
+  _release_daemon_lock "$GATEWAY_LOCK"
+  _release_daemon_lock "$EXECUTOR_LOCK"
+  _stop_gateway
+)
+
+# Nested capture under an outer tx9-logs workload still starts exactly one
+# Hermes wrapper, even when the inherited mirror numbers are closed. The
+# short-lived hb launcher exits; the wrapper is adopted away from it.
+(
+  HB_DATA="$tmp/nested-capture-data"
+  HOME="$HB_DATA/home/agent"
+  mkdir -p "$HOME" "$tmp/nested-outer-logs"
+  bin="$tmp/nested-capture-bin"
+  install_fake_hermes "$bin"
+  ln -sf "$PROJECT_ROOT/guest/tx9-logs" "$bin/tx9-logs"
+  export PATH="$bin:$PATH"
+  export HERMES_PID_FILE="$tmp/nested-capture.gateway.pid"
+  export HERMES_ARGS_FILE="$tmp/nested-capture.args"
+  export HB_DATA HOME
+  export HB_GATEWAY_RESTART_DELAY=0.2
+  export INSTALL_HERMES=1
+  export HB_SCRIPT="$PROJECT_ROOT/guest/hb"
+  export WRAPPER_PID_FILE="$tmp/nested-capture.wrapper.pid"
+  export HB_LAUNCHER_PID_FILE="$tmp/nested-capture.hb.pid"
+  export WORKLOAD_PID_FILE="$tmp/nested-capture.workload.pid"
+  cat >"$tmp/nested-capture-hb.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$$" >"$HB_LAUNCHER_PID_FILE"
+# shellcheck disable=SC1090
+source "$HB_SCRIPT"
+init
+rm -f "$GATEWAY_DISABLED" "$QUIESCE_FILE"
+INSTALL_HERMES=1
+export TX9_LOG_MIRROR_STDOUT_FD=93 TX9_LOG_MIRROR_STDERR_FD=94
+_start_gateway
+EOF
+  cat >"$tmp/nested-capture-workload.sh" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "$$" >"$WORKLOAD_PID_FILE"
+bash "$1"
+# shellcheck disable=SC1090
+source "$HB_SCRIPT"
+mapfile -t capture_pids < <(_gateway_capture_pids)
+printf '%s\n' "${capture_pids[0]}" >"$WRAPPER_PID_FILE"
+trap 'exit 0' TERM INT
+while :; do sleep 0.1; done
+EOF
+  chmod 0700 "$tmp/nested-capture-hb.sh" "$tmp/nested-capture-workload.sh"
+  "$PROJECT_ROOT/guest/tx9-logs" capture --source agent --log-dir "$tmp/nested-outer-logs" -- \
+    bash "$tmp/nested-capture-workload.sh" "$tmp/nested-capture-hb.sh" \
+    >/dev/null 2>&1 &
+  outer_pid=$!
+  pids+=("$outer_pid")
+  wait_for_file "$HERMES_PID_FILE"
+  wait_for_file "$WRAPPER_PID_FILE"
+  wait_for_file "$HB_LAUNCHER_PID_FILE"
+  wrapper_pid="$(cat "$WRAPPER_PID_FILE")"
+  gateway_pid="$(cat "$HERMES_PID_FILE")"
+  hb_pid="$(cat "$HB_LAUNCHER_PID_FILE")"
+  pids+=("$wrapper_pid" "$gateway_pid")
+  kill -0 "$wrapper_pid"
+  kill -0 "$gateway_pid"
+  if kill -0 "$hb_pid" 2>/dev/null; then
+    echo "hb launcher was still alive after nested gateway start" >&2
+    exit 1
+  fi
+  wrapper_ppid="$(ps -o ppid= -p "$wrapper_pid" | tr -d ' ')"
+  [[ "$wrapper_ppid" != "$hb_pid" ]]
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  GATEWAY_RESTART_DELAY=0.2
+  mapfile -t gateway_pids < <(_gateway_pids)
+  mapfile -t capture_pids < <(_gateway_capture_pids)
+  [[ "${gateway_pids[*]}" == "$gateway_pid" ]]
+  [[ "${capture_pids[*]}" == "$wrapper_pid" ]]
+  grep -Fq -- '--external-supervisor' "$HERMES_ARGS_FILE"
+  args="$(ps -o args= -p "$wrapper_pid")"
+  [[ "$args" == *"--restart-delay 0.2"* ]]
+  [[ "$args" == *"tx9-logs capture"* ]]
+  _start_gateway
+  mapfile -t gateway_pids < <(_gateway_pids)
+  mapfile -t capture_pids < <(_gateway_capture_pids)
+  [[ "${#gateway_pids[@]}" == 1 ]]
+  [[ "${#capture_pids[@]}" == 1 ]]
+  _stop_gateway
+  kill -TERM "$outer_pid" 2>/dev/null || true
+  wait "$outer_pid" 2>/dev/null || true
+)
+
+# Killing only the Hermes child leaves the wrapper in place and starts a
+# replacement inside the restart window. Explicit stop kills both and does
+# not resurrect the gateway.
+(
+  HB_DATA="$tmp/gateway-restart-data"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  rm -f "$GATEWAY_DISABLED" "$QUIESCE_FILE"
+  INSTALL_HERMES=1
+  HB_GATEWAY_RESTART_DELAY=0.2
+  GATEWAY_RESTART_DELAY=0.2
+  bin="$tmp/gateway-restart-bin"
+  install_fake_hermes "$bin"
+  ln -sf "$PROJECT_ROOT/guest/tx9-logs" "$bin/tx9-logs"
+  export PATH="$bin:$PATH"
+  export HERMES_PID_FILE="$tmp/gateway-restart.gateway.pid"
+  export HERMES_ARGS_FILE="$tmp/gateway-restart.args"
+  _start_gateway
+  wait_for_file "$HERMES_PID_FILE"
+  mapfile -t capture_pids < <(_gateway_capture_pids)
+  [[ "${#capture_pids[@]}" == 1 ]]
+  wrapper_pid="${capture_pids[0]}"
+  first_gateway="$(cat "$HERMES_PID_FILE")"
+  pids+=("$wrapper_pid")
+  kill -TERM "$first_gateway"
+  second_gateway="$(wait_for_pid_change "$HERMES_PID_FILE" "$first_gateway")"
+  kill -0 "$wrapper_pid"
+  [[ "$(_gateway_capture_pids)" == "$wrapper_pid" ]]
+  [[ "$second_gateway" != "$first_gateway" ]]
+  jq -e 'select(.type == "process_exit")' "$LOGS/hermes.jsonl" >/dev/null
+  jq -e 'select(.type == "process_restart")' "$LOGS/hermes.jsonl" >/dev/null
+  jq -e --argjson pid "$second_gateway" \
+    'select(.type == "process_start" and .data.pid == $pid)' \
+    "$LOGS/hermes.jsonl" >/dev/null
+  gateway_disable >/dev/null
+  [[ -e "$GATEWAY_DISABLED" ]]
+  sleep 0.6
+  if _gateway_or_capture_running; then
+    echo "disabled gateway was resurrected by the capture restart loop" >&2
+    exit 1
+  fi
+  rm -f "$GATEWAY_DISABLED" "$HERMES_PID_FILE"
+  _start_gateway
+  wait_for_file "$HERMES_PID_FILE"
+  mapfile -t capture_pids < <(_gateway_capture_pids)
+  [[ "${#capture_pids[@]}" == 1 ]]
+  pids+=("${capture_pids[0]}" "$(cat "$HERMES_PID_FILE")")
+  pause >/dev/null
+  sleep 0.6
+  if _gateway_or_capture_running; then
+    echo "paused gateway was resurrected by the capture restart loop" >&2
+    exit 1
+  fi
+)
+
+# A wrapper that dies before Hermes exec reports that exit status instead of
+# a generic "see hb logs hermes" hint, and quiet reconcile does not flood.
+(
+  HB_DATA="$tmp/gateway-start-failure-data"
+  HB_RUNTIME_STATE_DIR="$tmp/gateway-start-failure-state"
+  # shellcheck disable=SC1090
+  source "$PROJECT_ROOT/guest/hb"
+  init
+  rm -f "$GATEWAY_DISABLED" "$QUIESCE_FILE"
+  INSTALL_HERMES=1
+  bin="$tmp/gateway-start-failure-bin"
+  install_fake_hermes "$bin"
+  printf '#!/usr/bin/env bash\nexit 1\n' >"$bin/tx9-logs"
+  chmod 0700 "$bin/tx9-logs"
+  export PATH="$bin:$PATH"
+  set +e
+  _start_gateway >"$tmp/gateway-start-failure.stdout" 2>"$tmp/gateway-start-failure.stderr"
+  first_status=$?
+  set -e
+  [[ "$first_status" == 1 ]]
+  grep -q 'nested tx9-logs exited 1 before Hermes exec' "$tmp/gateway-start-failure.stderr"
+  HB_STEADY_QUIET=1
+  set +e
+  _start_gateway >"$tmp/gateway-start-failure-quiet1.stdout" 2>"$tmp/gateway-start-failure-quiet1.stderr"
+  quiet_first_status=$?
+  _start_gateway >"$tmp/gateway-start-failure-quiet2.stdout" 2>"$tmp/gateway-start-failure-quiet2.stderr"
+  quiet_second_status=$?
+  set -e
+  [[ "$quiet_first_status" == 1 ]]
+  [[ "$quiet_second_status" == 1 ]]
+  grep -q 'nested tx9-logs exited 1 before Hermes exec' "$tmp/gateway-start-failure-quiet1.stderr"
+  [[ ! -s "$tmp/gateway-start-failure-quiet2.stderr" ]] || {
+    echo "quiet reconcile re-logged an unchanged gateway start failure" >&2
+    exit 1
+  }
+)
 
 echo "hb-workload regression checks passed"

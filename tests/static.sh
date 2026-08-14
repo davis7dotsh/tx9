@@ -73,6 +73,14 @@ grep -q -- '--source "service-\$name"' guest/tx9-services
 grep -q -- '--restart-delay' guest/tx9-services
 grep -q '_services_reconcile' guest/hb
 grep -q '_services_stop' guest/hb
+grep -q 'TX9_LOG_MIRROR_STDOUT_FD' guest/hb
+grep -q '_sanitize_log_mirror_fds' guest/hb
+grep -q 'GATEWAY_RESTART_DELAY' guest/hb
+grep -q -- '--external-supervisor' guest/hb
+grep -q 'inherited_open_fd' guest/tx9-logs
+grep -q 'ignoring invalid inherited TX9_LOG_MIRROR' guest/tx9-logs
+grep -q '_gateway_or_capture_running' guest/hb
+grep -q 'nested tx9-logs exited' guest/hb
 
 # --- provisioning / config invariants ------------------------------------
 grep -q 'tools) tools_only ;;' provision/provision.sh
