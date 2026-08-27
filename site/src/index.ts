@@ -32,6 +32,10 @@ const ASSET_RE = /^tx9_(?:linux|darwin)_(?:amd64|arm64)$/u;
 const VERSION_RE = /^\d+\.\d+\.\d+$/u;
 const CHECKSUMS = "checksums.txt";
 
+function isAsset(asset: string) {
+	return asset === CHECKSUMS || ASSET_RE.test(asset);
+}
+
 function text(body: string, status = 200, extra: Record<string, string> = {}): Response {
 	return new Response(body, {
 		status,
@@ -54,28 +58,50 @@ async function serveReleaseObject(
 	env: Env,
 	version: string,
 	asset: string,
-	method: string,
+	request: Request,
 ): Promise<Response> {
 	if (!VERSION_RE.test(version)) return text("not found\n", 404);
-	if (asset !== CHECKSUMS && !ASSET_RE.test(asset)) return text("not found\n", 404);
+	if (!isAsset(asset)) return text("not found\n", 404);
 
 	// HEAD needs only metadata — head() skips pulling the (binary-sized)
 	// body out of R2 entirely.
 	const key = `${version}/${asset}`;
 	let object: R2Object | null;
 	let body: ReadableStream | null = null;
-	if (method === "HEAD") {
+	const condition = request.headers.get("If-None-Match");
+	let unchanged = false;
+	if (request.method === "HEAD") {
 		object = await env.RELEASES.head(key);
+		unchanged =
+			object !== null &&
+			condition !== null &&
+			(condition.trim() === "*" ||
+				condition.split(",").some((tag) => tag.trim().replace(/^W\//u, "") === object?.httpEtag));
 	} else {
-		const got = await env.RELEASES.get(key);
+		// Pass only the supported validator. R2 omits the body when it
+		// matches, avoiding a binary download for a cache revalidation.
+		const onlyIf = new Headers();
+		if (condition !== null) onlyIf.set("If-None-Match", condition);
+		const got = await env.RELEASES.get(key, { onlyIf });
 		object = got;
-		body = got?.body ?? null;
+		unchanged = got !== null && !("body" in got);
+		body = got && "body" in got ? got.body : null;
 	}
 	if (!object) return text("not found\n", 404);
+	if (unchanged) {
+		return new Response(null, {
+			status: 304,
+			headers: {
+				ETag: object.httpEtag,
+				"Cache-Control": "public, max-age=31536000, immutable",
+			},
+		});
+	}
 
 	return new Response(body, {
 		headers: {
-			"Content-Type": asset === CHECKSUMS ? "text/plain; charset=utf-8" : "application/octet-stream",
+			"Content-Type":
+				asset === CHECKSUMS ? "text/plain; charset=utf-8" : "application/octet-stream",
 			"Content-Length": String(object.size),
 			ETag: object.httpEtag,
 			// Versioned paths are immutable by construction; the mutable
@@ -102,14 +128,17 @@ export default {
 
 		if (path === "/releases/latest") {
 			const version = await latestVersion(env);
-			if (!version) return text("no releases published yet\n", 404, { "Cache-Control": "no-store" });
+			if (!version)
+				return text("no releases published yet\n", 404, { "Cache-Control": "no-store" });
 			return text(`${version}\n`, 200, { "Cache-Control": "no-store" });
 		}
 
 		const latestAsset = path.match(/^\/releases\/latest\/([^/]+)$/u);
 		if (latestAsset) {
+			if (!isAsset(latestAsset[1])) return text("not found\n", 404);
 			const version = await latestVersion(env);
-			if (!version) return text("no releases published yet\n", 404, { "Cache-Control": "no-store" });
+			if (!version)
+				return text("no releases published yet\n", 404, { "Cache-Control": "no-store" });
 			// Redirect rather than proxy so the download URL in error
 			// messages / logs always names the concrete version.
 			return new Response(null, {
@@ -123,7 +152,7 @@ export default {
 
 		const versioned = path.match(/^\/releases\/([^/]+)\/([^/]+)$/u);
 		if (versioned) {
-			return serveReleaseObject(env, versioned[1], versioned[2], request.method);
+			return serveReleaseObject(env, versioned[1], versioned[2], request);
 		}
 
 		// Everything else (/, /favicon.ico, ...) falls through to static
