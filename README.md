@@ -246,9 +246,12 @@ npm audit --audit-level=high
 ```
 
 These commands do not start development servers or build container images.
-The Go toolchain and npm packages must be available or downloaded first.
+They require Bash, Make, Python 3, jq, ShellCheck, the Go toolchain declared in
+`go.mod`, and Node 22.18 or newer with npm. Go modules and npm packages must
+be available or downloaded first.
 Docker integration tests are optional; setting `TX9_TEST_DOCKER_IMAGE` to an
-already installed image with `/bin/sh` enables disposable helper tests.
+already installed image with `/bin/sh`, `cat`, `ls`, and `sleep` enables
+disposable helper tests. The audit used an existing `ubuntu:24.04` image.
 
 `.depot/workflows/check.yml` runs the Go/guest and site checks through Depot
 CI for pushes to `main` and pull requests against any branch, including stacks.
