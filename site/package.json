@@ -11,5 +11,8 @@
   "devDependencies": {
     "typescript": "^5.9.3",
     "wrangler": "^4.48.0"
+  },
+  "engines": {
+    "node": ">=22.18.0"
   }
 }
