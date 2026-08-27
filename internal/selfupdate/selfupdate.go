@@ -35,7 +35,7 @@ const (
 type Options struct {
 	// CurrentVersion is the running binary's version (internal/version.Version).
 	CurrentVersion string
-	// Force permits replacing a dev, equal, or newer version with the
+	// Force permits replacing a dev, custom, equal, or newer version with the
 	// site's latest release.
 	Force bool
 	// Origin overrides the release site origin. Zero value means
@@ -89,6 +89,9 @@ func Update(opts Options) (*Result, error) {
 		if !opts.Force {
 			return nil, ErrDevVersion
 		}
+	}
+	if _, numeric := splitNumeric(normalizeVersion(opts.CurrentVersion)); !numeric && !opts.Force {
+		return nil, fmt.Errorf("cannot order custom version %q against releases; pass --force to replace it", opts.CurrentVersion)
 	}
 
 	client := opts.HTTPClient

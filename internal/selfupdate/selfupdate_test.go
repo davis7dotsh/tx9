@@ -195,6 +195,36 @@ func TestUpdateNewerVersionRequiresForce(t *testing.T) {
 	}
 }
 
+func TestUpdateCustomVersionRequiresForce(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(fmt.Sprintf("force=%v", force), func(t *testing.T) {
+			srv := newTestServer(t, "2.0.0", "linux", "amd64", []byte("official release"))
+			exePath := filepath.Join(t.TempDir(), "tx9")
+			if err := os.WriteFile(exePath, []byte("custom build"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			res, err := Update(Options{
+				CurrentVersion: "10.0.0-custom", Force: force, Origin: srv.URL,
+				GOOS: "linux", GOARCH: "amd64", HTTPClient: srv.Client(),
+				execPathOverride: exePath,
+			})
+			want := "custom build"
+			if force {
+				want = "official release"
+				if err != nil || res == nil || !res.Applied {
+					t.Fatalf("forced update: result=%+v, error=%v", res, err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), "pass --force") || res != nil {
+				t.Fatalf("unforced custom update: result=%+v, error=%v", res, err)
+			}
+			got, err := os.ReadFile(exePath)
+			if err != nil || string(got) != want {
+				t.Fatalf("installed binary=%q, error=%v; want %q", got, err, want)
+			}
+		})
+	}
+}
+
 func TestUpdateDoesNotFollowPreexistingStageSymlink(t *testing.T) {
 	dir := t.TempDir()
 	exePath := filepath.Join(dir, "tx9")
