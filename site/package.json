@@ -5,7 +5,8 @@
   "scripts": {
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
-    "check": "wrangler types --strict-vars=false && tsc --noEmit"
+    "check": "wrangler types --strict-vars=false && tsc --noEmit",
+    "test": "node --import ./tests/text-modules.mjs --test tests/*.test.mjs"
   },
   "devDependencies": {
     "typescript": "^5.9.3",
