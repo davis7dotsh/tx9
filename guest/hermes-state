@@ -295,7 +295,7 @@ def inspect_home(home: Path, checkpoint: bool = False) -> dict[str, object]:
     for db in sorted(home.rglob("*.db")) if home.exists() else []:
         if db.is_symlink() or any(part in EXCLUDED_DIRS for part in db.relative_to(home).parts):
             continue
-        uri = f"file:{db}?mode={'rw' if checkpoint else 'ro'}"
+        uri = f"{db.absolute().as_uri()}?mode={'rw' if checkpoint else 'ro'}"
         conn = sqlite3.connect(uri, uri=True, timeout=30)
         try:
             if checkpoint:
