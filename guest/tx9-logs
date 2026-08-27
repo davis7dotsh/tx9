@@ -1094,6 +1094,13 @@ class Capture:
             return False
         return True
 
+    def _reap_child(self) -> int:
+        # Once wait() releases the leader PID, its numeric process-group ID
+        # can be reused. Disarm asynchronous forwarding before that happens.
+        self.active_pgid = None
+        assert self.child is not None
+        return self.child.wait()
+
     def install_signal_handlers(self) -> None:
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGQUIT, signal.SIGHUP):
             if signum == signal.SIGHUP and signal.getsignal(signum) == signal.SIG_IGN:
@@ -1220,13 +1227,13 @@ class Capture:
                 os.close(status_write_fd)
             if self.child is not None:
                 self._signal_process_group(signal.SIGKILL)
-                self.child.wait()
             reader_stop.set()
             for reader in readers:
                 reader.join()
             if reader_cancelled.is_set():
                 self._signal_process_group(signal.SIGKILL)
-            self.active_pgid = None
+            if self.child is not None:
+                self._reap_child()
             self.child = None
             self.flush_repeats()
             message = f"could not start {Path(command[0]).name}: {exc}"
@@ -1246,13 +1253,13 @@ class Capture:
             except (UnicodeDecodeError, ValueError):
                 stage = "setup"
                 error = 0
-            self.child.wait()
+            os.waitid(os.P_PID, self.child.pid, os.WEXITED | os.WNOWAIT)
             reader_stop.set()
             for reader in readers:
                 reader.join()
             if reader_cancelled.is_set():
                 self._signal_process_group(signal.SIGKILL)
-            self.active_pgid = None
+            self._reap_child()
             self.child = None
             self.flush_repeats()
             if stage == "exec":
@@ -1273,7 +1280,9 @@ class Capture:
             f"{Path(command[0]).name} started",
             {"pid": self.child.pid, "command": Path(command[0]).name},
         )
-        return_code = self.child.wait()
+        # Observe exit without reaping: the zombie leader pins its PID and
+        # process-group identity until the last descendant signal is sent.
+        os.waitid(os.P_PID, self.child.pid, os.WEXITED | os.WNOWAIT)
         # The direct child owns the capture lifecycle. Stop background
         # descendants in its process group, then let readers drain buffered
         # output. Cancellable polling also bounds shutdown when a daemonized
@@ -1283,15 +1292,13 @@ class Capture:
         reader_stop.set()
         for reader in readers:
             reader.join()
-        # Pipe EOF does not mean the process group exited. A background child
-        # can close stdout/stderr and ignore TERM while its service restarts.
-        while self._signal_process_group(0):
-            remaining = drain_deadline - time.monotonic()
-            if remaining <= 0:
-                self._signal_process_group(signal.SIGKILL)
-                break
-            time.sleep(min(0.01, remaining))
-        self.active_pgid = None
+        # Pipe EOF does not mean descendants exited. The unreaped leader also
+        # keeps killpg(pgid, 0) true, so give the group a fixed TERM grace.
+        remaining = drain_deadline - time.monotonic()
+        if remaining > 0:
+            time.sleep(remaining)
+        self._signal_process_group(signal.SIGKILL)
+        return_code = self._reap_child()
         self.child = None
         self.flush_repeats()
 
