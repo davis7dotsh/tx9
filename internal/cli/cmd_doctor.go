@@ -12,6 +12,8 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/go-connections/nat"
+
 	"github.com/davis7dotsh/tx9/internal/box"
 	"github.com/davis7dotsh/tx9/internal/docker"
 )
@@ -48,14 +50,14 @@ func cmdDoctor(args []string) error {
 
 		guestErr := box.HB(ctx, cli, b, tok, os.Stdout, os.Stderr, "doctor")
 
-		port, portErr := box.HostPort(ctx, cli, b)
+		binding, portErr := box.HostBinding(ctx, cli, b)
 		var probeErr error
 		if portErr != nil {
 			probeErr = fmt.Errorf("host-side probe: %w", portErr)
 		} else {
-			probeErr = probeHostPort(port)
+			probeErr = probeHostPort(ctx, binding)
 			if probeErr == nil {
-				fmt.Printf("ok   host executor endpoint reachable on port %s\n", port)
+				fmt.Printf("ok   host executor endpoint reachable at %s\n", hostProbeURL(binding))
 			}
 		}
 		var publicProbeErr error
@@ -108,22 +110,37 @@ func probeExecutorPublicURL(ctx context.Context, baseURL string) error {
 // §5.2): up to 6 attempts, 3s connect timeout, 3s sleep between attempts —
 // the executor daemon needs a few seconds after `start` before it's
 // actually listening (dossier §10 gotcha #2).
-func probeHostPort(port string) error {
+func hostProbeURL(binding nat.PortBinding) string {
+	host := binding.HostIP
+	if host == "" || host == "0.0.0.0" {
+		host = "127.0.0.1"
+	} else if host == "::" {
+		host = "::1"
+	}
+	return "http://" + net.JoinHostPort(host, binding.HostPort) + "/"
+}
+
+func probeHostPort(ctx context.Context, binding nat.PortBinding) error {
 	const attempts = 6
 	const connectTimeout = 3 * time.Second
 	const retryWait = 3 * time.Second
 
-	url := fmt.Sprintf("http://127.0.0.1:%s/", port)
+	url := hostProbeURL(binding)
 	client := &http.Client{
 		Timeout: connectTimeout,
 		Transport: &http.Transport{
 			DialContext: (&net.Dialer{Timeout: connectTimeout}).DialContext,
 		},
 	}
+	defer client.CloseIdleConnections()
 
 	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
-		resp, err := client.Get(url)
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+		if err != nil {
+			return err
+		}
+		resp, err := client.Do(req)
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode < 400 {
@@ -134,8 +151,14 @@ func probeHostPort(port string) error {
 			lastErr = err
 		}
 		if attempt < attempts {
-			time.Sleep(retryWait)
+			timer := time.NewTimer(retryWait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return ctx.Err()
+			case <-timer.C:
+			}
 		}
 	}
-	return fmt.Errorf("executor dashboard unreachable on 127.0.0.1:%s after %d attempts: %w", port, attempts, lastErr)
+	return fmt.Errorf("executor dashboard unreachable at %s after %d attempts: %w", url, attempts, lastErr)
 }

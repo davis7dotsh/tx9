@@ -207,18 +207,28 @@ func Stop(ctx context.Context, cli *docker.Client, b *Box) error {
 // (dossier §1.4 — Docker auto-assigns this at container start since the
 // spec pins no host port).
 func HostPort(ctx context.Context, cli *docker.Client, b *Box) (string, error) {
+	binding, err := HostBinding(ctx, cli, b)
+	return binding.HostPort, err
+}
+
+// HostBinding retains the published address as well as the port, so local
+// health probes work when Executor is bound to a specific host interface.
+func HostBinding(ctx context.Context, cli *docker.Client, b *Box) (nat.PortBinding, error) {
 	if b.ExecutorID == "" {
-		return "", fmt.Errorf("box: host port %s: executor container missing", b.Name)
+		return nat.PortBinding{}, fmt.Errorf("box: host port %s: executor container missing", b.Name)
 	}
 	inspect, err := cli.ContainerInspect(ctx, b.ExecutorID)
 	if err != nil {
-		return "", fmt.Errorf("box: host port %s: %w", b.Name, err)
+		return nat.PortBinding{}, fmt.Errorf("box: host port %s: %w", b.Name, err)
+	}
+	if inspect.NetworkSettings == nil {
+		return nat.PortBinding{}, fmt.Errorf("box: host port %s: Docker returned no network settings", b.Name)
 	}
 	bindings, ok := inspect.NetworkSettings.Ports[nat.Port(executorPort)]
 	if !ok || len(bindings) == 0 {
-		return "", fmt.Errorf("box: host port %s: executor port %s not published (is the box running?)", b.Name, executorPort)
+		return nat.PortBinding{}, fmt.Errorf("box: host port %s: executor port %s not published (is the box running?)", b.Name, executorPort)
 	}
-	return bindings[0].HostPort, nil
+	return bindings[0], nil
 }
 
 // URLHost returns the host tx9 prints in dashboard/open URLs: TX9_URL_HOST
