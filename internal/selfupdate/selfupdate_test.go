@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // newTestServer serves a fake release site (site/src/index.ts's URL
@@ -107,9 +108,7 @@ func TestUpdateDownloadsVerifiesAndReplaces(t *testing.T) {
 	if info.Mode().Perm() != 0o755 {
 		t.Errorf("installed binary mode = %o, want 0755", info.Mode().Perm())
 	}
-	if _, err := os.Stat(exePath + ".new"); !os.IsNotExist(err) {
-		t.Errorf("stage file %s.new should be gone after a successful rename", exePath)
-	}
+	assertNoStagedBinaries(t, dir)
 }
 
 func TestUpdateChecksumMismatchLeavesOldBinaryUntouched(t *testing.T) {
@@ -156,9 +155,129 @@ func TestUpdateChecksumMismatchLeavesOldBinaryUntouched(t *testing.T) {
 	if string(got) != string(original) {
 		t.Errorf("binary was modified despite checksum mismatch: got %q, want unchanged %q", got, original)
 	}
-	if _, err := os.Stat(exePath + ".new"); !os.IsNotExist(err) {
-		t.Errorf("stage file %s.new should be cleaned up after a failed update", exePath)
+	assertNoStagedBinaries(t, dir)
+}
+
+func assertNoStagedBinaries(t *testing.T, dir string) {
+	t.Helper()
+	paths, err := filepath.Glob(filepath.Join(dir, ".tx9.update-*"))
+	if err != nil || len(paths) != 0 {
+		t.Fatalf("staged binaries remain: %v (error: %v)", paths, err)
 	}
+}
+
+func TestUpdateNewerVersionRequiresForce(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(fmt.Sprintf("force=%v", force), func(t *testing.T) {
+			content := []byte("older release")
+			srv := newTestServer(t, "1.2.3", "linux", "amd64", content)
+			exePath := filepath.Join(t.TempDir(), "tx9")
+			if err := os.WriteFile(exePath, []byte("newer release"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			res, err := Update(Options{
+				CurrentVersion: "1.2.4", Force: force, Origin: srv.URL,
+				GOOS: "linux", GOARCH: "amd64", HTTPClient: srv.Client(),
+				execPathOverride: exePath,
+			})
+			if err != nil || res.Applied != force {
+				t.Fatalf("Update: result=%+v, error=%v", res, err)
+			}
+			got, err := os.ReadFile(exePath)
+			want := "newer release"
+			if force {
+				want = string(content)
+			}
+			if err != nil || string(got) != want {
+				t.Fatalf("installed binary=%q, error=%v; want %q", got, err, want)
+			}
+		})
+	}
+}
+
+func TestUpdateDoesNotFollowPreexistingStageSymlink(t *testing.T) {
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "tx9")
+	sentinel := filepath.Join(dir, "sentinel")
+	if err := os.WriteFile(sentinel, []byte("untouched"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sentinel, exePath+".new"); err != nil {
+		t.Fatal(err)
+	}
+	srv := newTestServer(t, "1.2.4", "linux", "amd64", []byte("new release"))
+	_, err := Update(Options{
+		CurrentVersion: "1.2.3", Origin: srv.URL, GOOS: "linux", GOARCH: "amd64",
+		HTTPClient: srv.Client(), execPathOverride: exePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := os.ReadFile(sentinel)
+	if err != nil || string(got) != "untouched" {
+		t.Fatalf("stage symlink target was changed: %q, %v", got, err)
+	}
+	assertNoStagedBinaries(t, dir)
+}
+
+func TestConcurrentUpdatesUseIndependentStaging(t *testing.T) {
+	content := []byte(strings.Repeat("complete binary", 1024))
+	sum := sha256.Sum256(content)
+	ready := make(chan struct{}, 2)
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/releases/latest":
+			fmt.Fprintln(w, "1.2.4")
+		case "/releases/1.2.4/checksums.txt":
+			fmt.Fprintf(w, "%x  tx9_linux_amd64\n", sum)
+		case "/releases/1.2.4/tx9_linux_amd64":
+			ready <- struct{}{}
+			<-release
+			_, _ = w.Write(content)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer srv.Close()
+	// Release blocked handlers even when an assertion below fails.
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "tx9")
+	results := make(chan error, 2)
+	for range 2 {
+		go func() {
+			_, err := Update(Options{
+				CurrentVersion: "1.2.3", Origin: srv.URL, GOOS: "linux", GOARCH: "amd64",
+				HTTPClient: srv.Client(), execPathOverride: exePath,
+			})
+			results <- err
+		}()
+	}
+	for range 2 {
+		select {
+		case <-ready:
+		case <-time.After(5 * time.Second):
+			t.Fatal("concurrent download did not start")
+		}
+	}
+	close(release)
+	for range 2 {
+		if err := <-results; err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := os.ReadFile(exePath)
+	if err != nil || string(got) != string(content) {
+		t.Fatalf("concurrent update installed incomplete content, error=%v", err)
+	}
+	assertNoStagedBinaries(t, dir)
 }
 
 func TestUpdateNoReleaseYet(t *testing.T) {

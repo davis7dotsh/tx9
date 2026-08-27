@@ -35,8 +35,8 @@ const (
 type Options struct {
 	// CurrentVersion is the running binary's version (internal/version.Version).
 	CurrentVersion string
-	// Force skips the dev-version guard and the already-up-to-date
-	// short-circuit, and re-installs even the same version.
+	// Force permits replacing a dev, equal, or newer version with the
+	// site's latest release.
 	Force bool
 	// Origin overrides the release site origin. Zero value means
 	// DefaultOrigin, unless TX9_ORIGIN is set (same override install.sh
@@ -61,7 +61,7 @@ type Options struct {
 // Result summarizes a completed (or skipped) update.
 type Result struct {
 	// Applied is false when the binary was already at the latest version
-	// (and Force was not set) — nothing was downloaded or replaced.
+	// or newer and Force was not set. Nothing was downloaded or replaced.
 	Applied bool
 	// FromVersion is the version that was running before Update was called.
 	FromVersion string
@@ -104,7 +104,7 @@ func Update(opts Options) (*Result, error) {
 		return nil, err
 	}
 
-	if !opts.Force && SameVersion(opts.CurrentVersion, latest) {
+	if !opts.Force && CompareVersions(opts.CurrentVersion, latest) >= 0 {
 		return &Result{Applied: false, FromVersion: opts.CurrentVersion, ToVersion: latest}, nil
 	}
 
@@ -153,21 +153,32 @@ func Update(opts Options) (*Result, error) {
 		return nil, fmt.Errorf("selfupdate: %s has no checksum entry for %q (unsupported platform?)", checksumsAssetName, assetName)
 	}
 
-	stagePath := realPath + ".new"
-	fmt.Fprintf(out, "tx9: downloading %s %s -> %s\n", assetName, latest, stagePath)
-	gotDigest, err := downloadToFile(client, assetURL, stagePath)
+	// Create an exclusive, private sibling so concurrent updates cannot
+	// truncate each other's downloads or follow a pre-existing .new symlink.
+	stage, err := os.CreateTemp(filepath.Dir(realPath), "."+filepath.Base(realPath)+".update-*")
 	if err != nil {
-		os.Remove(stagePath)
+		return nil, fmt.Errorf("selfupdate: create staged binary: %w", err)
+	}
+	stagePath := stage.Name()
+	defer os.Remove(stagePath)
+	defer stage.Close()
+	fmt.Fprintf(out, "tx9: downloading %s %s -> %s\n", assetName, latest, stagePath)
+	gotDigest, err := downloadToFile(client, assetURL, stage)
+	if err != nil {
 		return nil, fmt.Errorf("selfupdate: download %s: %w", assetName, err)
 	}
 	if gotDigest != wantDigest {
-		os.Remove(stagePath)
 		return nil, fmt.Errorf("selfupdate: checksum mismatch for %s: got %s, want %s (old binary untouched)", assetName, gotDigest, wantDigest)
 	}
 
-	if err := os.Chmod(stagePath, 0o755); err != nil {
-		os.Remove(stagePath)
+	if err := stage.Chmod(0o755); err != nil {
 		return nil, fmt.Errorf("selfupdate: chmod staged binary: %w (old binary untouched)", err)
+	}
+	if err := stage.Sync(); err != nil {
+		return nil, fmt.Errorf("selfupdate: sync staged binary: %w (old binary untouched)", err)
+	}
+	if err := stage.Close(); err != nil {
+		return nil, fmt.Errorf("selfupdate: close staged binary: %w (old binary untouched)", err)
 	}
 
 	// stagePath is a sibling of realPath (same directory), so this rename
@@ -175,7 +186,6 @@ func Update(opts Options) (*Result, error) {
 	// process is currently executing is safe: the running process keeps
 	// its already-mapped inode; the new inode simply takes the path.
 	if err := os.Rename(stagePath, realPath); err != nil {
-		os.Remove(stagePath)
 		return nil, fmt.Errorf("selfupdate: install new binary at %s: %w (old binary untouched)", realPath, err)
 	}
 
@@ -209,10 +219,9 @@ func fetchBytes(client *http.Client, url string) ([]byte, error) {
 	return io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MiB is generous for a checksums file
 }
 
-// downloadToFile streams url's body to destPath (created/truncated,
-// mode 0644 pending the caller's chmod) while hashing it, and returns the
-// lowercase hex sha256 digest of what was written.
-func downloadToFile(client *http.Client, url, destPath string) (string, error) {
+// downloadToFile streams url's body into an already-open destination while
+// hashing it. The caller owns the file and its permissions and lifetime.
+func downloadToFile(client *http.Client, url string, dest io.Writer) (string, error) {
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
@@ -229,17 +238,8 @@ func downloadToFile(client *http.Client, url, destPath string) (string, error) {
 		return "", fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
 
-	f, err := os.OpenFile(destPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
-
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(f, h), resp.Body); err != nil {
-		return "", err
-	}
-	if err := f.Close(); err != nil {
+	if _, err := io.Copy(io.MultiWriter(dest, h), resp.Body); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
