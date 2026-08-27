@@ -4,8 +4,10 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
+	"sync"
 	"time"
+
+	"github.com/docker/docker/api/types/container"
 
 	"github.com/davis7dotsh/tx9/internal/box"
 	"github.com/davis7dotsh/tx9/internal/docker"
@@ -20,85 +22,113 @@ func showOverview(w io.Writer) error {
 			return fmt.Errorf("list boxes: %w", err)
 		}
 
-		volumeNames := make([]string, 0, len(boxes)*2)
-		for _, b := range boxes {
-			agentVolume, executorVolume := box.VolumeNames(b.Name)
-			volumeNames = append(volumeNames, agentVolume, executorVolume)
-		}
-		usage := make(map[string]int64, len(volumeNames))
-		for _, name := range volumeNames {
-			usage[name] = -1
-		}
-		if len(volumeNames) > 0 {
-			measured, warnings, usageErr := cli.VolumeUsage(ctx, volumeNames...)
-			if usageErr != nil {
-				fmt.Fprintf(os.Stderr, "tx9: warning: volume usage unavailable: %v\n", usageErr)
-			} else {
-				usage = measured
-				printDockerWarnings(warnings)
-			}
-		}
-
-		overview := make([]overviewBox, 0, len(boxes))
-		for i := range boxes {
-			b := &boxes[i]
-			agentVolume, executorVolume := box.VolumeNames(b.Name)
-			entry := overviewBox{
-				Name:         b.Name,
-				State:        b.DerivedState(),
-				ImageVersion: imageVersionDisplay(b.Version),
-				Agent: overviewContainer{
-					Missing: b.AgentID == "",
-				},
-				Executor: overviewContainer{
-					Missing: b.ExecutorID == "",
-				},
-				AgentVolume: overviewVolume{
-					UsedBytes: usage[agentVolume],
-				},
-				ExecutorVolume: overviewVolume{
-					UsedBytes: usage[executorVolume],
-				},
-			}
-
-			if resources, loadErr := box.LoadResources(b.Name); loadErr == nil {
-				entry.AgentVolume.BudgetBytes = resources.AgentVolumeBudgetBytes
-				entry.ExecutorVolume.BudgetBytes = resources.ExecutorVolumeBudgetBytes
-				entry.AgentVolume.BudgetKnown = true
-				entry.ExecutorVolume.BudgetKnown = true
-			} else {
-				fmt.Fprintf(os.Stderr, "tx9: warning: %s resource settings unavailable: %v\n", b.Name, loadErr)
-			}
-			populateOverviewContainer(ctx, cli, b.Name, "agent", b.AgentID, &entry.Agent)
-			populateOverviewContainer(ctx, cli, b.Name, "executor", b.ExecutorID, &entry.Executor)
-
-			if entry.State == "running" {
-				if port, portErr := box.HostPort(ctx, cli, b); portErr == nil {
-					entry.DashboardURL = box.DashboardURL(port, b.ExecutorWebBaseURL)
-				}
-			}
-			overview = append(overview, entry)
-		}
-
+		overview, warnings := collectOverview(ctx, cli, boxes)
+		printDockerWarnings(warnings)
 		renderOverview(w, overview)
 		return nil
 	})
 }
 
-func populateOverviewContainer(ctx context.Context, cli *docker.Client, boxName, role, id string, target *overviewContainer) {
+type overviewClient interface {
+	ContainerInspect(context.Context, string) (container.InspectResponse, error)
+	VolumeUsage(context.Context, ...string) (map[string]int64, []string, error)
+}
+
+// Disk usage can take most of the overview's deadline on a large host. Run
+// it alongside bounded container inspection so it cannot starve CPU/RAM
+// and dashboard metadata. Each executor is inspected only once.
+func collectOverview(ctx context.Context, cli overviewClient, boxes []box.Box) ([]overviewBox, []string) {
+	entries := make([]overviewBox, len(boxes))
+	if len(boxes) == 0 {
+		return entries, nil
+	}
+	volumeNames := make([]string, 0, len(boxes)*2)
+	for _, b := range boxes {
+		a, e := box.VolumeNames(b.Name)
+		volumeNames = append(volumeNames, a, e)
+	}
+	var usage map[string]int64
+	var volumeWarnings []string
+	var wg sync.WaitGroup
+	wg.Go(func() {
+		var err error
+		usage, volumeWarnings, err = cli.VolumeUsage(ctx, volumeNames...)
+		if err != nil {
+			volumeWarnings = append(volumeWarnings, fmt.Sprintf("volume usage unavailable: %v", err))
+		}
+	})
+	warnings := make([][]string, len(boxes))
+	jobs := make(chan int)
+	for range min(4, len(boxes)) {
+		wg.Go(func() {
+			for i := range jobs {
+				entries[i], warnings[i] = collectOverviewBox(ctx, cli, &boxes[i])
+			}
+		})
+	}
+	for i := range boxes {
+		jobs <- i
+	}
+	close(jobs)
+	wg.Wait()
+
+	var allWarnings []string
+	for i := range entries {
+		a, e := box.VolumeNames(boxes[i].Name)
+		if used, ok := usage[a]; ok {
+			entries[i].AgentVolume.UsedBytes = used
+		}
+		if used, ok := usage[e]; ok {
+			entries[i].ExecutorVolume.UsedBytes = used
+		}
+		allWarnings = append(allWarnings, warnings[i]...)
+	}
+	return entries, append(allWarnings, volumeWarnings...)
+}
+
+func collectOverviewBox(ctx context.Context, cli overviewClient, b *box.Box) (overviewBox, []string) {
+	entry := overviewBox{
+		Name: b.Name, State: b.DerivedState(), ImageVersion: imageVersionDisplay(b.Version),
+		Agent: overviewContainer{Missing: b.AgentID == ""}, Executor: overviewContainer{Missing: b.ExecutorID == ""},
+		AgentVolume: overviewVolume{UsedBytes: -1}, ExecutorVolume: overviewVolume{UsedBytes: -1},
+	}
+	var warnings []string
+	if resources, err := box.LoadResources(b.Name); err == nil {
+		entry.AgentVolume.BudgetBytes = resources.AgentVolumeBudgetBytes
+		entry.ExecutorVolume.BudgetBytes = resources.ExecutorVolumeBudgetBytes
+		entry.AgentVolume.BudgetKnown = true
+		entry.ExecutorVolume.BudgetKnown = true
+	} else {
+		warnings = append(warnings, fmt.Sprintf("%s resource settings unavailable: %v", b.Name, err))
+	}
+	if _, err := populateOverviewContainer(ctx, cli, b.AgentID, &entry.Agent); err != nil {
+		warnings = append(warnings, fmt.Sprintf("inspect %s agent: %v", b.Name, err))
+	}
+	info, err := populateOverviewContainer(ctx, cli, b.ExecutorID, &entry.Executor)
+	if err != nil {
+		warnings = append(warnings, fmt.Sprintf("inspect %s executor: %v", b.Name, err))
+	}
+	if entry.State == "running" && info.NetworkSettings != nil {
+		if bindings := info.NetworkSettings.Ports["4788/tcp"]; len(bindings) > 0 {
+			entry.DashboardURL = box.DashboardURL(bindings[0].HostPort, b.ExecutorWebBaseURL)
+		}
+	}
+	return entry, warnings
+}
+
+func populateOverviewContainer(ctx context.Context, cli overviewClient, id string, target *overviewContainer) (container.InspectResponse, error) {
 	if id == "" {
-		return
+		return container.InspectResponse{}, nil
 	}
 	info, err := cli.ContainerInspect(ctx, id)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "tx9: warning: inspect %s %s: %v\n", boxName, role, err)
-		return
+		return info, err
 	}
-	if info.HostConfig == nil {
-		fmt.Fprintf(os.Stderr, "tx9: warning: inspect %s %s: Docker returned no host config\n", boxName, role)
-		return
+	if info.ContainerJSONBase == nil || info.HostConfig == nil {
+		return info, fmt.Errorf("Docker returned no host config")
 	}
 	target.CPUs = float64(info.HostConfig.NanoCPUs) / 1_000_000_000
 	target.MemoryBytes = info.HostConfig.Memory
 	target.Inspected = true
+	return info, nil
 }
