@@ -79,6 +79,9 @@ func cmdUpgrade(args []string) error {
 		if err := box.PreflightAgentMounts(agentMounts); err != nil {
 			return fmt.Errorf("upgrade %s: agent mount preflight: %w", name, err)
 		}
+		if err := box.PreflightExistingObjects(ctx, cli, name); err != nil {
+			return fmt.Errorf("upgrade %s: %w", name, err)
+		}
 
 		tok, err := box.Token(name)
 		if err != nil {

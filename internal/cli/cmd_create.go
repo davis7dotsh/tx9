@@ -80,6 +80,9 @@ func cmdCreate(args []string) error {
 	if exists {
 		return fmt.Errorf("create %s: box already exists", name)
 	}
+	if err := box.PreflightFreshObjects(ctx, cli, name); err != nil {
+		return fmt.Errorf("create %s: %w", name, err)
+	}
 
 	imageTag := fmt.Sprintf("tx9-box:%s", version.Version)
 	if err := ensureBoxImage(ctx, cli, imageTag); err != nil {

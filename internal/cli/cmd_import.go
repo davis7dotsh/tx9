@@ -103,6 +103,9 @@ func cmdImport(args []string) error {
 		} else if exists {
 			return fmt.Errorf("import %s: box %q already exists, choose a different --name or delete it first", name, name)
 		}
+		if err := box.PreflightFreshObjects(ctx, cli, name); err != nil {
+			return fmt.Errorf("import %s: %w", name, err)
+		}
 
 		tmpDir, err := os.MkdirTemp("", "tx9-import-*")
 		if err != nil {

@@ -446,21 +446,20 @@ func Destroy(ctx context.Context, cli *docker.Client, name string) error {
 	switch {
 	case err == nil:
 		if b.AgentID != "" {
-			if rmErr := cli.ContainerRemove(ctx, b.AgentID, true); rmErr != nil && !dockerclient.IsErrNotFound(rmErr) {
+			if rmErr := removeOwnedContainer(ctx, cli, b.AgentID, name); rmErr != nil {
 				errs = append(errs, rmErr)
 			}
 		}
 		if b.ExecutorID != "" {
-			if rmErr := cli.ContainerRemove(ctx, b.ExecutorID, true); rmErr != nil && !dockerclient.IsErrNotFound(rmErr) {
+			if rmErr := removeOwnedContainer(ctx, cli, b.ExecutorID, name); rmErr != nil {
 				errs = append(errs, rmErr)
 			}
 		}
 	case errors.Is(err, ErrNotFound):
-		// No labeled containers found via List (e.g. labels never got
-		// applied because create failed very early) — fall back to
-		// removing by the names we would have minted, best-effort.
+		// Check derived names too, but never delete an unrelated container
+		// merely because it happens to have the name we would have used.
 		for _, cn := range []string{agentName, executorName} {
-			if rmErr := cli.ContainerRemove(ctx, cn, true); rmErr != nil && !dockerclient.IsErrNotFound(rmErr) {
+			if rmErr := removeOwnedContainer(ctx, cli, cn, name); rmErr != nil {
 				errs = append(errs, rmErr)
 			}
 		}
@@ -468,11 +467,11 @@ func Destroy(ctx context.Context, cli *docker.Client, name string) error {
 		errs = append(errs, err)
 	}
 
-	if rmErr := cli.NetworkRemove(ctx, netName); rmErr != nil && !dockerclient.IsErrNotFound(rmErr) {
+	if rmErr := removeOwnedNetwork(ctx, cli, netName, name); rmErr != nil {
 		errs = append(errs, rmErr)
 	}
 	for _, vn := range []string{agentVol, execVol} {
-		if rmErr := cli.VolumeRemove(ctx, vn, true); rmErr != nil && !dockerclient.IsErrNotFound(rmErr) {
+		if rmErr := removeOwnedVolume(ctx, cli, vn, name); rmErr != nil {
 			errs = append(errs, rmErr)
 		}
 	}

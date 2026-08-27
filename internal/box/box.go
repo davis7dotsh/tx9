@@ -313,6 +313,9 @@ func OpenURL(port, token, webBaseURL string) (string, error) {
 // containers but keeps the network).
 func ensureNetwork(ctx context.Context, cli *docker.Client, netName, boxName, ver string) (string, error) {
 	if insp, err := cli.Raw().NetworkInspect(ctx, netName, dockernetwork.InspectOptions{}); err == nil {
+		if !ownedByBox(insp.Labels, boxName) {
+			return "", fmt.Errorf("refusing to reuse network %s: it is not owned by box %s", netName, boxName)
+		}
 		return insp.ID, nil
 	} else if !dockerclient.IsErrNotFound(err) {
 		return "", fmt.Errorf("network inspect %s: %w", netName, err)
@@ -327,7 +330,10 @@ func ensureNetwork(ctx context.Context, cli *docker.Client, netName, boxName, ve
 // ensureVolume returns volName, creating it if absent so Create is
 // idempotent for volumes (same rationale as ensureNetwork).
 func ensureVolume(ctx context.Context, cli *docker.Client, volName, boxName, ver string) (string, error) {
-	if _, err := cli.Raw().VolumeInspect(ctx, volName); err == nil {
+	if insp, err := cli.Raw().VolumeInspect(ctx, volName); err == nil {
+		if !ownedByBox(insp.Labels, boxName) {
+			return "", fmt.Errorf("refusing to reuse volume %s: it is not owned by box %s", volName, boxName)
+		}
 		return volName, nil
 	} else if !dockerclient.IsErrNotFound(err) {
 		return "", fmt.Errorf("volume inspect %s: %w", volName, err)
