@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -47,7 +48,9 @@ func cmdCreate(args []string) error {
 		for _, b := range existing {
 			taken[b.Name] = true
 		}
-		name, err = names.Generate(taken)
+		name, err = generateFreshBoxName(taken, func(candidate string) error {
+			return box.PreflightFreshObjects(ctx, cli, candidate)
+		})
 		if err != nil {
 			return fmt.Errorf("create: %w", err)
 		}
@@ -132,4 +135,20 @@ func cmdCreate(args []string) error {
 	fmt.Printf("       tx9 gateway enable %s --confirm-single-writer\n", name)
 	fmt.Printf("  4. dashboard: %s (run `tx9 open %s` for a URL containing the persistent bearer token)\n", box.DashboardURL(port, b.ExecutorWebBaseURL), name)
 	return nil
+}
+
+func generateFreshBoxName(taken map[string]bool, preflight func(string) error) (string, error) {
+	for range 100 {
+		name, err := names.Generate(taken)
+		if err != nil {
+			return "", err
+		}
+		if err := preflight(name); err == nil {
+			return name, nil
+		} else if !errors.Is(err, box.ErrObjectsExist) {
+			return "", err
+		}
+		taken[name] = true
+	}
+	return "", fmt.Errorf("could not find an unused box name after 100 choices; pass an explicit name")
 }

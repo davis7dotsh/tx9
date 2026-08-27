@@ -2,6 +2,8 @@ package cli
 
 import (
 	"bytes"
+	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -10,6 +12,7 @@ import (
 	"testing"
 
 	"github.com/davis7dotsh/tx9/internal/archive"
+	"github.com/davis7dotsh/tx9/internal/box"
 	"github.com/davis7dotsh/tx9/internal/state"
 )
 
@@ -68,6 +71,49 @@ func TestFreshCommandsPreserveOrphanedVolumeAndToken(t *testing.T) {
 			env, err := state.ReadBoxEnv("fixture")
 			if err != nil || len(env) != 1 || env["EXECUTOR_MCP_TOKEN"] != "existing-synthetic-token" {
 				t.Fatal("existing box token was changed")
+			}
+		})
+	}
+}
+
+func TestGeneratedNamesSkipExistingDockerObjects(t *testing.T) {
+	var occupied string
+	checks := 0
+	name, err := generateFreshBoxName(make(map[string]bool), func(candidate string) error {
+		checks++
+		if checks == 1 {
+			occupied = candidate
+			return fmt.Errorf("orphaned volume: %w", box.ErrObjectsExist)
+		}
+		if candidate == occupied {
+			t.Fatal("generated the same conflicting name again")
+		}
+		return nil
+	})
+	if err != nil || name == "" || name == occupied || checks != 2 {
+		t.Fatalf("name=%q, checks=%d, error=%v", name, checks, err)
+	}
+}
+
+func TestGeneratedNameRetriesAreBoundedAndDoNotHideDockerErrors(t *testing.T) {
+	for _, collision := range []bool{false, true} {
+		t.Run(fmt.Sprint("collision=", collision), func(t *testing.T) {
+			failure := errors.New("Docker unavailable")
+			wantChecks := 1
+			if collision {
+				failure = box.ErrObjectsExist
+				wantChecks = 100
+			}
+			checks := 0
+			name, err := generateFreshBoxName(make(map[string]bool), func(string) error {
+				checks++
+				return failure
+			})
+			if name != "" || err == nil || checks != wantChecks {
+				t.Fatalf("name=%q, checks=%d, error=%v", name, checks, err)
+			}
+			if !collision && !errors.Is(err, failure) {
+				t.Fatalf("Docker error hidden: %v", err)
 			}
 		})
 	}
