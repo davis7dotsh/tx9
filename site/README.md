@@ -26,8 +26,8 @@ latest.txt                    "0.1.0\n" — flipped last during publish
 ```
 
 `.depot/workflows/release.yml` writes this on every `vX.Y.Z` tag push, after
-attaching the same files to the GitHub release (which `tx9 upgrade`
-self-update consumes).
+attaching the same files to the GitHub release. The installer and
+`tx9 upgrade` consume the public R2 routes, not the private GitHub release.
 
 ## One-time setup
 
@@ -40,12 +40,28 @@ self-update consumes).
    (interim hostname on the col-agents.com Cloudflare zone; swap the
    pattern when tx9 gets its own domain).
 
-## Develop / deploy
+## Validate
+
+Use Node.js 22.18 or newer. The tests load the actual Worker through Node's
+TypeScript support and use an in-memory R2 stub; they do not start a server,
+build a bundle, or contact Cloudflare.
 
 ```bash
 cd site
-npm install
+npm ci --ignore-scripts
 npm run check    # wrangler types + tsc --noEmit
+npm run format:check
+npm run lint
+npm test
+npm audit --audit-level=high
+```
+
+Run `npm run format` to apply formatting. CI uses the same locked tooling
+for checks and release uploads, without package install scripts.
+
+## Develop / deploy
+
+```bash
 npm run dev      # local worker with a local R2 stub
 npm run deploy
 ```

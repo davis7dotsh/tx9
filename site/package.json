@@ -1,18 +1,23 @@
 {
-  "name": "tx9-site",
-  "private": true,
-  "type": "module",
-  "scripts": {
-    "dev": "wrangler dev",
-    "deploy": "wrangler deploy",
-    "check": "wrangler types --strict-vars=false && tsc --noEmit",
-    "test": "node --import ./tests/text-modules.mjs --test tests/*.test.mjs"
-  },
-  "devDependencies": {
-    "typescript": "^5.9.3",
-    "wrangler": "^4.48.0"
-  },
-  "engines": {
-    "node": ">=22.18.0"
-  }
+	"name": "tx9-site",
+	"private": true,
+	"type": "module",
+	"scripts": {
+		"dev": "wrangler dev",
+		"deploy": "wrangler deploy",
+		"check": "wrangler types --strict-vars=false && tsc --noEmit",
+		"test": "node --import ./tests/text-modules.mjs --test tests/*.test.mjs",
+		"format": "prettier --write src/*.ts tests/*.mjs package.json tsconfig.json wrangler.jsonc shims.d.ts .prettierrc.json",
+		"format:check": "prettier --check src/*.ts tests/*.mjs package.json tsconfig.json wrangler.jsonc shims.d.ts .prettierrc.json",
+		"lint": "oxlint --deny-warnings src tests"
+	},
+	"devDependencies": {
+		"oxlint": "1.80.0",
+		"prettier": "3.9.6",
+		"typescript": "7.0.2",
+		"wrangler": "4.127.0"
+	},
+	"engines": {
+		"node": ">=22.18.0"
+	}
 }

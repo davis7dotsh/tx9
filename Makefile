@@ -1,4 +1,4 @@
-.PHONY: check syntax lint test tx9 go-check dist
+.PHONY: check syntax lint test format tx9 go-check dist
 
 # tests/regressions-*.sh is globbed so new split-out regression files don't
 # require touching this Makefile.
@@ -40,8 +40,10 @@ tx9:
 go-check:
 	@test -z "$$(gofmt -l .)" || { echo "gofmt: unformatted files:" >&2; gofmt -l . >&2; exit 1; }
 	go vet -buildvcs=false ./...
-	go build -buildvcs=false ./...
 	go test -buildvcs=false ./...
+
+format:
+	gofmt -w .
 
 # Cross-compiles the release binaries + checksums.txt into dist/. Asset
 # naming here MUST match internal/selfupdate.AssetName and
