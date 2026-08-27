@@ -80,6 +80,10 @@ ambiguous outer members. It limits metadata size, member count, and link
 resolution depth. It is not an overall disk quota. Large valid archives or
 log snapshots can still exhaust available storage.
 
+Log database snapshots copy validated files without a live SQLite read
+transaction. Concurrent writes can cause read failures or produce an export
+that does not represent one consistent point in time.
+
 Log redaction covers known token values and common credential formats,
 including quoted values. It does not recognize every secret, encoding, or
 private document. Native histories and `--no-redact` output may contain
