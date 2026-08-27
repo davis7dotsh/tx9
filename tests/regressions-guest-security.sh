@@ -90,6 +90,70 @@ with sqlite3.connect(database) as connection:
 Path(str(database) + "-wal").symlink_to(executor / "private-wal")
 assert list(module.read_hermes_db(database, root=agent, box="fixture")) == []
 assert any("cannot read Hermes database" in warning for warning in module.WARNINGS)
+
+# A checkpoint between the main-file and WAL copies must not silently discard
+# a committed WAL row. The first copy changes; the bounded retry reads it from
+# the checkpointed main file while preserving the safe descriptor boundary.
+def wal_fixture(name):
+    directory = root / name
+    directory.mkdir()
+    path = directory / "state.db"
+    writer = sqlite3.connect(path)
+    writer.execute("PRAGMA journal_mode=WAL")
+    writer.execute("PRAGMA wal_autocheckpoint=0")
+    writer.execute("CREATE TABLE messages(content TEXT)")
+    writer.commit()
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    writer.execute("INSERT INTO messages VALUES('committed-in-wal')")
+    writer.commit()
+    return path, writer
+
+path, writer = wal_fixture("checkpoint-race")
+original_copy = module.shutil.copyfileobj
+copies = 0
+
+def checkpoint_after_main(source, destination, *args, **kwargs):
+    global copies
+    original_copy(source, destination, *args, **kwargs)
+    if Path(destination.name).name == "state.db":
+        copies += 1
+        if copies == 1:
+            writer.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
+module.shutil.copyfileobj = checkpoint_after_main
+module.WARNINGS.clear()
+try:
+    events = list(module.read_hermes_db(path, root=path.parent, box="fixture"))
+finally:
+    module.shutil.copyfileobj = original_copy
+    writer.close()
+assert [event["message"] for event in events] == ["committed-in-wal"]
+assert copies == 2
+assert module.WARNINGS == []
+
+# Constant writes must terminate after three attempts and mark the export
+# incomplete through the existing warning path, rather than emit a mixed copy.
+path, writer = wal_fixture("continuous-writes")
+copies = 0
+
+def mutate_after_main(source, destination, *args, **kwargs):
+    global copies
+    original_copy(source, destination, *args, **kwargs)
+    if Path(destination.name).name == "state.db":
+        copies += 1
+        writer.execute("INSERT INTO messages VALUES(?)", (f"concurrent row {copies}",))
+        writer.commit()
+
+module.shutil.copyfileobj = mutate_after_main
+module.WARNINGS.clear()
+try:
+    events = list(module.read_hermes_db(path, root=path.parent, box="fixture"))
+finally:
+    module.shutil.copyfileobj = original_copy
+    writer.close()
+assert events == []
+assert copies == 3
+assert any("changed during all 3 snapshot attempts" in warning for warning in module.WARNINGS)
 PY
 
 echo "guest security regression checks passed"

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import ctypes
 import datetime as dt
 import errno
@@ -51,6 +52,7 @@ CAPTURE_READER_DRAIN_SECONDS = 0.5
 CAPTURE_DEDUP_WINDOW_SECONDS = 60.0
 CAPTURE_DEDUP_MAX_REPEATS = 1000
 MAX_RAW_CONTINUATION_LINES = 1000
+HERMES_SNAPSHOT_ATTEMPTS = 3
 PARENT_DEATH_EXEC_ACTION = "__parent-death-exec"
 PR_SET_PDEATHSIG = 1
 # Numeric values below this many epoch seconds (2001-09-09) cannot be event
@@ -1884,8 +1886,7 @@ def hermes_database_events(
 ) -> Iterator[dict[str, Any]]:
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA query_only=ON")
-    # One read transaction gives sessions and messages the same live WAL
-    # snapshot.
+    # Read sessions and messages from the same private snapshot.
     connection.execute("BEGIN")
     tables = {
         str(row[0])
@@ -1915,27 +1916,60 @@ def hermes_database_events(
             )
 
 
+def snapshot_file_signature(handle: BinaryIO | None) -> tuple[int, ...] | None:
+    if handle is None:
+        return None
+    info = os.fstat(handle.fileno())
+    return (
+        info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns
+    )
+
+
+def snapshot_path_signature(root: Path, path: Path) -> tuple[int, ...] | None:
+    try:
+        with open_regular_binary(root, path) as handle:
+            return snapshot_file_signature(handle)
+    except FileNotFoundError:
+        return None
+
+
 def hermes_snapshot_connection(
     path: Path, *, root: Path, source_handle: BinaryIO
 ) -> tuple[tempfile.TemporaryDirectory[str], sqlite3.Connection]:
-    snapshot_dir = tempfile.TemporaryDirectory(prefix="tx9-hermes-snapshot-")
-    snapshot_path = Path(snapshot_dir.name) / "state.db"
-    try:
-        source_handle.seek(0)
-        with snapshot_path.open("wb") as destination:
-            shutil.copyfileobj(source_handle, destination)
-        wal_path = Path(str(path) + "-wal")
+    wal_path = Path(str(path) + "-wal")
+    for _attempt in range(HERMES_SNAPSHOT_ATTEMPTS):
+        snapshot_dir = tempfile.TemporaryDirectory(prefix="tx9-hermes-snapshot-")
+        snapshot_path = Path(snapshot_dir.name) / "state.db"
         try:
-            wal_source = open_regular_binary(root, wal_path)
-        except FileNotFoundError:
-            wal_source = None
-        if wal_source is not None:
-            with wal_source, Path(str(snapshot_path) + "-wal").open("wb") as destination:
-                shutil.copyfileobj(wal_source, destination)
-        return snapshot_dir, sqlite3.connect(snapshot_path, timeout=5)
-    except Exception:
+            with contextlib.ExitStack() as files:
+                try:
+                    wal_source = files.enter_context(open_regular_binary(root, wal_path))
+                except FileNotFoundError:
+                    wal_source = None
+                before_main = snapshot_file_signature(source_handle)
+                before_wal = snapshot_file_signature(wal_source)
+                source_handle.seek(0)
+                with snapshot_path.open("wb") as destination:
+                    shutil.copyfileobj(source_handle, destination)
+                if wal_source is not None:
+                    with Path(str(snapshot_path) + "-wal").open("wb") as destination:
+                        shutil.copyfileobj(wal_source, destination)
+                # A checkpoint can move committed rows from WAL into the main
+                # file between copies. Detect changes to either open inode,
+                # replaced paths, and WAL appearance/disappearance before
+                # trusting the copy. This is still not a live SQLite lock.
+                if (
+                    before_main == snapshot_file_signature(source_handle)
+                    and before_wal == snapshot_file_signature(wal_source)
+                    and before_main == snapshot_path_signature(root, path)
+                    and before_wal == snapshot_path_signature(root, wal_path)
+                ):
+                    return snapshot_dir, sqlite3.connect(snapshot_path, timeout=5)
+        except Exception:
+            snapshot_dir.cleanup()
+            raise
         snapshot_dir.cleanup()
-        raise
+    raise OSError(f"Hermes database changed during all {HERMES_SNAPSHOT_ATTEMPTS} snapshot attempts")
 
 
 def read_hermes_db(path: Path, *, root: Path, box: str) -> Iterator[dict[str, Any]]:
