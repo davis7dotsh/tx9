@@ -1,7 +1,6 @@
 // Package selfupdate implements `tx9 upgrade` with no box argument
 // (docs/tx9-cli-design.md decision 11): it queries the tx9 release site
-// (the same origin scripts/install.sh installs from — the GitHub repo is
-// private, so the GitHub API is not usable anonymously) for the latest
+// (the same origin scripts/install.sh installs from) for the latest
 // release version, compares it against the running binary's version,
 // downloads and checksum-verifies the matching platform asset, and
 // atomically replaces the currently running executable.
