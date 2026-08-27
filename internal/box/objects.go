@@ -52,29 +52,16 @@ func existingObjectError(box, kind, name string) error {
 	return fmt.Errorf("box %q already has Docker %s %q; choose a different box name or recover/remove the existing resources explicitly: %w", box, kind, name, ErrObjectsExist)
 }
 
-// PreflightExistingObjects checks ownership before upgrade removes containers.
-// Missing objects remain recreatable, but a name collision must not leave the
-// existing box stopped before Create discovers the conflicting labels.
-func PreflightExistingObjects(ctx context.Context, cli *docker.Client, name string) error {
-	if err := names.Validate(name); err != nil {
-		return err
+// PreflightExistingObjects verifies ownership of every existing object and
+// returns all container IDs upgrade must remove before recreating the box.
+// Missing objects remain recreatable. Callers must hold the box lock through
+// teardown and remove this complete set, including duplicate or unknown roles.
+func PreflightExistingObjects(ctx context.Context, cli *docker.Client, name string) ([]string, error) {
+	targets, err := inspectDestroyTargets(ctx, cli, name)
+	if err != nil {
+		return nil, err
 	}
-	agent, executor := ContainerNames(name)
-	for _, ref := range []string{agent, executor} {
-		if _, err := inspectOwnedContainer(ctx, cli, ref, name); err != nil {
-			return err
-		}
-	}
-	if _, err := inspectOwnedNetwork(ctx, cli, NetworkName(name), name); err != nil {
-		return err
-	}
-	agentVolume, executorVolume := VolumeNames(name)
-	for _, volume := range []string{agentVolume, executorVolume} {
-		if _, err := inspectOwnedVolume(ctx, cli, volume, name); err != nil {
-			return err
-		}
-	}
-	return nil
+	return targets.containerIDs, nil
 }
 
 func ownedByBox(labels map[string]string, name string) bool {

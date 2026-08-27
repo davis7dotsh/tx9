@@ -85,6 +85,10 @@ func TestEnsureObjectsOnlyReusesOwnedNetworkAndVolumes(t *testing.T) {
 			if r.Method != http.MethodGet {
 				t.Errorf("existing object changed: %s %s", r.Method, r.URL.Path)
 			}
+			if r.URL.Path == "/containers/json" {
+				_, _ = w.Write([]byte(`[]`))
+				return
+			}
 			if strings.HasPrefix(r.URL.Path, "/containers/") {
 				http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
 				return
@@ -93,7 +97,7 @@ func TestEnsureObjectsOnlyReusesOwnedNetworkAndVolumes(t *testing.T) {
 		})
 		_, networkErr := ensureNetwork(context.Background(), cli, "tx9-fixture", "fixture", "new")
 		_, volumeErr := ensureVolume(context.Background(), cli, "tx9-fixture-agent-data", "fixture", "new")
-		preflightErr := PreflightExistingObjects(context.Background(), cli, "fixture")
+		_, preflightErr := PreflightExistingObjects(context.Background(), cli, "fixture")
 		wantSuccess := ownedByBox(labels, "fixture")
 		if (networkErr == nil) != wantSuccess || (volumeErr == nil) != wantSuccess || (preflightErr == nil) != wantSuccess {
 			t.Fatalf("ownership validation = network:%v volume:%v preflight:%v, want success %t", networkErr, volumeErr, preflightErr, wantSuccess)
@@ -109,6 +113,10 @@ func TestPreflightExistingObjectsRejectsForeignCanonicalContainer(t *testing.T) 
 				if r.Method != http.MethodGet {
 					t.Errorf("preflight changed Docker state: %s %s", r.Method, r.URL.Path)
 				}
+				if r.URL.Path == "/containers/json" {
+					_, _ = w.Write([]byte(`[]`))
+					return
+				}
 				labels := docker.BoxLabels("fixture", "previous", "")
 				if r.URL.Path == "/containers/"+foreign+"/json" {
 					labels = docker.BoxLabels("different", "previous", role)
@@ -117,7 +125,7 @@ func TestPreflightExistingObjectsRejectsForeignCanonicalContainer(t *testing.T) 
 					"Id": "existing-id", "Labels": labels, "Config": map[string]any{"Labels": labels},
 				})
 			})
-			if err := PreflightExistingObjects(context.Background(), cli, "fixture"); err == nil || !strings.Contains(err.Error(), foreign) || !strings.Contains(err.Error(), "not owned") {
+			if _, err := PreflightExistingObjects(context.Background(), cli, "fixture"); err == nil || !strings.Contains(err.Error(), foreign) || !strings.Contains(err.Error(), "not owned") {
 				t.Fatalf("preflight accepted foreign canonical container: %v", err)
 			}
 		})
