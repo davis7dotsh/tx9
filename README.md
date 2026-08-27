@@ -12,6 +12,10 @@ Separate containers do not keep Executor credentials confidential from that
 agent. Read the [security model](docs/security-model.md) before connecting
 sensitive accounts or host storage.
 
+The [August 2026 audit](docs/audit-2026-08-27.md) records the fixes, validation,
+and remaining decisions. Package versions and advisory results are in the
+[dependency audit](docs/dependency-audit-2026-08-27.md).
+
 For a stable HTTPS Executor origin and OAuth callbacks over a tailnet, see
 [Tailscale HTTPS for Executor](docs/tailscale-executor.md).
 For host directories and NAS shares that should be visible inside an agent,
@@ -224,8 +228,27 @@ use `tx9 logs export` when those should travel too.
 ## Local validation
 
 ```bash
-make check          # syntax + shellcheck + static contracts + regressions; hermetic
+make format
+make check          # syntax, ShellCheck, guest regressions, gofmt, Go vet and tests
+go test -buildvcs=false -race ./...
 ```
 
-`.depot/workflows/check.yml` runs `make check` on every push and pull request
-to `main` via Depot CI.
+Check the release Worker separately:
+
+```bash
+cd site
+npm ci --ignore-scripts
+npm run check
+npm run format:check
+npm run lint
+npm test
+npm audit --audit-level=high
+```
+
+These commands do not start development servers or build container images.
+The Go toolchain and npm packages must be available or downloaded first.
+Docker integration tests are optional; setting `TX9_TEST_DOCKER_IMAGE` to an
+already installed image with `/bin/sh` enables disposable helper tests.
+
+`.depot/workflows/check.yml` runs the Go/guest and site checks through Depot
+CI for pushes to `main` and pull requests against any branch, including stacks.
