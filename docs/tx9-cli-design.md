@@ -32,7 +32,7 @@ tx9 create
 | 7 | Scope | **Local-only v1.** The CLI drives the local Docker daemon; cross-machine moves are backup → transfer yourself → import. (Remote is a saved future direction — see below.) |
 | 8 | Docker interface | **Engine API via the official Go SDK**, not shelling to compose. tx9 creates the network/volumes/containers itself. Kills the compose-plugin dependency (bit us on siva) and owns all progress/error UX. |
 | 9 | Repo | **This repo.** Go code lives alongside provision/ and guest/ because they co-evolve; embedding pulls from source at build time. |
-| 10 | Distribution | **GitHub Releases** (cross-compiled, tag-push CI) for `tx9 upgrade` self-update, mirrored to an **R2 bucket behind `https://tx9.col-agents.com`** (`site/`, a Cloudflare Worker: homepage + `/install` + `/releases/*`) for `curl \| sh` installs — works while the repo is still private. Installer detects OS/arch, drops binary in `~/.local/bin`. |
+| 10 | Distribution | Tag-push CI publishes cross-compiled binaries to GitHub Releases and an R2 bucket behind `https://tx9.col-agents.com`. Both `tx9 upgrade` and the installer use the public R2 routes served by `site/`. The installer detects OS/arch and installs to `~/.local/bin`. |
 | 11 | Versioning | `tx9 upgrade` (no args) self-updates the CLI; `tx9 upgrade <box>` moves a box onto the current image. Images tagged `tx9-box:<cli-version>`; `list` shows per-box image version so drift is visible; unused old images pruned. |
 | 12 | Bash prototypes | **Both deleted** (done, this commit). git history is the reference. |
 
@@ -77,14 +77,18 @@ the port:
 
 - **Topology**: agent container (no published ports, volume = the box, sudo,
   IPv6 disabled via sysctl) + executor container (daemon only,
-  `--hostname 0.0.0.0 --port 4788 --auth-token <token>`, one published
+  `--hostname 0.0.0.0 --port 4788`, one published
   host port (all interfaces/automatic by default, optionally fixed and
   loopback-only), scratch volume) + per-box private network. Labels
   (`tx9=1`, `tx9.box=<name>`, `tx9.version=<v>`) on every object.
 - **Token**: 256-bit random per box, minted at create/import, injected as
   `BOXD_EXECUTOR_TOKEN` (outranks any restored on-disk `executor-mcp.env` —
   real bug found in dry run) and `EXECUTOR_HOST=executor`. `hb wire-once`
-  re-wires when token *or URL* is stale.
+  re-wires when token *or URL* is stale. The Executor entrypoint writes the
+  injected token to its private `server-control/auth.json` before startup,
+  keeping it out of daemon and log-capture command arguments. This is still
+  an administrator token available to the agent. See the
+  [security model](security-model.md) for the resulting limits.
 - **Archive safety**: the member-by-member validator (absolute paths,
   traversal, special files, duplicates, link targets/cycles/nesting) ported
   from bash+python to Go. Validate before create on import; validate after
