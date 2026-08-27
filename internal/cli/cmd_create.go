@@ -113,14 +113,12 @@ func cmdCreate(args []string) error {
 		Name: name, Image: imageTag, Token: tok, Executor: executorConfig, Resources: resources,
 	})
 	if err != nil {
-		box.Destroy(ctx, cli, name)
-		return fmt.Errorf("create %s: %w", name, err)
+		return errors.Join(fmt.Errorf("create %s: %w", name, err), box.Destroy(ctx, cli, name))
 	}
 
 	fmt.Println("tx9: preparing runtime (executor reachability, MCP wiring, doctor)")
 	if err := box.PrepareRuntime(ctx, cli, b, tok, os.Stdout); err != nil {
-		box.Destroy(ctx, cli, name)
-		return fmt.Errorf("create %s: runtime failed, box removed: %w", name, err)
+		return errors.Join(fmt.Errorf("create %s: runtime failed: %w", name, err), box.Destroy(ctx, cli, name))
 	}
 
 	port, err := box.HostPort(ctx, cli, b)
