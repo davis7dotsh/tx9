@@ -11,6 +11,7 @@ import (
 	"github.com/davis7dotsh/tx9/internal/box"
 	"github.com/davis7dotsh/tx9/internal/docker"
 	"github.com/davis7dotsh/tx9/internal/lock"
+	"github.com/davis7dotsh/tx9/internal/names"
 	"github.com/davis7dotsh/tx9/internal/state"
 	"github.com/davis7dotsh/tx9/internal/version"
 )
@@ -135,6 +136,10 @@ func pruneStateFiles(ctx context.Context, cli *docker.Client) ([]string, error) 
 			continue
 		}
 		name := strings.TrimSuffix(e.Name(), ".env")
+		if err := names.Validate(name); err != nil {
+			fmt.Fprintf(os.Stderr, "tx9: skipping state file %q: invalid box name\n", e.Name())
+			continue
+		}
 		if known[name] {
 			continue
 		}
