@@ -2,9 +2,10 @@ package docker
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
-	"sync"
+	"time"
 
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/pkg/stdcopy"
@@ -32,8 +33,13 @@ func (c *Client) ExecStream(ctx context.Context, containerID string, cmd []strin
 		return 0, fmt.Errorf("docker: exec attach: %w", err)
 	}
 	defer attach.Close()
+	stopCancel := context.AfterFunc(ctx, attach.Close)
+	defer stopCancel()
 
 	if _, err := stdcopy.StdCopy(stdout, stderr, attach.Reader); err != nil {
+		if ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
 		return 0, fmt.Errorf("docker: exec read output: %w", err)
 	}
 
@@ -64,7 +70,7 @@ type EphemeralOpts struct {
 // It returns the container's exit code; a non-nil error means the
 // container could not be run at all (create/attach/start/wait failure),
 // not merely that the command inside it exited non-zero.
-func (c *Client) RunEphemeral(ctx context.Context, opts EphemeralOpts) (int, error) {
+func (c *Client) RunEphemeral(ctx context.Context, opts EphemeralOpts) (exitCode int, err error) {
 	hasStdin := opts.Stdin != nil
 	cfg := &container.Config{
 		Image:        opts.Image,
@@ -77,13 +83,24 @@ func (c *Client) RunEphemeral(ctx context.Context, opts EphemeralOpts) (int, err
 		OpenStdin:    hasStdin,
 		StdinOnce:    hasStdin,
 	}
-	hostCfg := &container.HostConfig{Binds: opts.Binds}
+	// Helpers only inspect or restore local volumes. In particular the log
+	// reader mounts both trust domains and must not have network access.
+	hostCfg := &container.HostConfig{
+		Binds: opts.Binds, NetworkMode: "none",
+		SecurityOpt: []string{"no-new-privileges:true"},
+	}
 
 	resp, err := c.cli.ContainerCreate(ctx, cfg, hostCfg, nil, nil, "")
 	if err != nil {
 		return 0, fmt.Errorf("docker: ephemeral create: %w", err)
 	}
-	defer c.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
+	defer func() {
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		defer cancel()
+		if cleanupErr := c.cli.ContainerRemove(cleanupCtx, resp.ID, container.RemoveOptions{Force: true, RemoveVolumes: true}); cleanupErr != nil {
+			err = errors.Join(err, fmt.Errorf("docker: remove ephemeral container %s: %w", resp.ID, cleanupErr))
+		}
+	}()
 
 	attach, err := c.cli.ContainerAttach(ctx, resp.ID, container.AttachOptions{
 		Stream: true,
@@ -95,6 +112,8 @@ func (c *Client) RunEphemeral(ctx context.Context, opts EphemeralOpts) (int, err
 		return 0, fmt.Errorf("docker: ephemeral attach: %w", err)
 	}
 	defer attach.Close()
+	stopCancel := context.AfterFunc(ctx, attach.Close)
+	defer stopCancel()
 
 	// Reserve "not running" wait BEFORE start so we can't miss a fast exit.
 	statusCh, waitErrCh := c.cli.ContainerWait(ctx, resp.ID, container.WaitConditionNotRunning)
@@ -103,13 +122,13 @@ func (c *Client) RunEphemeral(ctx context.Context, opts EphemeralOpts) (int, err
 		return 0, fmt.Errorf("docker: ephemeral start: %w", err)
 	}
 
-	var stdinWG sync.WaitGroup
+	var stdinDone chan error
 	if hasStdin {
-		stdinWG.Add(1)
+		stdinDone = make(chan error, 1)
 		go func() {
-			defer stdinWG.Done()
-			io.Copy(attach.Conn, opts.Stdin)
-			attach.CloseWrite()
+			_, copyErr := io.Copy(attach.Conn, opts.Stdin)
+			closeErr := attach.CloseWrite()
+			stdinDone <- errors.Join(copyErr, closeErr)
 		}()
 	}
 
@@ -119,19 +138,35 @@ func (c *Client) RunEphemeral(ctx context.Context, opts EphemeralOpts) (int, err
 		copyDone <- cerr
 	}()
 
-	var exitCode int
 	select {
+	case <-ctx.Done():
+		return 0, ctx.Err()
 	case werr := <-waitErrCh:
 		return 0, fmt.Errorf("docker: ephemeral wait: %w", werr)
 	case status := <-statusCh:
 		exitCode = int(status.StatusCode)
+		if status.Error != nil {
+			return exitCode, fmt.Errorf("docker: ephemeral wait: %s", status.Error.Message)
+		}
 	}
 
 	if hasStdin {
-		stdinWG.Wait()
+		select {
+		case <-ctx.Done():
+			return exitCode, ctx.Err()
+		case copyErr := <-stdinDone:
+			if copyErr != nil {
+				return exitCode, fmt.Errorf("docker: ephemeral write input: %w", copyErr)
+			}
+		}
 	}
-	if cerr := <-copyDone; cerr != nil {
-		return exitCode, fmt.Errorf("docker: ephemeral read output: %w", cerr)
+	select {
+	case <-ctx.Done():
+		return exitCode, ctx.Err()
+	case cerr := <-copyDone:
+		if cerr != nil {
+			return exitCode, fmt.Errorf("docker: ephemeral read output: %w", cerr)
+		}
 	}
 	return exitCode, nil
 }

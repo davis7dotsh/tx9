@@ -81,7 +81,7 @@ func newTestDockerClient(t *testing.T, handler http.HandlerFunc) *Client {
 	server := httptest.NewServer(handler)
 	t.Cleanup(server.Close)
 	sdk, err := dockerclient.NewClientWithOpts(
-		dockerclient.WithHost(server.URL),
+		dockerclient.WithHost("tcp://"+strings.TrimPrefix(server.URL, "http://")),
 		dockerclient.WithVersion("1.47"),
 		dockerclient.WithHTTPClient(server.Client()),
 	)
