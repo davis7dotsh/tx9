@@ -3,6 +3,7 @@ package box
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -54,7 +55,7 @@ func TestPreflightFreshObjectsRejectsEveryExistingObject(t *testing.T) {
 				}
 				http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
 			})
-			if err := PreflightFreshObjects(context.Background(), cli, "fixture"); err == nil || !strings.Contains(err.Error(), "already has Docker") {
+			if err := PreflightFreshObjects(context.Background(), cli, "fixture"); !errors.Is(err, ErrObjectsExist) || !strings.Contains(err.Error(), "already has Docker") {
 				t.Fatalf("preflight did not preserve existing object: %v", err)
 			}
 		})
@@ -84,6 +85,10 @@ func TestEnsureObjectsOnlyReusesOwnedNetworkAndVolumes(t *testing.T) {
 			if r.Method != http.MethodGet {
 				t.Errorf("existing object changed: %s %s", r.Method, r.URL.Path)
 			}
+			if strings.HasPrefix(r.URL.Path, "/containers/") {
+				http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+				return
+			}
 			_ = json.NewEncoder(w).Encode(map[string]any{"Id": "network-id", "Name": "tx9-fixture-agent-data", "Labels": labels})
 		})
 		_, networkErr := ensureNetwork(context.Background(), cli, "tx9-fixture", "fixture", "new")
@@ -93,6 +98,102 @@ func TestEnsureObjectsOnlyReusesOwnedNetworkAndVolumes(t *testing.T) {
 		if (networkErr == nil) != wantSuccess || (volumeErr == nil) != wantSuccess || (preflightErr == nil) != wantSuccess {
 			t.Fatalf("ownership validation = network:%v volume:%v preflight:%v, want success %t", networkErr, volumeErr, preflightErr, wantSuccess)
 		}
+	}
+}
+
+func TestPreflightExistingObjectsRejectsForeignCanonicalContainer(t *testing.T) {
+	for _, role := range []string{docker.RoleAgent, docker.RoleExecutor} {
+		t.Run(role, func(t *testing.T) {
+			foreign := "tx9-fixture-" + role
+			cli := newObjectTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodGet {
+					t.Errorf("preflight changed Docker state: %s %s", r.Method, r.URL.Path)
+				}
+				labels := docker.BoxLabels("fixture", "previous", "")
+				if r.URL.Path == "/containers/"+foreign+"/json" {
+					labels = docker.BoxLabels("different", "previous", role)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"Id": "existing-id", "Labels": labels, "Config": map[string]any{"Labels": labels},
+				})
+			})
+			if err := PreflightExistingObjects(context.Background(), cli, "fixture"); err == nil || !strings.Contains(err.Error(), foreign) || !strings.Contains(err.Error(), "not owned") {
+				t.Fatalf("preflight accepted foreign canonical container: %v", err)
+			}
+		})
+	}
+}
+
+func TestDestroyInspectsEveryOwnedContainerBeforeCleanup(t *testing.T) {
+	for _, badOwnership := range []bool{false, true} {
+		t.Run(fmt.Sprintf("badOwnership=%t", badOwnership), func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			if err := state.WriteBoxEnv("fixture", map[string]string{"EXECUTOR_MCP_TOKEN": "synthetic-token"}); err != nil {
+				t.Fatal(err)
+			}
+			owned := map[string]string{
+				"agent-first": docker.RoleAgent, "agent-second": docker.RoleAgent,
+				"executor-id": docker.RoleExecutor, "unknown-role-id": "",
+			}
+			inspected := make(map[string]bool)
+			deleted := make(map[string]bool)
+			cli := newObjectTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					if len(inspected) != len(owned) {
+						t.Error("deletion started before every matching container was inspected")
+					}
+					deleted[r.URL.Path] = true
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				if r.URL.Path == "/containers/json" {
+					containers := []map[string]any{}
+					for _, id := range []string{"agent-first", "agent-second", "executor-id", "unknown-role-id"} {
+						containers = append(containers, map[string]any{"Id": id, "Labels": docker.BoxLabels("fixture", "previous", owned[id])})
+					}
+					containers = append(containers, map[string]any{"Id": "other-box-id", "Labels": docker.BoxLabels("different", "previous", docker.RoleAgent)})
+					_ = json.NewEncoder(w).Encode(containers)
+					return
+				}
+				id := strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/containers/"), "/json")
+				role, ok := owned[id]
+				if !ok {
+					if id == "other-box-id" {
+						t.Error("destroy inspected a container belonging to another box")
+					}
+					http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+					return
+				}
+				inspected[id] = true
+				labels := docker.BoxLabels("fixture", "previous", role)
+				if badOwnership && id == "agent-first" {
+					labels = docker.BoxLabels("different", "previous", role)
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"Id": id, "Config": map[string]any{"Labels": labels}})
+			})
+			err := Destroy(context.Background(), cli, "fixture")
+			if (err != nil) != badOwnership {
+				t.Errorf("destroy error = %v, want ownership failure %t", err, badOwnership)
+			}
+			env, err := state.ReadBoxEnv("fixture")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if badOwnership {
+				if len(deleted) != 0 || env["EXECUTOR_MCP_TOKEN"] != "synthetic-token" {
+					t.Errorf("failed ownership preflight changed resources: %d DELETE requests, token preserved=%t", len(deleted), env["EXECUTOR_MCP_TOKEN"] == "synthetic-token")
+				}
+				return
+			}
+			for id := range owned {
+				if !deleted["/containers/"+id] {
+					t.Errorf("matching container was not removed: %s", id)
+				}
+			}
+			if len(deleted) != len(owned) || len(env) != 0 {
+				t.Errorf("successful cleanup: %d DELETE requests, token removed=%t", len(deleted), len(env) == 0)
+			}
+		})
 	}
 }
 

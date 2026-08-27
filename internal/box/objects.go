@@ -12,6 +12,9 @@ import (
 	"github.com/davis7dotsh/tx9/internal/names"
 )
 
+// ErrObjectsExist identifies a fresh box name that collides with Docker objects.
+var ErrObjectsExist = errors.New("box objects already exist")
+
 // PreflightFreshObjects rejects names whose containers have been removed but
 // whose durable volumes or network remain. Fresh create/import must call this
 // under the box lock, before writing a new token or changing Docker objects.
@@ -46,7 +49,7 @@ func PreflightFreshObjects(ctx context.Context, cli *docker.Client, name string)
 }
 
 func existingObjectError(box, kind, name string) error {
-	return fmt.Errorf("box %q already has Docker %s %q; choose a different box name or recover/remove the existing resources explicitly", box, kind, name)
+	return fmt.Errorf("box %q already has Docker %s %q; choose a different box name or recover/remove the existing resources explicitly: %w", box, kind, name, ErrObjectsExist)
 }
 
 // PreflightExistingObjects checks ownership before upgrade removes containers.
@@ -55,6 +58,12 @@ func existingObjectError(box, kind, name string) error {
 func PreflightExistingObjects(ctx context.Context, cli *docker.Client, name string) error {
 	if err := names.Validate(name); err != nil {
 		return err
+	}
+	agent, executor := ContainerNames(name)
+	for _, ref := range []string{agent, executor} {
+		if _, err := inspectOwnedContainer(ctx, cli, ref, name); err != nil {
+			return err
+		}
 	}
 	if _, err := inspectOwnedNetwork(ctx, cli, NetworkName(name), name); err != nil {
 		return err
@@ -87,12 +96,14 @@ func inspectDestroyTargets(ctx context.Context, cli *docker.Client, name string)
 	}
 	agent, executor := ContainerNames(name)
 	containerRefs := []string{agent, executor}
-	b, err := Get(ctx, cli, name)
-	if err != nil && !errors.Is(err, ErrNotFound) {
+	containers, err := cli.ListBoxContainers(ctx)
+	if err != nil {
 		return destroyTargets{}, err
 	}
-	if b != nil {
-		containerRefs = append(containerRefs, b.AgentID, b.ExecutorID)
+	for _, container := range containers {
+		if ownedByBox(container.Labels, name) {
+			containerRefs = append(containerRefs, container.ID)
+		}
 	}
 	var targets destroyTargets
 	seen := make(map[string]bool)
