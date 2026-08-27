@@ -81,8 +81,10 @@ resolution depth. It is not an overall disk quota. Large valid archives or
 log snapshots can still exhaust available storage.
 
 Log database snapshots copy validated files without a live SQLite read
-transaction. Concurrent writes can cause read failures or produce an export
-that does not represent one consistent point in time.
+transaction. The reader checks file identity and metadata around each copy
+and retries observed changes up to three times. Continuous writes produce a
+warning rather than a silently incomplete snapshot. These checks do not
+provide a live database transaction or a snapshot across all log sources.
 
 Log redaction covers known token values and common credential formats,
 including quoted values. It does not recognize every secret, encoding, or
