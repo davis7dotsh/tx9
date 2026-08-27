@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	"github.com/davis7dotsh/tx9/internal/names"
 )
 
 // Dir returns ~/.tx9, creating it (mode 0700) if absent.
@@ -51,6 +53,9 @@ func LocksDir() (string, error) {
 
 // BoxEnvPath returns ~/.tx9/boxes/<name>.env.
 func BoxEnvPath(name string) (string, error) {
+	if err := names.Validate(name); err != nil {
+		return "", fmt.Errorf("state: box env path: %w", err)
+	}
 	dir, err := BoxesDir()
 	if err != nil {
 		return "", err
@@ -60,6 +65,9 @@ func BoxEnvPath(name string) (string, error) {
 
 // LockPath returns ~/.tx9/locks/<name>.lock.
 func LockPath(name string) (string, error) {
+	if err := names.Validate(name); err != nil {
+		return "", fmt.Errorf("state: lock path: %w", err)
+	}
 	dir, err := LocksDir()
 	if err != nil {
 		return "", err

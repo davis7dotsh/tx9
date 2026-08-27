@@ -19,6 +19,9 @@ import (
 // GPG_PASSPHRASE-style env var, both of which would leak via `ps` or
 // /proc/<pid>/environ.
 func runGPG(passphrase string, args []string, stdin io.Reader, stdout io.Writer) error {
+	if strings.ContainsAny(passphrase, "\x00\r\n") {
+		return fmt.Errorf("archive passphrase must not contain NUL or newline characters")
+	}
 	gpgPath, err := exec.LookPath("gpg")
 	if err != nil {
 		return fmt.Errorf("gpg not found in PATH (required for encrypted archives; install gnupg, or pass --no-encrypt): %w", err)
@@ -30,6 +33,13 @@ func runGPG(passphrase string, args []string, stdin io.Reader, stdout io.Writer)
 	}
 
 	cmd := exec.Command(gpgPath, args...)
+	inheritedEnv := os.Environ()
+	cmd.Env = make([]string, 0, len(inheritedEnv))
+	for _, entry := range inheritedEnv {
+		if !strings.HasPrefix(entry, "TX9_PASSWORD=") {
+			cmd.Env = append(cmd.Env, entry)
+		}
+	}
 	cmd.ExtraFiles = []*os.File{pr}
 	cmd.Stdin = stdin
 	cmd.Stdout = stdout
@@ -56,13 +66,12 @@ func runGPG(passphrase string, args []string, stdin io.Reader, stdout io.Writer)
 	return nil
 }
 
-// gpgArgsEncrypt/gpgArgsDecrypt are exactly boxd's gpg_enc/gpg_dec flag
-// sets (dossier §6.4): GPG-compatible AES-256 symmetric encryption, batch
-// mode (never blocks on a pinentry prompt), passphrase on fd 3.
-func gpgArgsEncrypt(dst string) []string {
+// GPG-compatible AES-256 symmetric encryption, batch mode, passphrase on fd 3.
+// Encryption writes to stdout so Go owns destination creation and permissions.
+func gpgArgsEncrypt() []string {
 	return []string{
 		"--batch", "--yes", "--pinentry-mode", "loopback", "--passphrase-fd", "3",
-		"--symmetric", "--cipher-algo", "AES256", "-o", dst,
+		"--symmetric", "--cipher-algo", "AES256", "-o", "-",
 	}
 }
 
@@ -73,8 +82,7 @@ func gpgArgsDecrypt(src string) []string {
 	}
 }
 
-// Encrypt GPG-symmetric-encrypts src (read as gpg's stdin, matching boxd's
-// `gpg_enc "$encrypted" <"$raw"`) to dst using passphrase.
+// Encrypt GPG-symmetric-encrypts src to a new private file at dst.
 func Encrypt(src, dst, passphrase string) error {
 	in, err := os.Open(src)
 	if err != nil {
@@ -82,9 +90,24 @@ func Encrypt(src, dst, passphrase string) error {
 	}
 	defer in.Close()
 
-	if err := runGPG(passphrase, gpgArgsEncrypt(dst), in, nil); err != nil {
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return fmt.Errorf("archive: create %s for encryption: %w", dst, err)
+	}
+	succeeded := false
+	defer func() {
+		_ = out.Close()
+		if !succeeded {
+			_ = os.Remove(dst)
+		}
+	}()
+	if err := runGPG(passphrase, gpgArgsEncrypt(), in, out); err != nil {
 		return fmt.Errorf("archive: encrypt %s: %w", src, err)
 	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("archive: close encrypted data: %w", err)
+	}
+	succeeded = true
 	return nil
 }
 
@@ -98,14 +121,27 @@ func DecryptStream(src, passphrase string, w io.Writer) error {
 	return nil
 }
 
-// Decrypt GPG-symmetric-decrypts src to dst using passphrase.
+// Decrypt GPG-symmetric-decrypts src to a new private file at dst.
 func Decrypt(src, dst, passphrase string) error {
-	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return fmt.Errorf("archive: create %s for decryption: %w", dst, err)
 	}
-	defer out.Close()
-	return DecryptStream(src, passphrase, out)
+	succeeded := false
+	defer func() {
+		_ = out.Close()
+		if !succeeded {
+			_ = os.Remove(dst)
+		}
+	}()
+	if err := DecryptStream(src, passphrase, out); err != nil {
+		return err
+	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("archive: close decrypted data: %w", err)
+	}
+	succeeded = true
+	return nil
 }
 
 // IsGPG sniffs whether the file at path is GPG binary output rather than a
