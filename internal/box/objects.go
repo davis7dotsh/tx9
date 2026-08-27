@@ -2,6 +2,7 @@ package box
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	dockernetwork "github.com/docker/docker/api/types/network"
@@ -55,22 +56,13 @@ func PreflightExistingObjects(ctx context.Context, cli *docker.Client, name stri
 	if err := names.Validate(name); err != nil {
 		return err
 	}
-	network := NetworkName(name)
-	inspect, err := cli.Raw().NetworkInspect(ctx, network, dockernetwork.InspectOptions{})
-	if err == nil && !ownedByBox(inspect.Labels, name) {
-		return fmt.Errorf("refusing to reuse network %s: it is not owned by box %s", network, name)
-	}
-	if err != nil && !dockerclient.IsErrNotFound(err) {
-		return fmt.Errorf("inspect network %s: %w", network, err)
+	if _, err := inspectOwnedNetwork(ctx, cli, NetworkName(name), name); err != nil {
+		return err
 	}
 	agentVolume, executorVolume := VolumeNames(name)
 	for _, volume := range []string{agentVolume, executorVolume} {
-		inspect, err := cli.Raw().VolumeInspect(ctx, volume)
-		if err == nil && !ownedByBox(inspect.Labels, name) {
-			return fmt.Errorf("refusing to reuse volume %s: it is not owned by box %s", volume, name)
-		}
-		if err != nil && !dockerclient.IsErrNotFound(err) {
-			return fmt.Errorf("inspect volume %s: %w", volume, err)
+		if _, err := inspectOwnedVolume(ctx, cli, volume, name); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -80,53 +72,104 @@ func ownedByBox(labels map[string]string, name string) bool {
 	return labels[docker.LabelManaged] == "1" && labels[docker.LabelBox] == name
 }
 
-func removeOwnedContainer(ctx context.Context, cli *docker.Client, id, name string) error {
+type destroyTargets struct {
+	containerIDs []string
+	networkID    string
+	volumes      []string
+}
+
+// Inspect every deletion target before allowing any mutation. Derived names
+// are checked even when labels find a container, so a foreign sibling cannot
+// be missed in a partially created box. Labels also find renamed containers.
+func inspectDestroyTargets(ctx context.Context, cli *docker.Client, name string) (destroyTargets, error) {
+	if err := names.Validate(name); err != nil {
+		return destroyTargets{}, err
+	}
+	agent, executor := ContainerNames(name)
+	containerRefs := []string{agent, executor}
+	b, err := Get(ctx, cli, name)
+	if err != nil && !errors.Is(err, ErrNotFound) {
+		return destroyTargets{}, err
+	}
+	if b != nil {
+		containerRefs = append(containerRefs, b.AgentID, b.ExecutorID)
+	}
+	var targets destroyTargets
+	seen := make(map[string]bool)
+	for _, ref := range containerRefs {
+		if ref == "" || seen[ref] {
+			continue
+		}
+		id, err := inspectOwnedContainer(ctx, cli, ref, name)
+		if err != nil {
+			return destroyTargets{}, err
+		}
+		if id != "" && !seen[id] {
+			targets.containerIDs = append(targets.containerIDs, id)
+			seen[id] = true
+		}
+	}
+	targets.networkID, err = inspectOwnedNetwork(ctx, cli, NetworkName(name), name)
+	if err != nil {
+		return destroyTargets{}, err
+	}
+	agentVolume, executorVolume := VolumeNames(name)
+	for _, ref := range []string{agentVolume, executorVolume} {
+		volume, err := inspectOwnedVolume(ctx, cli, ref, name)
+		if err != nil {
+			return destroyTargets{}, err
+		}
+		if volume != "" {
+			targets.volumes = append(targets.volumes, volume)
+		}
+	}
+	return targets, nil
+}
+
+func inspectOwnedContainer(ctx context.Context, cli *docker.Client, id, name string) (string, error) {
 	inspect, err := cli.ContainerInspect(ctx, id)
 	if dockerclient.IsErrNotFound(err) {
-		return nil
+		return "", nil
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	if inspect.Config == nil || !ownedByBox(inspect.Config.Labels, name) {
-		return fmt.Errorf("refusing to remove container %s: it is not owned by box %s", id, name)
+		return "", fmt.Errorf("refusing to use container %s: it is not owned by box %s", id, name)
 	}
-	if err := cli.ContainerRemove(ctx, inspect.ID, true); err != nil && !dockerclient.IsErrNotFound(err) {
-		return err
+	if inspect.ContainerJSONBase == nil || inspect.ID == "" {
+		return "", fmt.Errorf("inspect container %s: missing container ID", id)
 	}
-	return nil
+	return inspect.ID, nil
 }
 
-func removeOwnedNetwork(ctx context.Context, cli *docker.Client, network, name string) error {
+func inspectOwnedNetwork(ctx context.Context, cli *docker.Client, network, name string) (string, error) {
 	inspect, err := cli.Raw().NetworkInspect(ctx, network, dockernetwork.InspectOptions{})
 	if dockerclient.IsErrNotFound(err) {
-		return nil
+		return "", nil
 	}
 	if err != nil {
-		return fmt.Errorf("inspect network %s: %w", network, err)
+		return "", fmt.Errorf("inspect network %s: %w", network, err)
 	}
 	if !ownedByBox(inspect.Labels, name) {
-		return fmt.Errorf("refusing to remove network %s: it is not owned by box %s", network, name)
+		return "", fmt.Errorf("refusing to use network %s: it is not owned by box %s", network, name)
 	}
-	if err := cli.NetworkRemove(ctx, inspect.ID); err != nil && !dockerclient.IsErrNotFound(err) {
-		return err
+	if inspect.ID == "" {
+		return "", fmt.Errorf("inspect network %s: missing network ID", network)
 	}
-	return nil
+	return inspect.ID, nil
 }
 
-func removeOwnedVolume(ctx context.Context, cli *docker.Client, volume, name string) error {
+func inspectOwnedVolume(ctx context.Context, cli *docker.Client, volume, name string) (string, error) {
 	inspect, err := cli.Raw().VolumeInspect(ctx, volume)
 	if dockerclient.IsErrNotFound(err) {
-		return nil
+		return "", nil
 	}
 	if err != nil {
-		return fmt.Errorf("inspect volume %s: %w", volume, err)
+		return "", fmt.Errorf("inspect volume %s: %w", volume, err)
 	}
 	if !ownedByBox(inspect.Labels, name) {
-		return fmt.Errorf("refusing to remove volume %s: it is not owned by box %s", volume, name)
+		return "", fmt.Errorf("refusing to use volume %s: it is not owned by box %s", volume, name)
 	}
-	if err := cli.VolumeRemove(ctx, volume, true); err != nil && !dockerclient.IsErrNotFound(err) {
-		return err
-	}
-	return nil
+	return volume, nil
 }

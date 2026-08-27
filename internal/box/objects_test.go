@@ -3,9 +3,11 @@ package box
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 
 	"github.com/davis7dotsh/tx9/internal/docker"
@@ -118,14 +120,79 @@ func TestDestroyPreservesForeignObjectsAndToken(t *testing.T) {
 	}
 }
 
+func TestDestroyPreservesMixedOwnershipBeforeAnyDeletion(t *testing.T) {
+	for _, listed := range []bool{false, true} {
+		for _, foreign := range []string{
+			"/containers/tx9-fixture-agent/json", "/containers/tx9-fixture-executor/json",
+			"/networks/tx9-fixture", "/volumes/tx9-fixture-agent-data", "/volumes/tx9-fixture-exec-data",
+		} {
+			t.Run(fmt.Sprintf("listed=%t/%s", listed, foreign), func(t *testing.T) {
+				t.Setenv("HOME", t.TempDir())
+				if err := state.WriteBoxEnv("fixture", map[string]string{"EXECUTOR_MCP_TOKEN": "synthetic-token"}); err != nil {
+					t.Fatal(err)
+				}
+				var deletes atomic.Int32
+				cli := newObjectTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+					if r.Method == http.MethodDelete {
+						deletes.Add(1)
+						w.WriteHeader(http.StatusNoContent)
+						return
+					}
+					if r.URL.Path == "/containers/json" {
+						containers := []map[string]any{}
+						if listed {
+							for _, role := range []string{docker.RoleAgent, docker.RoleExecutor} {
+								if foreign != "/containers/tx9-fixture-"+role+"/json" {
+									containers = append(containers, map[string]any{
+										"Id": role + "-id", "Labels": docker.BoxLabels("fixture", "previous", role),
+									})
+								}
+							}
+						}
+						_ = json.NewEncoder(w).Encode(containers)
+						return
+					}
+					path := r.URL.Path
+					id := "network-id"
+					for _, role := range []string{docker.RoleAgent, docker.RoleExecutor} {
+						if path == "/containers/"+role+"-id/json" || path == "/containers/tx9-fixture-"+role+"/json" {
+							path = "/containers/tx9-fixture-" + role + "/json"
+							id = role + "-id"
+						}
+					}
+					labels := docker.BoxLabels("fixture", "previous", "")
+					if path == foreign {
+						labels = docker.BoxLabels("different", "previous", "")
+					}
+					_ = json.NewEncoder(w).Encode(map[string]any{"Id": id, "Labels": labels, "Config": map[string]any{"Labels": labels}})
+				})
+				if err := Destroy(context.Background(), cli, "fixture"); err == nil {
+					t.Error("destroy accepted mixed ownership")
+				}
+				if got := deletes.Load(); got != 0 {
+					t.Errorf("destroy made %d DELETE requests before rejecting mixed ownership", got)
+				}
+				env, err := state.ReadBoxEnv("fixture")
+				if err != nil || len(env) != 1 || env["EXECUTOR_MCP_TOKEN"] != "synthetic-token" {
+					t.Error("failed ownership preflight did not preserve token state")
+				}
+			})
+		}
+	}
+}
+
 func TestDestroyRemovesOnlyInspectedOwnedObjectIDs(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())
 	if err := state.WriteBoxEnv("fixture", map[string]string{"EXECUTOR_MCP_TOKEN": "synthetic-token"}); err != nil {
 		t.Fatal(err)
 	}
 	deletions := make(map[string]bool)
+	inspected := make(map[string]bool)
 	cli := newObjectTestClient(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodDelete {
+			if len(inspected) != 5 {
+				t.Error("deletion started before every existing resource was inspected")
+			}
 			deletions[r.URL.Path] = true
 			w.WriteHeader(http.StatusNoContent)
 			return
@@ -134,6 +201,7 @@ func TestDestroyRemovesOnlyInspectedOwnedObjectIDs(t *testing.T) {
 			_, _ = w.Write([]byte(`[]`))
 			return
 		}
+		inspected[r.URL.Path] = true
 		id := "network-id"
 		if strings.Contains(r.URL.Path, "-agent/json") {
 			id = "agent-id"
@@ -157,5 +225,93 @@ func TestDestroyRemovesOnlyInspectedOwnedObjectIDs(t *testing.T) {
 	env, err := state.ReadBoxEnv("fixture")
 	if err != nil || len(env) != 0 {
 		t.Fatal("successful destroy did not remove cached state")
+	}
+}
+
+func TestDestroyCleansPartialOwnedObjects(t *testing.T) {
+	for _, renamedAgent := range []bool{false, true} {
+		t.Run(fmt.Sprint(renamedAgent), func(t *testing.T) {
+			t.Setenv("HOME", t.TempDir())
+			if err := state.WriteBoxEnv("fixture", map[string]string{"EXECUTOR_MCP_TOKEN": "synthetic-token"}); err != nil {
+				t.Fatal(err)
+			}
+			var deletes atomic.Int32
+			cli := newObjectTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodDelete {
+					if r.URL.Path != "/networks/network-id" && r.URL.Path != "/volumes/tx9-fixture-agent-data" && (!renamedAgent || r.URL.Path != "/containers/renamed-agent-id") {
+						t.Errorf("unexpected DELETE request for absent resource: %s", r.URL.Path)
+					}
+					deletes.Add(1)
+					w.WriteHeader(http.StatusNoContent)
+					return
+				}
+				labels := docker.BoxLabels("fixture", "previous", docker.RoleAgent)
+				if r.URL.Path == "/containers/json" {
+					containers := []map[string]any{}
+					if renamedAgent {
+						containers = append(containers, map[string]any{"Id": "renamed-agent-id", "Labels": labels})
+					}
+					_ = json.NewEncoder(w).Encode(containers)
+					return
+				}
+				id := "network-id"
+				if r.URL.Path == "/containers/renamed-agent-id/json" && renamedAgent {
+					id = "renamed-agent-id"
+				} else if r.URL.Path != "/networks/tx9-fixture" && r.URL.Path != "/volumes/tx9-fixture-agent-data" {
+					http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"Id": id, "Labels": labels, "Config": map[string]any{"Labels": labels}})
+			})
+			if err := Destroy(context.Background(), cli, "fixture"); err != nil {
+				t.Fatal(err)
+			}
+			wantDeletes := int32(2)
+			if renamedAgent {
+				wantDeletes++
+			}
+			if got := deletes.Load(); got != wantDeletes {
+				t.Errorf("DELETE requests = %d, want %d existing owned resources", got, wantDeletes)
+			}
+			env, err := state.ReadBoxEnv("fixture")
+			if err != nil || len(env) != 0 {
+				t.Fatal("successful partial cleanup did not remove cached state")
+			}
+		})
+	}
+}
+
+func TestDestroyPreservesOwnedObjectsOnInspectFailure(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := state.WriteBoxEnv("fixture", map[string]string{"EXECUTOR_MCP_TOKEN": "synthetic-token"}); err != nil {
+		t.Fatal(err)
+	}
+	var deletes atomic.Int32
+	cli := newObjectTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deletes.Add(1)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path == "/containers/json" {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		if r.URL.Path == "/volumes/tx9-fixture-exec-data" {
+			http.Error(w, `{"message":"inspection failed"}`, http.StatusInternalServerError)
+			return
+		}
+		labels := docker.BoxLabels("fixture", "previous", "")
+		_ = json.NewEncoder(w).Encode(map[string]any{"Id": r.URL.Path, "Labels": labels, "Config": map[string]any{"Labels": labels}})
+	})
+	if err := Destroy(context.Background(), cli, "fixture"); err == nil {
+		t.Fatal("destroy ignored an inspection failure")
+	}
+	if got := deletes.Load(); got != 0 {
+		t.Errorf("destroy made %d DELETE requests despite incomplete preflight", got)
+	}
+	env, err := state.ReadBoxEnv("fixture")
+	if err != nil || env["EXECUTOR_MCP_TOKEN"] != "synthetic-token" {
+		t.Fatal("incomplete preflight did not preserve cached token")
 	}
 }

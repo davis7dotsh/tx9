@@ -430,49 +430,29 @@ func PrepareRuntime(ctx context.Context, cli *docker.Client, b *Box, token strin
 	return nil
 }
 
-// Destroy removes a box's containers (force), network, volumes, and cached
-// token file. It tolerates partial existence (e.g. a box that failed
-// mid-create) — every step is best-effort and errors are collected rather
-// than short-circuiting, so a half-created box never gets "stuck"
-// undeletable.
+// Destroy first verifies ownership of every existing resource, then removes
+// the containers, network, volumes, and cached token. Missing resources are
+// tolerated so partial creates remain removable. After preflight succeeds,
+// deletion errors are collected and the token is kept until cleanup completes.
 func Destroy(ctx context.Context, cli *docker.Client, name string) error {
-	agentName, executorName := ContainerNames(name)
-	netName := NetworkName(name)
-	agentVol, execVol := VolumeNames(name)
-
+	targets, err := inspectDestroyTargets(ctx, cli, name)
+	if err != nil {
+		return fmt.Errorf("box: destroy %s: %w", name, err)
+	}
 	var errs []error
-
-	b, err := Get(ctx, cli, name)
-	switch {
-	case err == nil:
-		if b.AgentID != "" {
-			if rmErr := removeOwnedContainer(ctx, cli, b.AgentID, name); rmErr != nil {
-				errs = append(errs, rmErr)
-			}
+	for _, id := range targets.containerIDs {
+		if err := cli.ContainerRemove(ctx, id, true); err != nil && !dockerclient.IsErrNotFound(err) {
+			errs = append(errs, err)
 		}
-		if b.ExecutorID != "" {
-			if rmErr := removeOwnedContainer(ctx, cli, b.ExecutorID, name); rmErr != nil {
-				errs = append(errs, rmErr)
-			}
-		}
-	case errors.Is(err, ErrNotFound):
-		// Check derived names too, but never delete an unrelated container
-		// merely because it happens to have the name we would have used.
-		for _, cn := range []string{agentName, executorName} {
-			if rmErr := removeOwnedContainer(ctx, cli, cn, name); rmErr != nil {
-				errs = append(errs, rmErr)
-			}
-		}
-	default:
-		errs = append(errs, err)
 	}
-
-	if rmErr := removeOwnedNetwork(ctx, cli, netName, name); rmErr != nil {
-		errs = append(errs, rmErr)
+	if targets.networkID != "" {
+		if err := cli.NetworkRemove(ctx, targets.networkID); err != nil && !dockerclient.IsErrNotFound(err) {
+			errs = append(errs, err)
+		}
 	}
-	for _, vn := range []string{agentVol, execVol} {
-		if rmErr := removeOwnedVolume(ctx, cli, vn, name); rmErr != nil {
-			errs = append(errs, rmErr)
+	for _, volume := range targets.volumes {
+		if err := cli.VolumeRemove(ctx, volume, true); err != nil && !dockerclient.IsErrNotFound(err) {
+			errs = append(errs, err)
 		}
 	}
 	if len(errs) > 0 {
