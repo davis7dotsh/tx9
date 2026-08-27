@@ -144,6 +144,37 @@ nested = hermes / "profiles" / "other"
 nested.mkdir(parents=True)
 (hermes / "state.db").rename(nested / "state.db")
 assert module.hermes_db_paths(home, root=agent) == [nested / "state.db"]
+
+# SQLite URI metacharacters in profile names must stay literal. Verification
+# must inspect the requested file and never create a truncated-name database.
+loader = importlib.machinery.SourceFileLoader(
+    "hermes_state_runtime", str(Path(sys.argv[1]).with_name("hermes-state"))
+)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+state = importlib.util.module_from_spec(spec)
+loader.exec_module(state)
+for index, name in enumerate(("profile#one", "profile?two", "profile%2fthree", "profile four")):
+    state_home = root / f"uri-home-{index}"
+    directory = state_home / name
+    directory.mkdir(parents=True)
+    database = directory / "state.db"
+    database.write_bytes(b"corrupt database fixture")
+    before = set(state_home.rglob("*"))
+    try:
+        state.inspect_home(state_home)
+    except sqlite3.DatabaseError:
+        pass
+    else:
+        raise AssertionError("URI metacharacters bypassed database integrity validation")
+    assert set(state_home.rglob("*")) == before
+    database.unlink()
+    with sqlite3.connect(database) as connection:
+        connection.execute("CREATE TABLE messages(content TEXT)")
+        connection.execute("INSERT INTO messages VALUES('profile fixture')")
+    for checkpoint in (False, True):
+        report = state.inspect_home(state_home, checkpoint=checkpoint)
+        assert report["databases"][0]["messages"] == 1
+        assert report["databases"][0]["path"] == f"{name}/state.db"
 PY
 
 echo "runtime audit regression checks passed"
