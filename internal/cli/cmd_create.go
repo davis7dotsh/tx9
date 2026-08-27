@@ -130,6 +130,6 @@ func cmdCreate(args []string) error {
 	fmt.Println("  2. inside the box, authenticate claude/codex and run: hermes gateway setup")
 	fmt.Println("  3. leave the foreground setup process, then enable TX9's durable gateway from the host:")
 	fmt.Printf("       tx9 gateway enable %s --confirm-single-writer\n", name)
-	fmt.Printf("  4. dashboard: %s (run `tx9 open %s` for an authenticated one-shot URL)\n", box.DashboardURL(port, b.ExecutorWebBaseURL), name)
+	fmt.Printf("  4. dashboard: %s (run `tx9 open %s` for a URL containing the persistent bearer token)\n", box.DashboardURL(port, b.ExecutorWebBaseURL), name)
 	return nil
 }

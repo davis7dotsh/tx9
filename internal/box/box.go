@@ -296,7 +296,7 @@ func DashboardURL(port, webBaseURL string) string {
 
 // OpenURL is the box's authenticated dashboard URL, with the bearer token
 // embedded in the query string (dossier §4) — what `tx9 open` prints: a
-// one-shot secret, not meant for logs.
+// persistent secret, not meant for logs or sharing.
 func OpenURL(port, token, webBaseURL string) (string, error) {
 	u, err := url.Parse(DashboardURL(port, webBaseURL))
 	if err != nil {

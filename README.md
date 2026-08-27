@@ -7,6 +7,11 @@ with portable agent state on a named volume that travels as an encrypted,
 validated backup archive. Executor scratch state and runtime logs remain on a
 separate durable-but-non-portable volume.
 
+**Security limit:** the agent receives Executor's administrator token.
+Separate containers do not keep Executor credentials confidential from that
+agent. Read the [security model](docs/security-model.md) before connecting
+sensitive accounts or host storage.
+
 For a stable HTTPS Executor origin and OAuth callbacks over a tailnet, see
 [Tailscale HTTPS for Executor](docs/tailscale-executor.md).
 For host directories and NAS shares that should be visible inside an agent,

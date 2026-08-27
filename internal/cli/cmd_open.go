@@ -13,8 +13,8 @@ import (
 
 // cmdOpen implements `tx9 open <box>`: print (or open) the authenticated
 // dashboard URL (?_token=). Mirrors boxd's cmd_open (dossier §4): the
-// token-bearing URL is a one-shot secret, distinct from `create`'s printed
-// (unauthenticated) dashboard URL.
+// token-bearing URL contains the persistent bearer, distinct from create's
+// unauthenticated dashboard URL. It is not a single-use login link.
 func cmdOpen(args []string) error {
 	fs := flag.NewFlagSet("open", flag.ContinueOnError)
 	if err := parseFlagsAnywhere(fs, args); err != nil {
