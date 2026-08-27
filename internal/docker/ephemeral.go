@@ -70,6 +70,9 @@ type EphemeralOpts struct {
 // It returns the container's exit code; a non-nil error means the
 // container could not be run at all (create/attach/start/wait failure),
 // not merely that the command inside it exited non-zero.
+// Caller I/O finishes before return, including on cancellation. Readers and
+// writers must not block indefinitely; closing the attachment cannot interrupt
+// a Read or Write that is already executing inside a caller's implementation.
 func (c *Client) RunEphemeral(ctx context.Context, opts EphemeralOpts) (exitCode int, err error) {
 	hasStdin := opts.Stdin != nil
 	cfg := &container.Config{
@@ -126,6 +129,7 @@ func (c *Client) RunEphemeral(ctx context.Context, opts EphemeralOpts) (exitCode
 	if hasStdin {
 		stdinDone = make(chan error, 1)
 		go func() {
+			defer close(stdinDone)
 			_, copyErr := io.Copy(attach.Conn, opts.Stdin)
 			closeErr := attach.CloseWrite()
 			stdinDone <- errors.Join(copyErr, closeErr)
@@ -134,8 +138,18 @@ func (c *Client) RunEphemeral(ctx context.Context, opts EphemeralOpts) (exitCode
 
 	copyDone := make(chan error, 1)
 	go func() {
+		defer close(copyDone)
 		_, cerr := stdcopy.StdCopy(opts.Stdout, opts.Stderr, attach.Reader)
 		copyDone <- cerr
+	}()
+	defer func() {
+		// Closing the socket interrupts Docker I/O, but a caller's file may
+		// still be in use. Join both copies before its owner can close it.
+		attach.Close()
+		<-copyDone
+		if stdinDone != nil {
+			<-stdinDone
+		}
 	}()
 
 	select {

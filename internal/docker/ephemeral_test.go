@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/docker/docker/api/types/container"
+	"github.com/docker/docker/pkg/stdcopy"
 )
 
 func TestExecCancellationClosesAttachedStream(t *testing.T) {
@@ -159,3 +160,118 @@ func TestEphemeralReportsInputFailure(t *testing.T) {
 type errorReader struct{ err error }
 
 func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestEphemeralWaitsForCallerIOOnFailure(t *testing.T) {
+	for _, failure := range []string{"cancel", "wait", "status", "input"} {
+		for _, blockedInput := range []bool{false, true} {
+			if blockedInput && failure == "input" {
+				continue
+			}
+			t.Run(fmt.Sprintf("%s/blockedInput=%v", failure, blockedInput), func(t *testing.T) {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				entered := make(chan struct{})
+				release := make(chan struct{})
+				defer func() {
+					select {
+					case <-release:
+					default:
+						close(release)
+					}
+				}()
+				cli := newTestDockerClient(t, func(w http.ResponseWriter, r *http.Request) {
+					switch {
+					case strings.HasSuffix(r.URL.Path, "/containers/create"):
+						w.Header().Set("Content-Type", "application/json")
+						fmt.Fprint(w, `{"Id":"helper"}`)
+					case strings.HasSuffix(r.URL.Path, "/containers/helper/attach"):
+						conn, rw, err := w.(http.Hijacker).Hijack()
+						if err != nil {
+							t.Error(err)
+							return
+						}
+						defer conn.Close()
+						fmt.Fprint(rw, "HTTP/1.1 101 UPGRADED\r\nContent-Type: application/vnd.docker.raw-stream\r\nConnection: Upgrade\r\nUpgrade: tcp\r\n\r\n")
+						stdcopy.NewStdWriter(rw, stdcopy.Stdout).Write([]byte("fixture output"))
+						rw.Flush()
+						io.Copy(io.Discard, rw)
+					case strings.HasSuffix(r.URL.Path, "/containers/helper/wait"):
+						w.Header().Set("Content-Type", "application/json")
+						w.WriteHeader(http.StatusOK)
+						w.(http.Flusher).Flush()
+						select {
+						case <-entered:
+						case <-r.Context().Done():
+							return
+						}
+						switch failure {
+						case "cancel":
+							cancel()
+						case "wait":
+							fmt.Fprint(w, "invalid wait response")
+						case "status":
+							fmt.Fprint(w, `{"StatusCode":1,"Error":{"Message":"fixture failure"}}`)
+						case "input":
+							fmt.Fprint(w, `{"StatusCode":0}`)
+						}
+					case strings.HasSuffix(r.URL.Path, "/containers/helper/start"), r.Method == http.MethodDelete:
+						w.WriteHeader(http.StatusNoContent)
+					default:
+						http.Error(w, "unexpected request", http.StatusNotFound)
+					}
+				})
+				opts := EphemeralOpts{Image: "fixture", Stdout: io.Discard, Stderr: io.Discard}
+				if blockedInput {
+					opts.Stdin = heldReader{entered, release}
+				} else {
+					opts.Stdout = heldWriter{entered, release}
+				}
+				if failure == "input" {
+					opts.Stdin = errorReader{errors.New("fixture input failure")}
+				}
+				done := make(chan error, 1)
+				go func() {
+					_, err := cli.RunEphemeral(ctx, opts)
+					done <- err
+				}()
+				select {
+				case <-entered:
+				case err := <-done:
+					t.Fatalf("helper returned before caller I/O: %v", err)
+				case <-ctx.Done():
+					t.Fatal("helper never entered caller I/O")
+				}
+				select {
+				case err := <-done:
+					t.Fatalf("helper returned while caller I/O was still active: %v", err)
+				case <-time.After(50 * time.Millisecond):
+				}
+				close(release)
+				select {
+				case err := <-done:
+					if err == nil {
+						t.Fatal("helper failure was lost")
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("helper did not return after caller I/O finished")
+				}
+			})
+		}
+	}
+}
+
+type heldWriter struct{ entered, release chan struct{} }
+
+func (w heldWriter) Write(p []byte) (int, error) {
+	close(w.entered)
+	<-w.release
+	return len(p), nil
+}
+
+type heldReader struct{ entered, release chan struct{} }
+
+func (r heldReader) Read([]byte) (int, error) {
+	close(r.entered)
+	<-r.release
+	return 0, io.EOF
+}
