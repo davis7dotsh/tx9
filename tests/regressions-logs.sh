@@ -842,9 +842,9 @@ chmod 0500 "$agent_root/home/agent/.hermes"
 chmod 0700 "$agent_root/home/agent/.hermes"
 grep -q 'Hermes stale WAL message' "$tmp/wal-query.jsonl"
 
-# If a live read fails after emitting one table, replay the writable snapshot
-# and suppress only rows that already escaped. Identical legitimate rows keep
-# their multiplicity instead of being collapsed by the recovery pass.
+# SQLite must receive only a private snapshot, never a mounted path or a
+# /proc/self/fd URI that it resolves back to a mutable pathname. Replace the
+# source parent as SQLite opens its input and retain duplicate message rows.
 python3 - "$helper" "$tmp/partial-hermes" <<'PY'
 from collections import Counter
 import importlib.machinery
@@ -870,31 +870,40 @@ with sqlite3.connect(path) as database:
         INSERT INTO messages VALUES('2026-03-01T00:00:02Z', 'snapshot message');
     """)
 
-original_events = module.hermes_database_events
+private = root.with_name("executor-private")
+private.mkdir()
+with sqlite3.connect(private / "state.db") as database:
+    database.executescript("""
+        CREATE TABLE messages(content TEXT);
+        INSERT INTO messages VALUES('executor-private-fixture');
+    """)
+
+original_connect = module.sqlite3.connect
 calls = 0
 
 
-def partial_events(connection, *, path, box, modified_at):
+def guarded_connect(database, *args, **kwargs):
     global calls
     calls += 1
-    call_number = calls
-    for event in original_events(
-        connection, path=path, box=box, modified_at=modified_at
-    ):
-        yield event
-        if call_number == 1 and event["type"] == "hermes.message":
-            raise sqlite3.DatabaseError("injected failure after partial read")
+    assert not str(database).startswith("file:"), "SQLite reopened a mutable source URI"
+    snapshot = pathlib.Path(database)
+    assert not snapshot.is_relative_to(root)
+    assert not snapshot.is_relative_to(private)
+    assert snapshot.parent.stat().st_mode & 0o777 == 0o700
+    root.rename(root.with_name("moved-agent"))
+    root.symlink_to(private, target_is_directory=True)
+    return original_connect(database, *args, **kwargs)
 
 
-module.hermes_database_events = partial_events
+module.sqlite3.connect = guarded_connect
 events = list(module.read_hermes_db(path, root=root, box="fixture-box"))
 
-assert calls == 2
+assert calls == 1
 assert Counter((event["type"], event["message"]) for event in events) == Counter({
     ("hermes.session", "partial session"): 1,
     ("hermes.message", "snapshot message"): 2,
 })
-assert any("recovered remaining rows" in warning for warning in module.WARNINGS)
+assert module.WARNINGS == []
 PY
 
 python3 - "$agent_root/logs" <<'PY'
