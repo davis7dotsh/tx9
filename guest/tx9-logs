@@ -1084,14 +1084,15 @@ class Capture:
             self.received_signal = signum
         self._signal_process_group(signum)
 
-    def _signal_process_group(self, signum: int) -> None:
+    def _signal_process_group(self, signum: int) -> bool:
         pgid = self.active_pgid
         if pgid is None:
-            return
+            return False
         try:
             os.killpg(pgid, signum)
         except ProcessLookupError:
-            pass
+            return False
+        return True
 
     def install_signal_handlers(self) -> None:
         for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGQUIT, signal.SIGHUP):
@@ -1278,11 +1279,18 @@ class Capture:
         # output. Cancellable polling also bounds shutdown when a daemonized
         # descendant escaped that group while retaining a pipe descriptor.
         self._signal_process_group(signal.SIGTERM)
+        drain_deadline = time.monotonic() + CAPTURE_READER_DRAIN_SECONDS
         reader_stop.set()
         for reader in readers:
             reader.join()
-        if reader_cancelled.is_set():
-            self._signal_process_group(signal.SIGKILL)
+        # Pipe EOF does not mean the process group exited. A background child
+        # can close stdout/stderr and ignore TERM while its service restarts.
+        while self._signal_process_group(0):
+            remaining = drain_deadline - time.monotonic()
+            if remaining <= 0:
+                self._signal_process_group(signal.SIGKILL)
+                break
+            time.sleep(min(0.01, remaining))
         self.active_pgid = None
         self.child = None
         self.flush_repeats()
@@ -1829,11 +1837,15 @@ def runtime_source(stem: str, scope: str) -> str:
     return source
 
 
-def read_runtime_logs(root: Path, *, scope: str, box: str) -> Iterator[dict[str, Any]]:
+def read_runtime_logs(
+    root: Path, *, scope: str, box: str, selected: set[str] | None = None
+) -> Iterator[dict[str, Any]]:
     log_dir = root / "logs"
     files = list(iter_regular_files(root, log_dir, recursive=False))
     for active in sorted(path for path in files if path.suffix == ".jsonl"):
         source = runtime_source(active.stem, scope)
+        if not source_wanted(source, selected):
+            continue
         yield from read_jsonl(active, root=root, box=box, source=source, fallback_kind="output")
 
     structured_replacements = {
@@ -1854,6 +1866,8 @@ def read_runtime_logs(root: Path, *, scope: str, box: str) -> Iterator[dict[str,
             and SERVICE_SOURCE_RE.fullmatch(source) is None
         ):
             source = "agent" if scope == "agent" else "executor"
+        if not source_wanted(source, selected):
+            continue
         yield from read_raw(active, root=root, box=box, source=source)
 
 
@@ -1875,10 +1889,15 @@ def read_client_events(
 def hermes_db_paths(home: Path, *, root: Path) -> list[Path]:
     hermes_home = home / ".hermes"
     direct = hermes_home / "state.db"
-    files = list(iter_regular_files(root, hermes_home, recursive=True))
-    if direct in files:
-        return [direct]
-    return sorted(path for path in files if path.name == "state.db")
+    try:
+        with open_regular_binary(root, direct):
+            return [direct]
+    except OSError:
+        pass
+    return sorted(
+        path for path in iter_regular_files(root, hermes_home, recursive=True)
+        if path.name == "state.db"
+    )
 
 
 def hermes_database_events(
@@ -2048,9 +2067,9 @@ def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int
     if selected is None or selected & {"agent", "hermes", "codex", "claude"} or any(
         SERVICE_SOURCE_RE.fullmatch(source) is not None for source in selected
     ):
-        streams.append(read_runtime_logs(agent_root, scope="agent", box=args.box))
+        streams.append(read_runtime_logs(agent_root, scope="agent", box=args.box, selected=selected))
     if source_wanted("executor", selected):
-        streams.append(read_runtime_logs(executor_root, scope="executor", box=args.box))
+        streams.append(read_runtime_logs(executor_root, scope="executor", box=args.box, selected=selected))
     if source_wanted("codex", selected):
         streams.append(
             read_client_events(agent_home, root=agent_root, client="codex", box=args.box)
