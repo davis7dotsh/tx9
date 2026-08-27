@@ -70,7 +70,7 @@ init() {
     "$SERVICES_DIR" "$AGENT_HOME/.local" "$AGENT_HOME/.local/share"
     "$AGENT_HOME/.local/state" "$LOGS"
   )
-  mkdir -p "${managed[@]}"
+  mkdir -p "${managed[@]}" || return 1
   chmod 0700 "$SERVICES_DIR" 2>/dev/null || true
   id agent >/dev/null 2>&1 && chown agent:agent "${managed[@]}" 2>/dev/null || true
   if [[ -e "$LEGACY_QUIESCE_FILE" ]]; then
@@ -78,7 +78,7 @@ init() {
     rm -f "$LEGACY_QUIESCE_FILE" || return 1
   fi
   if [[ ! -e "$GATEWAY_POLICY" ]]; then
-    touch "$GATEWAY_DISABLED" "$GATEWAY_POLICY"
+    touch "$GATEWAY_DISABLED" "$GATEWAY_POLICY" || return 1
   fi
   # Provisioning runs init as root, which would leave the policy markers
   # root-owned; later agent-run gateway_disable/gateway_enable must be able
@@ -227,7 +227,7 @@ _spawn_without_lock_fd() {
 }
 
 _executor_up() {
-  init
+  init || return 1
   if _exec_remote; then
     _wait_port open || { _steady_report executor unreachable "remote executor unreachable at $EXECUTOR_HOST:${EXECUTOR_PORT:-4788}" stderr; return 1; }
     _steady_report executor reachable "executor daemon: reachable (remote)"
@@ -403,8 +403,8 @@ up() {
   local services_failed=0
   local gateway_status
 
-  init
-  rm -f "$QUIESCE_FILE"
+  init || return 1
+  rm -f "$QUIESCE_FILE" || return 1
   _services_reconcile || {
     services_failed=1
     echo "warning: custom service reconciliation failed; run 'hb services-reload' for details" >&2
@@ -417,7 +417,7 @@ up() {
 }
 
 reconcile() {
-  init
+  init || return 1
   if [[ -e "$QUIESCE_FILE" ]]; then
     _services_stop
     return
@@ -454,8 +454,8 @@ _stop_gateway() {
 
 pause() {
   local failed=0
-  init
-  touch "$QUIESCE_FILE"
+  init || return 1
+  touch "$QUIESCE_FILE" || return 1
   _services_stop || failed=1
   _stop_gateway || failed=1
   _stop_executor || failed=1
@@ -467,7 +467,7 @@ pause() {
 }
 
 resume() {
-  rm -f "$QUIESCE_FILE"
+  rm -f "$QUIESCE_FILE" || return 1
   up
 }
 
@@ -477,7 +477,7 @@ gateway_is_disabled() { [[ -e "$GATEWAY_DISABLED" ]] && ! _gateway_running; }
 
 gateway_enable() {
   local flag="${1:-}" phrase="${2:-}"
-  init
+  init || return 1
   [[ "$flag" == --confirm-single-writer && "$phrase" == I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY ]] || {
     echo "refusing gateway start without: --confirm-single-writer I_CONFIRM_NO_OTHER_GATEWAY_USES_THIS_IDENTITY" >&2
     return 1
@@ -492,7 +492,7 @@ gateway_enable() {
     [[ "$(jq -r '.gateway_enabled // false' "$STATE_DIR/import-manifest.json" 2>/dev/null)" != true ]]; then
     cutover_ready || return 1
   fi
-  rm -f "$GATEWAY_DISABLED"
+  rm -f "$GATEWAY_DISABLED" || return 1
   _start_gateway
   local start_status=$?
   if [[ "$start_status" == 2 ]]; then
@@ -522,7 +522,7 @@ gateway_enable() {
 }
 
 gateway_disable() {
-  init
+  init || return 1
   # The marker may be root-owned from provisioning; touch then fails to update
   # its mtime, which is fine — but "disabled" must never be claimed unless the
   # durable marker actually exists.
