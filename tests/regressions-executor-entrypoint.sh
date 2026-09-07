@@ -44,9 +44,12 @@ token = json.loads((data / "server-control" / "auth.json").read_text())["token"]
 assert token == os.environ["EXPECTED_TOKEN"] == os.environ["EXECUTOR_MCP_TOKEN"]
 print("credential fixture " + token)
 ''')
+# Use the shipped profile so the entrypoint is exercised against its real
+# trailing conditional source (whose status is 1 when the optional env file is
+# absent), with a stale token exported ahead of it.
 profile = root / "profile.sh"
-profile.write_text("export EXECUTOR_MCP_TOKEN=stale-profile-fixture\n")
 source = (project / "docker" / "executor-entrypoint.sh").read_text()
+shipped_profile = (project / "guest" / "profile.sh").read_text()
 
 for label in ("default", "custom"):
     fixture = root / label
@@ -61,6 +64,10 @@ for label in ("default", "custom"):
     outside.write_text("unchanged fixture\n")
     auth = control / "auth.json"
     auth.symlink_to(outside)
+    profile.write_text(
+        "export EXECUTOR_MCP_TOKEN=stale-profile-fixture\n"
+        + shipped_profile.replace("/data/home/agent", str(home))
+    )
     entrypoint = fixture / "entrypoint.sh"
     entrypoint.write_text(
         source.replace("/data/home/agent", str(home))

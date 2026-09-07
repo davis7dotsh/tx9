@@ -20,8 +20,10 @@ chown agent:agent /data/home/agent /data/logs
 exec runuser -u agent -- env HOME=/data/home/agent TX9_BOX_NAME="${TX9_BOX_NAME:-}" \
   bash --noprofile --norc -euo pipefail <<'WORKLOAD'
 tx9_runtime_executor_token="$EXECUTOR_MCP_TOKEN"
+# The profile ends with a conditional source of an optional env file that
+# never exists on the executor volume, so its exit status is 1 under errexit.
 # shellcheck disable=SC1091
-. /etc/profile.d/hermes-box.sh
+. /etc/profile.d/hermes-box.sh || true
 # Restored profile state must not replace the runtime's current credential.
 export EXECUTOR_MCP_TOKEN="$tx9_runtime_executor_token"
 export TX9_LOG_MAX_BYTES TX9_LOG_MAX_FILES
