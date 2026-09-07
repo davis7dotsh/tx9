@@ -2,11 +2,15 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+
+	"github.com/docker/docker/api/types/network"
+	dockerclient "github.com/docker/docker/client"
 
 	"github.com/davis7dotsh/tx9/internal/box"
 	"github.com/davis7dotsh/tx9/internal/docker"
@@ -19,9 +23,7 @@ import (
 // cmdPrune implements `tx9 prune`: garbage-collect stale tx9-box:* images
 // (superseded versions no container references) and orphaned per-box state
 // files (~/.tx9/boxes/*.env with no matching box left in the daemon).
-// Unlike other lifecycle commands, prune spans every box at once, so it
-// doesn't take a per-box lock — it only ever removes things nothing is
-// using.
+// State files are checked again under their per-box lock before removal.
 func cmdPrune(args []string) error {
 	fs := flag.NewFlagSet("prune", flag.ContinueOnError)
 	if err := parseFlagsAnywhere(fs, args); err != nil {
@@ -108,9 +110,11 @@ func pruneImages(ctx context.Context, cli *docker.Client) ([]string, error) {
 }
 
 // pruneStateFiles removes ~/.tx9/boxes/<name>.env files with no
-// corresponding box left in the daemon — leftovers from a box deleted by
-// some other means (e.g. `docker rm` directly) that skipped tx9's own
-// cleanup.
+// corresponding box left in the daemon — leftovers from a box whose
+// containers, volumes, and network were all removed by some other means
+// that skipped tx9's own cleanup. A box that still has volumes or a network
+// (e.g. only `docker rm` was run) keeps its token so it stays recoverable;
+// prune says so instead of silently leaving the file behind.
 func pruneStateFiles(ctx context.Context, cli *docker.Client) ([]string, error) {
 	boxes, err := box.List(ctx, cli)
 	if err != nil {
@@ -144,30 +148,80 @@ func pruneStateFiles(ctx context.Context, cli *docker.Client) ([]string, error) 
 			continue
 		}
 
-		// An env file is written by create/import before either of them
-		// takes this box's per-box lock and holds it for their entire
-		// run, so a box with no containers yet (known[name] == false)
-		// might just be mid-create/mid-import rather than truly
-		// orphaned. Try the same non-blocking lock they use; if it's
-		// held, skip this file instead of deleting state out from under
-		// a running operation.
-		lockPath, err := state.LockPath(name)
+		deleted, err := pruneStateFile(name, func() (bool, error) {
+			return boxStateInUse(ctx, cli, name)
+		})
 		if err != nil {
 			return removed, err
 		}
-		release, err := lock.Acquire(lockPath)
-		if err != nil {
-			fmt.Printf("tx9: skipping %s: operation in progress\n", name)
-			continue
+		if deleted {
+			removed = append(removed, filepath.Join(dir, e.Name()))
 		}
-
-		path := filepath.Join(dir, e.Name())
-		rmErr := os.Remove(path)
-		release()
-		if rmErr != nil {
-			return removed, fmt.Errorf("remove %s: %w", path, rmErr)
-		}
-		removed = append(removed, path)
 	}
 	return removed, nil
+}
+
+func boxStateInUse(ctx context.Context, cli *docker.Client, name string) (bool, error) {
+	exists, err := box.Exists(ctx, cli, name)
+	if err != nil || exists {
+		return exists, err
+	}
+	// A failed upgrade or manual container removal can leave a recoverable
+	// box with only its volumes. Keep its token and configuration until all
+	// durable objects have gone, even if their ownership labels are missing.
+	agent, executor := box.VolumeNames(name)
+	for _, volume := range []string{agent, executor} {
+		if _, err := cli.Raw().VolumeInspect(ctx, volume); err == nil {
+			fmt.Printf("tx9: keeping state for %s: Docker volume %s still exists (remove it with `docker volume rm` to prune)\n", name, volume)
+			return true, nil
+		} else if !dockerclient.IsErrNotFound(err) {
+			return false, err
+		}
+	}
+	networkName := box.NetworkName(name)
+	if _, err := cli.Raw().NetworkInspect(ctx, networkName, network.InspectOptions{}); err == nil {
+		fmt.Printf("tx9: keeping state for %s: Docker network %s still exists (remove it with `docker network rm` to prune)\n", name, networkName)
+		return true, nil
+	} else if !dockerclient.IsErrNotFound(err) {
+		return false, err
+	}
+	return false, nil
+}
+
+func pruneStateFile(name string, exists func() (bool, error)) (bool, error) {
+	lockPath, err := state.LockPath(name)
+	if err != nil {
+		return false, err
+	}
+	release, err := lock.Acquire(lockPath)
+	if err != nil {
+		if errors.Is(err, lock.ErrBusy) {
+			fmt.Printf("tx9: skipping %s: operation in progress\n", name)
+			return false, nil
+		}
+		return false, err
+	}
+	defer release()
+
+	// Create/import may have finished since the initial list, or upgrade
+	// may have temporarily removed both containers. The lock alone does
+	// not make that earlier snapshot safe to use.
+	live, err := exists()
+	if err != nil {
+		return false, fmt.Errorf("recheck box %s before pruning state: %w", name, err)
+	}
+	if live {
+		return false, nil
+	}
+	path, err := state.BoxEnvPath(name)
+	if err != nil {
+		return false, err
+	}
+	if err := os.Remove(path); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("remove %s: %w", path, err)
+	}
+	return true, nil
 }
