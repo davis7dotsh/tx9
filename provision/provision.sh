@@ -155,7 +155,9 @@ install_hermes() {
 # [messaging] extra, so a freshly provisioned gateway starts but every chat
 # platform adapter fails with "Platform 'Discord' requirements not met
 # (pip install 'hermes-agent[messaging]')" — the box's whole purpose.
-# Verified live during the Eventide migration. Idempotent: uv resolves
+# Verified live during the Eventide migration. Upstream setup.py blocks
+# non-editable wheel builds outside Nix, so this must stay an editable (-e)
+# install like the official installer uses. Idempotent: uv resolves
 # already-satisfied pins in seconds.
 install_hermes_messaging_deps() {
   local install_dir="$1"
@@ -164,7 +166,7 @@ install_hermes_messaging_deps() {
     return 1
   }
   log "hermes messaging platform deps ([messaging] extra)"
-  (cd "$install_dir" && "$UV_DIR/uv" pip install --python venv/bin/python ".[messaging]") || {
+  (cd "$install_dir" && "$UV_DIR/uv" pip install --python venv/bin/python -e ".[messaging]") || {
     log "hermes messaging deps install FAILED"
     return 1
   }
