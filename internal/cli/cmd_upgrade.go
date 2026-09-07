@@ -27,7 +27,7 @@ import (
 // executable.
 func cmdUpgrade(args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
-	force := fs.Bool("force", false, "self-update: skip the dev-build guard and reinstall even if already current")
+	force := fs.Bool("force", false, "self-update: replace dev, custom, or newer builds and reinstall even if already current")
 	executorFlags := addExecutorConfigFlags(fs)
 	resourceFlags := addResourceConfigFlags(fs)
 	if err := parseFlagsAnywhere(fs, args); err != nil {
