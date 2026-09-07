@@ -365,3 +365,138 @@ func TestUpdateRejectsMalformedLatestVersion(t *testing.T) {
 		t.Fatalf("Update: err = %v, want unexpected-version-string error", err)
 	}
 }
+
+// slowServer serves a release whose binary asset trickles out in chunks
+// spaced chunkDelay apart, so the whole download takes far longer than
+// any single gap. Used to show that client.Timeout does not bound the
+// download while downloadStallTimeout still does.
+func slowServer(t *testing.T, version, goos, goarch string, chunks [][]byte, chunkDelay time.Duration, stallAfter int) *httptest.Server {
+	t.Helper()
+	assetName := AssetName(goos, goarch)
+	var content []byte
+	for _, c := range chunks {
+		content = append(content, c...)
+	}
+	sum := sha256.Sum256(content)
+	checksums := fmt.Sprintf("%s  %s\n", hex.EncodeToString(sum[:]), assetName)
+
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s\n", version)
+	})
+	mux.HandleFunc("/releases/"+version+"/"+checksumsAssetName, func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(checksums))
+	})
+	mux.HandleFunc("/releases/"+version+"/"+assetName, func(w http.ResponseWriter, r *http.Request) {
+		flusher, _ := w.(http.Flusher)
+		for i, c := range chunks {
+			if stallAfter >= 0 && i >= stallAfter {
+				// Hold the connection open without sending anything
+				// until the client gives up.
+				<-r.Context().Done()
+				return
+			}
+			_, _ = w.Write(c)
+			if flusher != nil {
+				flusher.Flush()
+			}
+			select {
+			case <-time.After(chunkDelay):
+			case <-r.Context().Done():
+				return
+			}
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestUpdateSlowDownloadOutlivesClientTimeout(t *testing.T) {
+	// Ten chunks 40ms apart: ~400ms total, well past the 100ms client
+	// timeout but with every gap under the stall limit.
+	chunks := make([][]byte, 10)
+	for i := range chunks {
+		chunks[i] = []byte(fmt.Sprintf("chunk-%02d;", i))
+	}
+	srv := slowServer(t, "1.2.4", "linux", "amd64", chunks, 40*time.Millisecond, -1)
+
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "tx9")
+	if err := os.WriteFile(exePath, []byte("old binary contents"), 0o755); err != nil {
+		t.Fatalf("seed old binary: %v", err)
+	}
+
+	client := srv.Client()
+	client.Timeout = 100 * time.Millisecond
+	res, err := Update(Options{
+		CurrentVersion:   "1.2.3",
+		Origin:           srv.URL,
+		GOOS:             "linux",
+		GOARCH:           "amd64",
+		HTTPClient:       client,
+		execPathOverride: exePath,
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if !res.Applied {
+		t.Fatal("Update: Applied = false, want true")
+	}
+	got, err := os.ReadFile(exePath)
+	if err != nil {
+		t.Fatalf("read installed binary: %v", err)
+	}
+	if !strings.HasPrefix(string(got), "chunk-00;") || !strings.HasSuffix(string(got), "chunk-09;") {
+		t.Errorf("installed binary = %q, want the full streamed asset", got)
+	}
+}
+
+func TestUpdateStalledDownloadFails(t *testing.T) {
+	old := downloadStallTimeout
+	downloadStallTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { downloadStallTimeout = old })
+
+	chunks := [][]byte{[]byte("first;"), []byte("never-sent;")}
+	srv := slowServer(t, "1.2.4", "linux", "amd64", chunks, 10*time.Millisecond, 1)
+
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "tx9")
+	if err := os.WriteFile(exePath, []byte("old binary contents"), 0o755); err != nil {
+		t.Fatalf("seed old binary: %v", err)
+	}
+
+	start := time.Now()
+	_, err := Update(Options{
+		CurrentVersion:   "1.2.3",
+		Origin:           srv.URL,
+		GOOS:             "linux",
+		GOARCH:           "amd64",
+		HTTPClient:       srv.Client(),
+		execPathOverride: exePath,
+	})
+	if err == nil {
+		t.Fatal("Update: err = nil, want stall error")
+	}
+	if !strings.Contains(err.Error(), "no data received for") {
+		t.Errorf("Update: err = %v, want stall message", err)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("Update took %s to give up on a stalled download", elapsed)
+	}
+
+	got, err := os.ReadFile(exePath)
+	if err != nil {
+		t.Fatalf("read binary: %v", err)
+	}
+	if string(got) != "old binary contents" {
+		t.Errorf("old binary was modified: %q", got)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("staging file leaked: %v", entries)
+	}
+}
