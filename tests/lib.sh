@@ -44,6 +44,16 @@ wait_for_file() {
   return 1
 }
 
+# Prints a pid's one-letter /proc state (R, S, Z, ...) or nothing once the
+# pid is gone. Reads /proc directly: forking ps on every poll of a tight
+# loop is what a loaded runner is slowest at.
+proc_state() {
+  local stat
+  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+  stat="${stat##*) }"
+  printf '%s' "${stat%% *}"
+}
+
 wait_for_pattern() {
   local pattern="$1" file="$2" attempt
   for ((attempt = 0; attempt < 100; attempt++)); do
