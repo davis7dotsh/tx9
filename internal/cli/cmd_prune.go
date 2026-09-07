@@ -110,9 +110,11 @@ func pruneImages(ctx context.Context, cli *docker.Client) ([]string, error) {
 }
 
 // pruneStateFiles removes ~/.tx9/boxes/<name>.env files with no
-// corresponding box left in the daemon — leftovers from a box deleted by
-// some other means (e.g. `docker rm` directly) that skipped tx9's own
-// cleanup.
+// corresponding box left in the daemon — leftovers from a box whose
+// containers, volumes, and network were all removed by some other means
+// that skipped tx9's own cleanup. A box that still has volumes or a network
+// (e.g. only `docker rm` was run) keeps its token so it stays recoverable;
+// prune says so instead of silently leaving the file behind.
 func pruneStateFiles(ctx context.Context, cli *docker.Client) ([]string, error) {
 	boxes, err := box.List(ctx, cli)
 	if err != nil {
@@ -170,12 +172,15 @@ func boxStateInUse(ctx context.Context, cli *docker.Client, name string) (bool, 
 	agent, executor := box.VolumeNames(name)
 	for _, volume := range []string{agent, executor} {
 		if _, err := cli.Raw().VolumeInspect(ctx, volume); err == nil {
+			fmt.Printf("tx9: keeping state for %s: Docker volume %s still exists (remove it with `docker volume rm` to prune)\n", name, volume)
 			return true, nil
 		} else if !dockerclient.IsErrNotFound(err) {
 			return false, err
 		}
 	}
-	if _, err := cli.Raw().NetworkInspect(ctx, box.NetworkName(name), network.InspectOptions{}); err == nil {
+	networkName := box.NetworkName(name)
+	if _, err := cli.Raw().NetworkInspect(ctx, networkName, network.InspectOptions{}); err == nil {
+		fmt.Printf("tx9: keeping state for %s: Docker network %s still exists (remove it with `docker network rm` to prune)\n", name, networkName)
 		return true, nil
 	} else if !dockerclient.IsErrNotFound(err) {
 		return false, err
