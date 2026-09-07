@@ -42,6 +42,9 @@ DEFAULT_MAX_FILES = 5
 MIN_MAX_BYTES = 1024
 MAX_EVENT_MESSAGE_BYTES = 1024 * 1024
 MAX_CAPTURE_CHUNK_BYTES = 64 * 1024
+# A quoted credential longer than this is treated as unterminated so one
+# truncated `key="...` line cannot suppress the rest of a captured stream.
+MAX_QUOTED_SECRET_BYTES = 8 * 1024
 MAX_NORMALIZE_DEPTH = 24
 MAX_NORMALIZE_ITEMS = 200
 MAX_NORMALIZE_STRING_BYTES = 64 * 1024
@@ -53,6 +56,7 @@ CAPTURE_DEDUP_WINDOW_SECONDS = 60.0
 CAPTURE_DEDUP_MAX_REPEATS = 1000
 MAX_RAW_CONTINUATION_LINES = 1000
 HERMES_SNAPSHOT_ATTEMPTS = 3
+HERMES_SNAPSHOT_RETRY_SECONDS = 0.05
 PARENT_DEATH_EXEC_ACTION = "__parent-death-exec"
 PR_SET_PDEATHSIG = 1
 # Numeric values below this many epoch seconds (2001-09-09) cannot be event
@@ -267,6 +271,7 @@ class StreamingPatternRedactor:
         self.value_delimiter_re = self._VALUE_DELIMITER_RE
         self.value_quote = 0
         self.value_escaped = False
+        self.value_suppressed = 0
 
     def _word_ends(self, value: bytes) -> bool:
         return self.word_length >= len(value) and self.word_tail.endswith(value)
@@ -350,6 +355,10 @@ class StreamingPatternRedactor:
                     self.value_escaped = True
                 elif byte == self.value_quote:
                     output.append(byte)
+                    self._reset_scan()
+                    continue
+                self.value_suppressed += 1
+                if self.value_suppressed >= MAX_QUOTED_SECRET_BYTES:
                     self._reset_scan()
                 continue
 
@@ -448,6 +457,7 @@ class StreamingPatternRedactor:
                         output.extend(REDACTED_BYTES)
                         self.value_quote = byte
                         self.value_escaped = False
+                        self.value_suppressed = 0
                         self.state = "suppress_quoted"
                     continue
                 if byte in self.value_delimiters:
@@ -1937,7 +1947,7 @@ def hermes_snapshot_connection(
     path: Path, *, root: Path, source_handle: BinaryIO
 ) -> tuple[tempfile.TemporaryDirectory[str], sqlite3.Connection]:
     wal_path = Path(str(path) + "-wal")
-    for _attempt in range(HERMES_SNAPSHOT_ATTEMPTS):
+    for attempt in range(HERMES_SNAPSHOT_ATTEMPTS):
         snapshot_dir = tempfile.TemporaryDirectory(prefix="tx9-hermes-snapshot-")
         snapshot_path = Path(snapshot_dir.name) / "state.db"
         try:
@@ -1968,8 +1978,20 @@ def hermes_snapshot_connection(
         except Exception:
             snapshot_dir.cleanup()
             raise
+        if attempt + 1 == HERMES_SNAPSHOT_ATTEMPTS:
+            # A busy gateway can write faster than a large database copies.
+            # Reading the last copy is better than showing no history at all:
+            # SQLite drops a torn WAL tail and reports a torn main file as an
+            # error, so nothing is silently misread. The warning marks the
+            # result as possibly incomplete.
+            warn(
+                f"Hermes database {path} changed during all {HERMES_SNAPSHOT_ATTEMPTS} "
+                "snapshot attempts; using the last copy, which may be incomplete"
+            )
+            return snapshot_dir, sqlite3.connect(snapshot_path, timeout=5)
         snapshot_dir.cleanup()
-    raise OSError(f"Hermes database changed during all {HERMES_SNAPSHOT_ATTEMPTS} snapshot attempts")
+        time.sleep(HERMES_SNAPSHOT_RETRY_SECONDS * (attempt + 1))
+    raise AssertionError("unreachable")
 
 
 def read_hermes_db(path: Path, *, root: Path, box: str) -> Iterator[dict[str, Any]]:

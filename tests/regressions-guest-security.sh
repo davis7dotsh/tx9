@@ -131,8 +131,8 @@ assert [event["message"] for event in events] == ["committed-in-wal"]
 assert copies == 2
 assert module.WARNINGS == []
 
-# Constant writes must terminate after three attempts and mark the export
-# incomplete through the existing warning path, rather than emit a mixed copy.
+# Constant writes must terminate after three attempts and still return the
+# last copy, marked possibly incomplete through the existing warning path.
 path, writer = wal_fixture("continuous-writes")
 copies = 0
 
@@ -151,9 +151,20 @@ try:
 finally:
     module.shutil.copyfileobj = original_copy
     writer.close()
-assert events == []
+assert [event["message"] for event in events][:1] == ["committed-in-wal"]
 assert copies == 3
 assert any("changed during all 3 snapshot attempts" in warning for warning in module.WARNINGS)
+
+# An unterminated quoted credential must not suppress the rest of a stream:
+# after a bounded number of bytes the redactor resumes normal scanning.
+redactor = module.StreamingRedactor(())
+head = redactor.feed(b"warn: token: 'abc\n")
+tail = b"x" * module.MAX_QUOTED_SECRET_BYTES + b"\nline two password=hunter2\nline three\n"
+redacted = head + redactor.feed(tail) + redactor.finish()
+assert redacted.startswith(b"warn: token: '[REDACTED]")
+assert b"line three" in redacted
+assert b"hunter2" not in redacted
+assert b"password=[REDACTED]" in redacted
 PY
 
 echo "guest security regression checks passed"
