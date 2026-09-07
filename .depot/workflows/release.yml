@@ -93,9 +93,14 @@ jobs:
       - name: make check
         run: make check
 
+      # npm audit is advisory here: a new advisory against dev-only tooling
+      # (wrangler's transitive graph) must not block publishing a tag whose
+      # CLI and Worker code are unchanged. check.yml still fails PRs on it.
       - name: Check release site
         working-directory: site
-        run: npm run check && npm run format:check && npm run lint && npm test && npm audit --audit-level=high
+        run: |
+          npm run check && npm run format:check && npm run lint && npm test
+          npm audit --audit-level=high || echo "::warning::npm audit reported high-severity advisories in site tooling; review before the next release"
 
       - name: Derive VERSION from tag
         id: version
