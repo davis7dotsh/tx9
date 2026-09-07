@@ -46,10 +46,16 @@ wait_for_file() {
 
 # Prints a pid's one-letter /proc state (R, S, Z, ...) or nothing once the
 # pid is gone. Reads /proc directly: forking ps on every poll of a tight
-# loop is what a loaded runner is slowest at.
+# loop is what a loaded runner is slowest at. Only a vanished /proc entry
+# counts as gone; any other read failure is an error so a caller never
+# mistakes an unreadable /proc for a finished process.
 proc_state() {
   local stat
-  stat="$(cat "/proc/$1/stat" 2>/dev/null)" || return 0
+  if ! stat="$(cat "/proc/$1/stat" 2>/dev/null)"; then
+    [[ -d "/proc/$1" ]] || return 0
+    echo "proc_state: cannot read /proc/$1/stat" >&2
+    return 1
+  fi
   stat="${stat##*) }"
   printf '%s' "${stat%% *}"
 }
