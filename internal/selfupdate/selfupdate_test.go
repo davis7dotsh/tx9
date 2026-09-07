@@ -500,3 +500,91 @@ func TestUpdateStalledDownloadFails(t *testing.T) {
 		t.Errorf("staging file leaked: %v", entries)
 	}
 }
+
+func TestUpdateOversizedAssetFails(t *testing.T) {
+	// An origin that keeps streaming must be cut off at maxAssetBytes even
+	// though it never stalls. Serve with chunked encoding (no
+	// Content-Length) so the cap is enforced on the body, not the header.
+	version, goos, goarch := "1.2.4", "linux", "amd64"
+	assetName := AssetName(goos, goarch)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s\n", version)
+	})
+	mux.HandleFunc("/releases/"+version+"/"+checksumsAssetName, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s  %s\n", strings.Repeat("0", 64), assetName)
+	})
+	mux.HandleFunc("/releases/"+version+"/"+assetName, func(w http.ResponseWriter, r *http.Request) {
+		chunk := make([]byte, 1<<20)
+		flusher, _ := w.(http.Flusher)
+		for i := 0; i < (maxAssetBytes>>20)+8; i++ {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+		}
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	dir := t.TempDir()
+	exePath := filepath.Join(dir, "tx9")
+	if err := os.WriteFile(exePath, []byte("old binary contents"), 0o755); err != nil {
+		t.Fatalf("seed old binary: %v", err)
+	}
+
+	_, err := Update(Options{
+		CurrentVersion:   "1.2.3",
+		Origin:           srv.URL,
+		GOOS:             goos,
+		GOARCH:           goarch,
+		HTTPClient:       srv.Client(),
+		execPathOverride: exePath,
+	})
+	if err == nil || !strings.Contains(err.Error(), "exceeds the") {
+		t.Fatalf("Update: err = %v, want size-limit error", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 1 {
+		t.Errorf("staging file leaked: %v", entries)
+	}
+}
+
+func TestUpdateRejectsOversizedContentLength(t *testing.T) {
+	version, goos, goarch := "1.2.4", "linux", "amd64"
+	assetName := AssetName(goos, goarch)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/releases/latest", func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s\n", version)
+	})
+	mux.HandleFunc("/releases/"+version+"/"+checksumsAssetName, func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprintf(w, "%s  %s\n", strings.Repeat("0", 64), assetName)
+	})
+	mux.HandleFunc("/releases/"+version+"/"+assetName, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Length", fmt.Sprint(maxAssetBytes+1))
+		w.WriteHeader(http.StatusOK)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	exePath := filepath.Join(t.TempDir(), "tx9")
+	if err := os.WriteFile(exePath, []byte("old binary contents"), 0o755); err != nil {
+		t.Fatalf("seed old binary: %v", err)
+	}
+	_, err := Update(Options{
+		CurrentVersion:   "1.2.3",
+		Origin:           srv.URL,
+		GOOS:             goos,
+		GOARCH:           goarch,
+		HTTPClient:       srv.Client(),
+		execPathOverride: exePath,
+	})
+	if err == nil || !strings.Contains(err.Error(), "larger than the") {
+		t.Fatalf("Update: err = %v, want content-length error", err)
+	}
+}

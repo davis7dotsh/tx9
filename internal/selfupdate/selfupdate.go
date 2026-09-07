@@ -33,6 +33,12 @@ const (
 	// requestTimeout bounds the small requests (/releases/latest and
 	// checksums.txt) end to end.
 	requestTimeout = 30 * time.Second
+
+	// maxAssetBytes caps the binary download. Release binaries are ~12MiB,
+	// so this is generous headroom, but it keeps a misbehaving or
+	// compromised origin from filling the disk now that the download is
+	// no longer bounded by wall clock.
+	maxAssetBytes = 256 << 20
 )
 
 // downloadStallTimeout is the longest the binary download may go without
@@ -242,7 +248,8 @@ func fetchBytes(client *http.Client, url string) ([]byte, error) {
 // deadline, and a multi-MiB binary on a slow link legitimately outlives
 // it. Instead the request is cancelled whenever downloadStallTimeout
 // passes without any bytes arriving, so a hung connection still fails
-// promptly while a slow-but-progressing one completes.
+// promptly while a slow-but-progressing one completes. The body is capped
+// at maxAssetBytes regardless of progress.
 func downloadToFile(client *http.Client, url string, dest io.Writer) (string, error) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -276,11 +283,20 @@ func downloadToFile(client *http.Client, url string, dest io.Writer) (string, er
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
+	if resp.ContentLength > maxAssetBytes {
+		return "", fmt.Errorf("GET %s: asset is %d bytes, larger than the %d byte limit", url, resp.ContentLength, maxAssetBytes)
+	}
 
 	h := sha256.New()
 	body := progressReader{r: resp.Body, onRead: func() { stall.Reset(downloadStallTimeout) }}
-	if _, err := io.Copy(io.MultiWriter(dest, h), body); err != nil {
+	// Read one byte past the cap so an over-limit body is distinguishable
+	// from one that is exactly at it.
+	n, err := io.Copy(io.MultiWriter(dest, h), io.LimitReader(body, maxAssetBytes+1))
+	if err != nil {
 		return "", stalled(err)
+	}
+	if n > maxAssetBytes {
+		return "", fmt.Errorf("GET %s: asset exceeds the %d byte limit", url, maxAssetBytes)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
