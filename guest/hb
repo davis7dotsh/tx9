@@ -455,7 +455,11 @@ _stop_gateway() {
 pause() {
   local failed=0
   init || return 1
-  touch "$QUIESCE_FILE" || return 1
+  # The marker may be root-owned from an earlier migration; touch then fails
+  # to update its mtime, which is fine — but never stop anything unless the
+  # durable marker actually exists, or resume could never be reached.
+  touch "$QUIESCE_FILE" 2>/dev/null || true
+  [[ -e "$QUIESCE_FILE" ]] || { echo "could not persist quiesce marker at $QUIESCE_FILE" >&2; return 1; }
   _services_stop || failed=1
   _stop_gateway || failed=1
   _stop_executor || failed=1
