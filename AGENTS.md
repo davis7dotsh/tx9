@@ -34,8 +34,8 @@ daemon.
   change won't have it; use a fresh login shell or `sg docker -c '<cmd>'` to run
   `tx9` against the daemon.
 - Core flow: `tx9 create <name>` (builds the `tx9-box:dev` image via
-  `provision/provision.sh`, first build ~10 min), then `tx9 list`, `tx9 doctor`,
-  `tx9 enter`, `tx9 open <name>` (authenticated dashboard URL), `tx9 delete`.
+  `provision/provision.sh`, first build ~10 min), then `tx9 list`, `tx9 doctor <name>`,
+  `tx9 enter <name>`, `tx9 open <name>` (authenticated dashboard URL), `tx9 delete <name>`.
 
 ### Non-obvious gotchas
 
