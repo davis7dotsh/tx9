@@ -450,7 +450,19 @@ func Destroy(ctx context.Context, cli *docker.Client, name string) error {
 			errs = append(errs, err)
 		}
 	}
+	// Volume removal is name-addressed (the Engine API has no conditional
+	// delete), so re-check ownership right before each request. This shrinks
+	// the window in which a same-named foreign volume could replace ours; it
+	// cannot close it.
 	for _, volume := range targets.volumes {
+		owned, err := inspectOwnedVolume(ctx, cli, volume, name)
+		if err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if owned == "" {
+			continue
+		}
 		if err := cli.VolumeRemove(ctx, volume, true); err != nil && !dockerclient.IsErrNotFound(err) {
 			errs = append(errs, err)
 		}

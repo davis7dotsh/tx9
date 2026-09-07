@@ -424,3 +424,47 @@ func TestDestroyPreservesOwnedObjectsOnInspectFailure(t *testing.T) {
 		t.Fatal("incomplete preflight did not preserve cached token")
 	}
 }
+
+func TestDestroyRechecksVolumeOwnershipBeforeRemoval(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	if err := state.WriteBoxEnv("fixture", map[string]string{"EXECUTOR_MCP_TOKEN": "synthetic-token"}); err != nil {
+		t.Fatal(err)
+	}
+	agentInspects := 0
+	var deletes []string
+	cli := newObjectTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodDelete {
+			deletes = append(deletes, r.URL.Path)
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+		if r.URL.Path == "/containers/json" {
+			_, _ = w.Write([]byte(`[]`))
+			return
+		}
+		labels := docker.BoxLabels("fixture", "previous", "")
+		if r.URL.Path == "/volumes/tx9-fixture-agent-data" {
+			agentInspects++
+			if agentInspects > 1 {
+				// A foreign volume took the name after the preflight inspect.
+				labels = map[string]string{}
+			}
+		}
+		if strings.HasPrefix(r.URL.Path, "/containers/") {
+			http.Error(w, `{"message":"not found"}`, http.StatusNotFound)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"Id": "network-id", "Labels": labels, "Config": map[string]any{"Labels": labels}})
+	})
+	if err := Destroy(context.Background(), cli, "fixture"); err == nil {
+		t.Fatal("destroy did not report the replaced volume")
+	}
+	for _, path := range deletes {
+		if path == "/volumes/tx9-fixture-agent-data" {
+			t.Fatal("destroy removed a volume that failed its final ownership check")
+		}
+	}
+	if env, err := state.ReadBoxEnv("fixture"); err != nil || env["EXECUTOR_MCP_TOKEN"] != "synthetic-token" {
+		t.Fatal("failed destroy did not preserve token state")
+	}
+}
