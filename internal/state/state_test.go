@@ -3,8 +3,31 @@ package state
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
+
+func TestStatePathsRejectUnsafeNamesBeforeFilesystemAccess(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	for _, name := range []string{"", ".", "..", "../../outside", "/absolute", "a/b", "a\\b", "bad\nname", strings.Repeat("x", 33)} {
+		t.Run(name, func(t *testing.T) {
+			for _, path := range []func(string) (string, error){BoxEnvPath, LockPath} {
+				if _, err := path(name); err == nil {
+					t.Fatal("unsafe name accepted as a state path")
+				}
+			}
+			if _, err := ReadBoxEnv(name); err == nil {
+				t.Fatal("unsafe name accepted for state read")
+			}
+			if err := WriteBoxEnv(name, map[string]string{"A": "one"}); err == nil {
+				t.Fatal("unsafe name accepted for state write")
+			}
+			if err := RemoveBoxEnv(name); err == nil {
+				t.Fatal("unsafe name accepted for state removal")
+			}
+		})
+	}
+}
 
 func TestWriteBoxEnvIsPrivateAndLeavesNoTemporaryFile(t *testing.T) {
 	t.Setenv("HOME", t.TempDir())

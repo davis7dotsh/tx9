@@ -542,7 +542,7 @@ acknowledge_active_paths() {
 cutover_ready() {
   [[ -e "$GATEWAY_DISABLED" ]] || { echo "gateway must be disabled before cutover" >&2; return 1; }
   ! _gateway_running || { echo "gateway is still running" >&2; return 1; }
-  hermes-state cutover-check
+  hermes-state cutover-check || return 1
   echo "cutover-ready: import report, DB and inventory baselines, Discord config, active paths, disabled marker, and single-writer process gates passed"
 }
 

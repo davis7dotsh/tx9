@@ -29,6 +29,10 @@ import (
 // to generate a million-entry archive.
 var maxArchiveMembers = 1_000_000
 
+// Match the Linux filesystem's symlink traversal bound instead of allowing
+// link-resolution work to grow with the total number of archive members.
+const maxArchiveLinkHops = 40
+
 func ValidateDataTar(r io.Reader) error {
 	gz, err := gzip.NewReader(r)
 	if err != nil {
@@ -326,6 +330,7 @@ func (idx *memberIndex) resolve(key string) (*tarMember, error) {
 	var resolved []string
 	seenStates := map[string]bool{}
 	steps := 0
+	linkHops := 0
 	maxSteps := len(idx.order)*8 + 32
 
 	for len(pending) > 0 {
@@ -362,6 +367,10 @@ func (idx *memberIndex) resolve(key string) (*tarMember, error) {
 
 		entry, ok := idx.byName[candidate]
 		if ok && (entry.IsSymlink || entry.IsHardlink) {
+			linkHops++
+			if linkHops > maxArchiveLinkHops {
+				return nil, errors.New("archive link chain exceeds safety bound")
+			}
 			var base []string
 			if entry.IsSymlink {
 				base = append([]string{}, resolved...)

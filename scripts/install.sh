@@ -64,8 +64,12 @@ os=$(detect_os)
 arch=$(detect_arch)
 asset="tx9_${os}_${arch}"
 
-tmpdir=$(mktemp -d)
-trap 'rm -rf "$tmpdir"' EXIT INT TERM HUP
+# Keep staging on the destination filesystem so the final rename is atomic.
+mkdir -p "$INSTALL_DIR"
+[ ! -d "$INSTALL_DIR/tx9" ] || die "${INSTALL_DIR}/tx9 is a directory"
+tmpdir=$(mktemp -d "$INSTALL_DIR/.tx9-install.XXXXXXXXXX")
+trap 'rm -rf "$tmpdir"' EXIT
+trap 'exit 1' INT TERM HUP
 
 log "resolving latest version..."
 version=$(curl -fsSL "${ORIGIN}/releases/latest") \
@@ -108,7 +112,6 @@ fi
 
 [ "$actual" = "$expected" ] || die "checksum mismatch for ${asset}: got ${actual}, want ${expected} (not installing)"
 
-mkdir -p "$INSTALL_DIR"
 chmod 0755 "$tmpdir/$asset"
 mv "$tmpdir/$asset" "$INSTALL_DIR/tx9"
 

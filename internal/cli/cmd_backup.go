@@ -153,12 +153,16 @@ func cmdBackup(args []string) error {
 		}
 
 		fmt.Println("tx9: capturing /data from the agent container")
-		rawFile, err := os.CreateTemp("", "tx9-backup-*.tar.gz")
+		tmpDir, err := os.MkdirTemp("", "tx9-backup-*")
 		if err != nil {
 			return fmt.Errorf("backup %s: %w", name, err)
 		}
-		rawPath := rawFile.Name()
-		defer os.Remove(rawPath)
+		defer os.RemoveAll(tmpDir)
+		rawPath := filepath.Join(tmpDir, "data.tar.gz")
+		rawFile, err := os.OpenFile(rawPath, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return fmt.Errorf("backup %s: %w", name, err)
+		}
 
 		var stderrBuf bytes.Buffer
 		exitCode, err := cli.ExecStream(ctx, b.AgentID, []string{"bash", "-c", buildTarScript()}, nil, "", rawFile, &stderrBuf)

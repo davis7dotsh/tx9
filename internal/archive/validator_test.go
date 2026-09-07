@@ -100,6 +100,26 @@ func TestValidateDataTar_AcceptsMinimalArchive(t *testing.T) {
 	}
 }
 
+func TestValidateDataTarBoundsLinkResolutionIndependentlyOfMemberCount(t *testing.T) {
+	for _, length := range []int{maxArchiveLinkHops, maxArchiveLinkHops + 1} {
+		entries := append(validBase(), file("target", "payload"))
+		for i := length - 1; i >= 0; i-- {
+			target := "target"
+			if i+1 < length {
+				target = fmt.Sprintf("link%d", i+1)
+			}
+			entries = append(entries, symlink(fmt.Sprintf("link%d", i), target))
+		}
+		err := runValidate(t, entries)
+		if length <= maxArchiveLinkHops && err != nil {
+			t.Fatalf("supported chain length %d: %v", length, err)
+		}
+		if length > maxArchiveLinkHops && (err == nil || !strings.Contains(err.Error(), "safety bound")) {
+			t.Fatalf("overlong chain length %d was not rejected by the safety bound: %v", length, err)
+		}
+	}
+}
+
 // TestValidateDataTar_Rejects is the comprehensive table covering every
 // rule enumerated in dossier §6.3 (the Python `_validate_archive` this
 // validator ports), plus the extra corrupt-stream case.

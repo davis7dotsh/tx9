@@ -14,6 +14,67 @@ func requireGPG(t *testing.T) {
 	if _, err := exec.LookPath("gpg"); err != nil {
 		t.Skip("gpg not installed, skipping encryption test")
 	}
+	t.Setenv("GNUPGHOME", t.TempDir())
+	t.Cleanup(func() { _ = exec.Command("gpgconf", "--kill", "gpg-agent").Run() })
+}
+
+func TestGPGOutputDoesNotFollowSymlinksOrOverwriteFiles(t *testing.T) {
+	for _, encrypt := range []bool{false, true} {
+		for _, symlink := range []bool{false, true} {
+			dir := t.TempDir()
+			src := filepath.Join(dir, "source")
+			target := filepath.Join(dir, "existing")
+			if err := os.WriteFile(src, []byte("fixture input"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(target, []byte("preserve me"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			dst := target
+			if symlink {
+				dst = filepath.Join(dir, "link")
+				if err := os.Symlink(target, dst); err != nil {
+					t.Fatal(err)
+				}
+			}
+			operation := Decrypt
+			if encrypt {
+				operation = Encrypt
+			}
+			if err := operation(src, dst, "synthetic passphrase"); err == nil {
+				t.Fatal("existing output was accepted")
+			}
+			contents, err := os.ReadFile(target)
+			if err != nil || string(contents) != "preserve me" {
+				t.Fatal("existing file was overwritten")
+			}
+		}
+	}
+}
+
+func TestRunGPGPassphraseUsesOnlyPrivateDescriptor(t *testing.T) {
+	dir := t.TempDir()
+	script := "#!/bin/sh\n[ -z \"${TX9_PASSWORD+x}\" ] || exit 61\nIFS= read -r passphrase <&3\n[ \"$passphrase\" = 'synthetic passphrase' ] || exit 62\nprintf fixture\n"
+	if err := os.WriteFile(filepath.Join(dir, "gpg"), []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", dir)
+	t.Setenv("TX9_PASSWORD", "synthetic passphrase")
+	var output bytes.Buffer
+	if err := runGPG("synthetic passphrase", nil, nil, &output); err != nil {
+		t.Fatal(err)
+	}
+	if output.String() != "fixture" {
+		t.Fatal("GPG fixture did not receive the passphrase on fd 3")
+	}
+}
+
+func TestRunGPGRejectsPassphrasesItWouldTruncate(t *testing.T) {
+	for _, passphrase := range []string{"first\nsecond", "first\rsecond", "first\x00second"} {
+		if err := runGPG(passphrase, nil, nil, nil); err == nil || !strings.Contains(err.Error(), "passphrase must not contain") {
+			t.Fatal("passphrase accepted despite a descriptor delimiter")
+		}
+	}
 }
 
 func TestEncryptDecryptRoundTrip(t *testing.T) {

@@ -27,7 +27,7 @@ import (
 // executable.
 func cmdUpgrade(args []string) error {
 	fs := flag.NewFlagSet("upgrade", flag.ContinueOnError)
-	force := fs.Bool("force", false, "self-update: skip the dev-build guard and reinstall even if already current")
+	force := fs.Bool("force", false, "self-update: replace dev, custom, or newer builds and reinstall even if already current")
 	executorFlags := addExecutorConfigFlags(fs)
 	resourceFlags := addResourceConfigFlags(fs)
 	if err := parseFlagsAnywhere(fs, args); err != nil {
@@ -79,6 +79,10 @@ func cmdUpgrade(args []string) error {
 		if err := box.PreflightAgentMounts(agentMounts); err != nil {
 			return fmt.Errorf("upgrade %s: agent mount preflight: %w", name, err)
 		}
+		containerIDs, err := box.PreflightExistingObjects(ctx, cli, name)
+		if err != nil {
+			return fmt.Errorf("upgrade %s: %w", name, err)
+		}
 
 		tok, err := box.Token(name)
 		if err != nil {
@@ -92,7 +96,7 @@ func cmdUpgrade(args []string) error {
 		}
 
 		fmt.Printf("tx9: stopping and removing %s's containers (network/volumes/token kept)\n", name)
-		if err := removeBoxContainers(ctx, cli, b); err != nil {
+		if err := removeBoxContainers(ctx, cli, containerIDs); err != nil {
 			return fmt.Errorf("upgrade %s: %w", name, err)
 		}
 
@@ -156,22 +160,15 @@ func cmdUpgradeSelf(force bool) error {
 	return nil
 }
 
-// removeBoxContainers stops (best-effort) then force-removes a box's
-// agent/executor containers, leaving its network, volumes, and token file
-// alone — the part of box.Destroy this needs, without the rest of the
-// teardown.
-func removeBoxContainers(ctx context.Context, cli *docker.Client, b *box.Box) error {
+// removeBoxContainers stops (best-effort) then force-removes the complete
+// container ID set returned by ownership preflight, leaving the network,
+// volumes, and token file alone.
+func removeBoxContainers(ctx context.Context, cli *docker.Client, containerIDs []string) error {
 	var errs []error
-	if b.AgentID != "" {
-		_ = cli.ContainerStop(ctx, b.AgentID, nil)
-		if err := cli.ContainerRemove(ctx, b.AgentID, true); err != nil {
-			errs = append(errs, fmt.Errorf("remove agent: %w", err))
-		}
-	}
-	if b.ExecutorID != "" {
-		_ = cli.ContainerStop(ctx, b.ExecutorID, nil)
-		if err := cli.ContainerRemove(ctx, b.ExecutorID, true); err != nil {
-			errs = append(errs, fmt.Errorf("remove executor: %w", err))
+	for _, id := range containerIDs {
+		_ = cli.ContainerStop(ctx, id, nil)
+		if err := cli.ContainerRemove(ctx, id, true); err != nil {
+			errs = append(errs, fmt.Errorf("remove container %s: %w", id, err))
 		}
 	}
 	return errors.Join(errs...)

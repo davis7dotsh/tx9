@@ -21,7 +21,6 @@ import (
 	"github.com/docker/docker/api/types/volume"
 	"github.com/docker/docker/client"
 	"github.com/docker/docker/pkg/jsonmessage"
-	"github.com/docker/docker/pkg/stdcopy"
 	"github.com/docker/go-connections/nat"
 
 	"github.com/davis7dotsh/tx9/internal/assets"
@@ -381,36 +380,15 @@ type ExecResult struct {
 // Interactive/TTY exec (e.g. `tx9 enter`) needs raw terminal handling this
 // helper doesn't provide and should use Raw() directly.
 func (c *Client) Exec(ctx context.Context, containerID string, cmd []string, env []string, user string) (ExecResult, error) {
-	created, err := c.cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
-		Cmd:          cmd,
-		Env:          env,
-		User:         user,
-		AttachStdout: true,
-		AttachStderr: true,
-	})
-	if err != nil {
-		return ExecResult{}, fmt.Errorf("docker: exec create: %w", err)
-	}
-
-	attach, err := c.cli.ContainerExecAttach(ctx, created.ID, container.ExecAttachOptions{})
-	if err != nil {
-		return ExecResult{}, fmt.Errorf("docker: exec attach: %w", err)
-	}
-	defer attach.Close()
-
 	var stdout, stderr bytes.Buffer
-	if _, err := stdcopy.StdCopy(&stdout, &stderr, attach.Reader); err != nil {
-		return ExecResult{}, fmt.Errorf("docker: exec read output: %w", err)
-	}
-
-	inspect, err := c.cli.ContainerExecInspect(ctx, created.ID)
+	exitCode, err := c.ExecStream(ctx, containerID, cmd, env, user, &stdout, &stderr)
 	if err != nil {
-		return ExecResult{}, fmt.Errorf("docker: exec inspect: %w", err)
+		return ExecResult{}, err
 	}
 
 	return ExecResult{
 		Stdout:   stdout.String(),
 		Stderr:   stderr.String(),
-		ExitCode: inspect.ExitCode,
+		ExitCode: exitCode,
 	}, nil
 }

@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -47,7 +48,9 @@ func cmdCreate(args []string) error {
 		for _, b := range existing {
 			taken[b.Name] = true
 		}
-		name, err = names.Generate(taken)
+		name, err = generateFreshBoxName(taken, func(candidate string) error {
+			return box.PreflightFreshObjects(ctx, cli, candidate)
+		})
 		if err != nil {
 			return fmt.Errorf("create: %w", err)
 		}
@@ -80,6 +83,9 @@ func cmdCreate(args []string) error {
 	if exists {
 		return fmt.Errorf("create %s: box already exists", name)
 	}
+	if err := box.PreflightFreshObjects(ctx, cli, name); err != nil {
+		return fmt.Errorf("create %s: %w", name, err)
+	}
 
 	imageTag := fmt.Sprintf("tx9-box:%s", version.Version)
 	if err := ensureBoxImage(ctx, cli, imageTag); err != nil {
@@ -107,14 +113,12 @@ func cmdCreate(args []string) error {
 		Name: name, Image: imageTag, Token: tok, Executor: executorConfig, Resources: resources,
 	})
 	if err != nil {
-		box.Destroy(ctx, cli, name)
-		return fmt.Errorf("create %s: %w", name, err)
+		return errors.Join(fmt.Errorf("create %s: %w", name, err), box.Destroy(ctx, cli, name))
 	}
 
 	fmt.Println("tx9: preparing runtime (executor reachability, MCP wiring, doctor)")
 	if err := box.PrepareRuntime(ctx, cli, b, tok, os.Stdout); err != nil {
-		box.Destroy(ctx, cli, name)
-		return fmt.Errorf("create %s: runtime failed, box removed: %w", name, err)
+		return errors.Join(fmt.Errorf("create %s: runtime failed: %w", name, err), box.Destroy(ctx, cli, name))
 	}
 
 	port, err := box.HostPort(ctx, cli, b)
@@ -127,6 +131,22 @@ func cmdCreate(args []string) error {
 	fmt.Println("  2. inside the box, authenticate claude/codex and run: hermes gateway setup")
 	fmt.Println("  3. leave the foreground setup process, then enable TX9's durable gateway from the host:")
 	fmt.Printf("       tx9 gateway enable %s --confirm-single-writer\n", name)
-	fmt.Printf("  4. dashboard: %s (run `tx9 open %s` for an authenticated one-shot URL)\n", box.DashboardURL(port, b.ExecutorWebBaseURL), name)
+	fmt.Printf("  4. dashboard: %s (run `tx9 open %s` for a URL containing the persistent bearer token)\n", box.DashboardURL(port, b.ExecutorWebBaseURL), name)
 	return nil
+}
+
+func generateFreshBoxName(taken map[string]bool, preflight func(string) error) (string, error) {
+	for range 100 {
+		name, err := names.Generate(taken)
+		if err != nil {
+			return "", err
+		}
+		if err := preflight(name); err == nil {
+			return name, nil
+		} else if !errors.Is(err, box.ErrObjectsExist) {
+			return "", err
+		}
+		taken[name] = true
+	}
+	return "", fmt.Errorf("could not find an unused box name after 100 choices; pass an explicit name")
 }

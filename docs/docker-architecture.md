@@ -7,6 +7,11 @@ recover it from git history (`6f1ced3` and earlier) when porting logic. The
 runtime topology, contracts, and verification results below remain the
 authoritative description of what the Go CLI must create.
 
+Security correction, 2026-08-27: the agent receives Executor's administrator
+token. The filesystem split does not keep Executor credentials confidential
+from an agent with that token. The [security model](security-model.md)
+describes the current boundary and supersedes earlier isolation claims here.
+
 ## Why move off smolvm
 
 smolvm gives real VM isolation, but in practice it has been the least
@@ -92,9 +97,10 @@ backend, so tx9 reports real usage plus `unlimited`, with optional advisory
 budgets for planning and warnings.
 
 What the agent container can do to Executor: exactly what any LAN client can
-do — talk HTTP to the token-gated endpoint. Nothing else. Cross-box: each
-compose project gets its own network, so `alpha`'s agent cannot even resolve
-`beta`'s executor (verified: DNS fails).
+do with the same administrator token, including management operations that
+can start Executor-side processes. A separate network prevents direct
+cross-box service-name resolution, but an agent can still reach another
+box's published port through a host address.
 
 ### What stays exactly the same
 
@@ -133,14 +139,12 @@ split answers it structurally rather than with hardening flags:
 - The agent container is deliberately permissive — that's linux land, the
   Hermes agent runs around freely, sudo included. What it can reach is the
   network, its own volume, and one token-gated HTTP endpoint.
-- Executor's credentials and execution surface live in a container the agent
-  cannot exec into, whose filesystem it cannot see, whose processes it cannot
-  signal. Compromising the agent gets you the same position as any
-  unauthenticated LAN client: an HTTP endpoint that 401s without the token.
-  (The agent does hold a valid token — that's its job — so "agent can call
-  Executor tools" is by design; "agent can tamper with Executor itself"
-  is what the split removes.)
-- Per-project networks mean boxes can't see each other at all.
+- Executor's volume and process namespace are not directly shared with the
+  agent. However, the agent's bearer token authenticates management APIs as
+  well as tool execution. An authenticated stdio server configuration can
+  start a process inside Executor, bypassing the intended credential boundary.
+- Per-project networks separate container DNS names and direct bridge access.
+  They do not block access through host-published ports or provide egress policy.
 
 gVisor (`--runtime=runsc`) remains the one-flag escape hatch if VM-grade
 isolation is ever wanted back — the design doesn't change.

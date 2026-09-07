@@ -3,12 +3,75 @@ package archive
 import (
 	"archive/tar"
 	"bytes"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
+
+func TestReadMetadataRejectsUnboundedOrInvalidHeader(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		body     string
+		typeflag byte
+	}{
+		{name: "oversized metadata", body: `{"box_name":"` + strings.Repeat("x", maxMetadataBytes) + `","format_version":1}`, typeflag: tar.TypeReg},
+		{name: "negative version", body: `{"format_version":-1}`, typeflag: tar.TypeReg},
+		{name: "trailing JSON", body: `{"format_version":1}{"format_version":2}`, typeflag: tar.TypeReg},
+		{name: "nonregular metadata", typeflag: tar.TypeDir},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "fixture.tx9")
+			var contents bytes.Buffer
+			tw := tar.NewWriter(&contents)
+			if err := tw.WriteHeader(&tar.Header{Name: metadataMember, Typeflag: tc.typeflag, Size: int64(len(tc.body)), Mode: 0600}); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := tw.Write([]byte(tc.body)); err != nil {
+				t.Fatal(err)
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, contents.Bytes(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ReadMetadata(path); err == nil {
+				t.Fatal("invalid metadata accepted")
+			}
+		})
+	}
+}
+
+func TestExtractDataRejectsExtraOrNonregularMembers(t *testing.T) {
+	for _, extra := range []bool{false, true} {
+		t.Run(fmt.Sprint(extra), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "fixture.tx9")
+			var contents bytes.Buffer
+			tw := tar.NewWriter(&contents)
+			writeTestTarMember(t, tw, metadataMember, []byte(`{"box_name":"fixture","format_version":1}`))
+			if extra {
+				writeTestTarMember(t, tw, dataMemberPlain, []byte("payload"))
+				writeTestTarMember(t, tw, "unexpected", nil)
+			} else if err := tw.WriteHeader(&tar.Header{Name: dataMemberPlain, Typeflag: tar.TypeSymlink, Linkname: "elsewhere"}); err != nil {
+				t.Fatal(err)
+			}
+			if err := tw.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(path, contents.Bytes(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := ExtractData(path, filepath.Join(dir, "payload")); err == nil {
+				t.Fatal("invalid outer archive accepted")
+			}
+		})
+	}
+}
 
 func tarWriterForTest(t *testing.T, w io.Writer) *tar.Writer {
 	t.Helper()

@@ -38,6 +38,7 @@ const (
 	metadataMember    = "metadata.json"
 	dataMemberPlain   = "data.tar.gz"
 	dataMemberEncrypt = "data.tar.gz.gpg"
+	maxMetadataBytes  = 64 << 10
 )
 
 // Metadata is the JSON header every .tx9 archive carries as its first tar
@@ -132,13 +133,20 @@ func readMetadataMember(f *os.File) (Metadata, *tar.Reader, error) {
 	if hdr.Name != metadataMember {
 		return Metadata{}, nil, fmt.Errorf("does not look like a .tx9 file (expected first member %q, got %q)", metadataMember, hdr.Name)
 	}
+	if hdr.Typeflag != tar.TypeReg || hdr.Size > maxMetadataBytes {
+		return Metadata{}, nil, fmt.Errorf("metadata.json must be a regular file no larger than %d bytes", maxMetadataBytes)
+	}
+	metadataJSON, err := io.ReadAll(tr)
+	if err != nil {
+		return Metadata{}, nil, fmt.Errorf("read metadata.json: %w", err)
+	}
 
 	var meta Metadata
-	if err := json.NewDecoder(tr).Decode(&meta); err != nil {
+	if err := json.Unmarshal(metadataJSON, &meta); err != nil {
 		return Metadata{}, nil, fmt.Errorf("invalid metadata.json: %w", err)
 	}
-	if meta.FormatVersion == 0 {
-		return Metadata{}, nil, fmt.Errorf("invalid metadata.json: missing format_version")
+	if meta.FormatVersion < 1 {
+		return Metadata{}, nil, fmt.Errorf("invalid metadata.json: format_version must be positive")
 	}
 	if meta.FormatVersion > FormatVersion {
 		return Metadata{}, nil, fmt.Errorf("archive format version %d is newer than this tx9 (supports up to %d) — upgrade tx9 first", meta.FormatVersion, FormatVersion)
@@ -188,6 +196,9 @@ func ExtractData(path, destFile string) (Metadata, error) {
 	if hdr.Name != wantName {
 		return Metadata{}, fmt.Errorf("archive: %s: expected data member %q, got %q", path, wantName, hdr.Name)
 	}
+	if hdr.Typeflag != tar.TypeReg {
+		return Metadata{}, fmt.Errorf("archive: %s: data member must be a regular file", path)
+	}
 
 	out, err := os.OpenFile(destFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
 	if err != nil {
@@ -196,6 +207,15 @@ func ExtractData(path, destFile string) (Metadata, error) {
 	defer out.Close()
 	if _, err := io.Copy(out, tr); err != nil {
 		return Metadata{}, fmt.Errorf("archive: extract data from %s: %w", path, err)
+	}
+	if _, err := tr.Next(); err != io.EOF {
+		if err == nil {
+			return Metadata{}, fmt.Errorf("archive: %s: unexpected member after data payload", path)
+		}
+		return Metadata{}, fmt.Errorf("archive: %s: invalid archive trailer: %w", path, err)
+	}
+	if err := out.Close(); err != nil {
+		return Metadata{}, fmt.Errorf("archive: close extracted data: %w", err)
 	}
 	return meta, nil
 }

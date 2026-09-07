@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 
 	"github.com/davis7dotsh/tx9/internal/box"
@@ -64,8 +65,27 @@ func cmdEnter(args []string) error {
 		return fmt.Errorf("enter %s: docker binary not found on PATH: %w", name, err)
 	}
 
+	argv, env := enterExecCommand(dockerBin, containerID, tok, *intoExecutor, os.Environ())
+	// Replace this process so Docker owns terminal signals and resizing.
+	if err := syscall.Exec(dockerBin, argv, env); err != nil {
+		return fmt.Errorf("enter %s: exec docker: %w", name, err)
+	}
+	return nil
+}
+
+// Pass bearer tokens through Docker's environment lookup, never its arguments.
+// An interactive docker exec can stay visible in host process listings for
+// hours. Remove inherited token values before supplying this box's token.
+func enterExecCommand(dockerBin, containerID, token string, intoExecutor bool, inheritedEnv []string) ([]string, []string) {
+	env := make([]string, 0, len(inheritedEnv)+1)
+	for _, entry := range inheritedEnv {
+		key, _, _ := strings.Cut(entry, "=")
+		if key != "BOXD_EXECUTOR_TOKEN" && key != "EXECUTOR_MCP_TOKEN" {
+			env = append(env, entry)
+		}
+	}
 	var argv []string
-	if *intoExecutor {
+	if intoExecutor {
 		// The executor container runs only the daemon — no tmux session, no
 		// login-profile automation. A plain interactive shell with the box
 		// profile sourced (PATH to vp/executor, /data env) is what you want
@@ -77,11 +97,12 @@ func cmdEnter(args []string) error {
 			"-e", "USER=agent",
 			"-e", "LOGNAME=agent",
 			"-e", "SHELL=/bin/bash",
-			"-e", "EXECUTOR_MCP_TOKEN=" + tok,
+			"-e", "EXECUTOR_MCP_TOKEN",
 			"-w", "/data/home/agent",
 			containerID, "bash", "--norc", "-c",
 			". /etc/profile.d/hermes-box.sh; exec bash --norc -i",
 		}
+		env = append(env, "EXECUTOR_MCP_TOKEN="+token)
 	} else {
 		argv = []string{
 			dockerBin, "exec", "-it", "-u", "agent",
@@ -90,17 +111,11 @@ func cmdEnter(args []string) error {
 			"-e", "LOGNAME=agent",
 			"-e", "SHELL=/bin/bash",
 			"-e", "EXECUTOR_HOST=executor",
-			"-e", "BOXD_EXECUTOR_TOKEN=" + tok,
+			"-e", "BOXD_EXECUTOR_TOKEN",
 			"-w", "/data/home/agent",
 			containerID, "bash", "-l",
 		}
+		env = append(env, "BOXD_EXECUTOR_TOKEN="+token)
 	}
-
-	// syscall.Exec replaces this process outright so the TTY (job control,
-	// signals, resize) is docker's problem from here on, exactly as boxd's
-	// own `exec docker exec ...` did.
-	if err := syscall.Exec(dockerBin, argv, os.Environ()); err != nil {
-		return fmt.Errorf("enter %s: exec docker: %w", name, err)
-	}
-	return nil
+	return argv, env
 }
