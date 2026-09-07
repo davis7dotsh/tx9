@@ -27,7 +27,7 @@ latest.txt                    "0.1.0\n" — flipped last during publish
 
 `.depot/workflows/release.yml` writes this on every `vX.Y.Z` tag push, after
 attaching the same files to the GitHub release. The installer and
-`tx9 upgrade` consume the public R2 routes, not the private GitHub release.
+`tx9 upgrade` consume the public R2 routes. GitHub retains the release archive.
 
 ## One-time setup
 

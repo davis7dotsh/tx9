@@ -136,5 +136,7 @@ go run github.com/rhysd/actionlint/cmd/actionlint@v1.7.12 \
   .depot/workflows/check.yml .depot/workflows/release.yml
 ```
 
-Hosted CI, image builds, cross-compilation, and Worker deployment were not run
-during this audit.
+Hosted Go/guest and site checks subsequently passed for the complete stack
+at `d7e4f529daab7df1e701db38bfc3c6bf7a0fe247` in
+[Depot](https://depot.dev/orgs/kfmrjsn0w2/workflows/fkvv5hcb1x).
+Image builds, cross-compilation, and Worker deployment were not run.

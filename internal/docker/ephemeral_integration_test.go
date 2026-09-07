@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-// Opt in with an already-installed image that provides /bin/sh and cat.
+// Opt in with an already-installed image that provides /bin/sh, cat, ls, and sleep.
 // These tests create only disposable containers and never mount host data.
 func TestEphemeralDockerIntegration(t *testing.T) {
 	image := os.Getenv("TX9_TEST_DOCKER_IMAGE")

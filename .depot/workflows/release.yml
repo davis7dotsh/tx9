@@ -4,9 +4,7 @@ name: release
 # push a `vX.Y.Z` tag, get cross-compiled binaries + checksums.txt published
 # to two places from one build:
 #
-#   1. A GitHub release — a browsable archive with generated release notes
-#      (not consumed programmatically: the repo is private, so the GitHub
-#      API 404s for anonymous clients).
+#   1. A GitHub release with generated release notes, retained as an archive.
 #   2. The tx9-releases R2 bucket behind https://tx9.col-agents.com (site/) —
 #      what both scripts/install.sh and `tx9 upgrade` (internal/selfupdate)
 #      consume: <version>/<asset> objects, plus a latest.txt version
@@ -95,9 +93,14 @@ jobs:
       - name: make check
         run: make check
 
+      # npm audit is advisory here: a new advisory against dev-only tooling
+      # (wrangler's transitive graph) must not block publishing a tag whose
+      # CLI and Worker code are unchanged. check.yml still fails PRs on it.
       - name: Check release site
         working-directory: site
-        run: npm run check && npm run format:check && npm run lint && npm test && npm audit --audit-level=high
+        run: |
+          npm run check && npm run format:check && npm run lint && npm test
+          npm audit --audit-level=high || echo "::warning::npm audit reported high-severity advisories in site tooling; review before the next release"
 
       - name: Derive VERSION from tag
         id: version
