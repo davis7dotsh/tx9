@@ -14,6 +14,7 @@
 package selfupdate
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -28,7 +29,24 @@ import (
 const (
 	checksumsAssetName = "checksums.txt"
 	userAgent          = "tx9-selfupdate"
+
+	// requestTimeout bounds the small requests (/releases/latest and
+	// checksums.txt) end to end.
+	requestTimeout = 30 * time.Second
+
+	// maxAssetBytes caps the binary download. Release binaries are ~12MiB,
+	// so this is generous headroom, but it keeps a misbehaving or
+	// compromised origin from filling the disk now that the download is
+	// no longer bounded by wall clock.
+	maxAssetBytes = 256 << 20
 )
+
+// downloadStallTimeout is the longest the binary download may go without
+// receiving any bytes before it is abandoned. The binary is ~12MiB, so an
+// end-to-end deadline like requestTimeout aborts a healthy download on a
+// slow link; only a lack of progress counts as failure. A var so tests
+// can shorten it.
+var downloadStallTimeout = 30 * time.Second
 
 // Options configures Update.
 type Options struct {
@@ -46,7 +64,9 @@ type Options struct {
 	GOOS, GOARCH string
 	// HTTPClient overrides the default client used for both the version
 	// check and the asset downloads. Tests only; zero value means
-	// "use a client with a sane timeout".
+	// "use a client with a sane timeout". Its Timeout applies to the
+	// small requests only; the binary download is bounded by
+	// downloadStallTimeout instead (see downloadToFile).
 	HTTPClient *http.Client
 	// Out receives human-readable progress lines. Defaults to io.Discard.
 	Out io.Writer
@@ -95,7 +115,7 @@ func Update(opts Options) (*Result, error) {
 
 	client := opts.HTTPClient
 	if client == nil {
-		client = &http.Client{Timeout: 30 * time.Second}
+		client = &http.Client{Timeout: requestTimeout}
 	}
 
 	origin := ResolveOrigin(opts.Origin)
@@ -223,26 +243,75 @@ func fetchBytes(client *http.Client, url string) ([]byte, error) {
 
 // downloadToFile streams url's body into an already-open destination while
 // hashing it. The caller owns the file and its permissions and lifetime.
+//
+// The download deliberately ignores client.Timeout: that is an end-to-end
+// deadline, and a multi-MiB binary on a slow link legitimately outlives
+// it. Instead the request is cancelled whenever downloadStallTimeout
+// passes without any bytes arriving, so a hung connection still fails
+// promptly while a slow-but-progressing one completes. The body is capped
+// at maxAssetBytes regardless of progress.
 func downloadToFile(client *http.Client, url string, dest io.Writer) (string, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", err
 	}
 	req.Header.Set("User-Agent", userAgent)
 
-	resp, err := client.Do(req)
+	// Shallow copy so the caller's client keeps its Timeout for the small
+	// requests; only this request runs without the end-to-end deadline.
+	untimed := *client
+	untimed.Timeout = 0
+
+	stall := time.AfterFunc(downloadStallTimeout, cancel)
+	defer stall.Stop()
+	stalled := func(err error) error {
+		if ctx.Err() != nil {
+			return fmt.Errorf("no data received for %s: %w", downloadStallTimeout, err)
+		}
+		return err
+	}
+
+	resp, err := untimed.Do(req)
 	if err != nil {
-		return "", err
+		return "", stalled(err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
 		return "", fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
+	if resp.ContentLength > maxAssetBytes {
+		return "", fmt.Errorf("GET %s: asset is %d bytes, larger than the %d byte limit", url, resp.ContentLength, maxAssetBytes)
+	}
 
 	h := sha256.New()
-	if _, err := io.Copy(io.MultiWriter(dest, h), resp.Body); err != nil {
-		return "", err
+	body := progressReader{r: resp.Body, onRead: func() { stall.Reset(downloadStallTimeout) }}
+	// Read one byte past the cap so an over-limit body is distinguishable
+	// from one that is exactly at it.
+	n, err := io.Copy(io.MultiWriter(dest, h), io.LimitReader(body, maxAssetBytes+1))
+	if err != nil {
+		return "", stalled(err)
+	}
+	if n > maxAssetBytes {
+		return "", fmt.Errorf("GET %s: asset exceeds the %d byte limit", url, maxAssetBytes)
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+// progressReader calls onRead after every Read that returned bytes, so a
+// stall timer is pushed back on progress rather than on wall clock.
+type progressReader struct {
+	r      io.Reader
+	onRead func()
+}
+
+func (p progressReader) Read(b []byte) (int, error) {
+	n, err := p.r.Read(b)
+	if n > 0 {
+		p.onRead()
+	}
+	return n, err
 }
