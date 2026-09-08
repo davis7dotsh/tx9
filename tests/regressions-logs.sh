@@ -595,16 +595,20 @@ wait "$pdeath_capture_pid" 2>/dev/null
 pdeath_capture_status=$?
 set -e
 [[ "$pdeath_capture_status" == 137 ]]
-for _ in {1..150}; do
-  if ! kill -0 "$pdeath_child_pid" 2>/dev/null ||
-    [[ "$(ps -o stat= -p "$pdeath_child_pid" 2>/dev/null)" == Z* ]]; then
-    break
-  fi
+# The kernel queues the parent-death SIGKILL in the wrapper's exit path, so
+# by the time wait returned it is already pending on the child. Only the
+# child's next scheduling slot is outstanding, but a saturated CI runner can
+# defer that for seconds, so allow ten before calling it survived and dump
+# what the child looks like if it does.
+pdeath_child_state=""
+for _ in {1..500}; do
+  pdeath_child_state="$(proc_state "$pdeath_child_pid")"
+  [[ -z "$pdeath_child_state" || "$pdeath_child_state" == Z ]] && break
   sleep 0.02
 done
-if kill -0 "$pdeath_child_pid" 2>/dev/null &&
-  [[ "$(ps -o stat= -p "$pdeath_child_pid" 2>/dev/null)" != Z* ]]; then
+if [[ -n "$pdeath_child_state" && "$pdeath_child_state" != Z ]]; then
   echo "captured foreground child survived SIGKILL of its wrapper" >&2
+  grep -E '^(Name|State|PPid|SigPnd|ShdPnd|SigBlk):' "/proc/$pdeath_child_pid/status" >&2 || true
   exit 1
 fi
 
