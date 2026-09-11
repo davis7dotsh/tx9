@@ -326,6 +326,7 @@ for before in (
     'browser: {backend: browser_use, engine: lightpanda}\n',
     '{browser: {backend: browserbase}}\n',
     'browser.backend: browser_use\n',
+    'browser:\n  use_gateway: true\n',
     'defaults: &chosen {engine: lightpanda}\nbrowser: *chosen\n',
 ):
     custom.write_text(before)

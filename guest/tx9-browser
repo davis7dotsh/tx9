@@ -32,7 +32,7 @@ SESSION = PROBE_PREFIX
 FIXTURE_MARKER = "TX9_BROWSER_FIXTURE_OK"
 HTTPS_SMOKE_URL = "https://example.com"
 CLI_TIMEOUT = 45
-BROWSER_YAML_KEYS = ("backend", "cloud_provider", "cdp_url", "engine")
+BROWSER_YAML_KEYS = ("backend", "cloud_provider", "cdp_url", "engine", "use_gateway")
 BROWSER_ENV_KEYS = (
     "AGENT_BROWSER_ENGINE",
     "BROWSER_CDP_URL",
