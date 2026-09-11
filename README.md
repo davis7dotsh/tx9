@@ -61,6 +61,9 @@ tx9 mount list media-bot
 Mount configuration survives container recreation and box upgrades. The host
 is still responsible for mounting and authenticating the underlying share.
 
+The image ships a pinned Chromium and agent-browser runtime. See
+[the browser runtime](docs/browser-runtime.md).
+
 ## Repository layout
 
 | Path                     | Role                                                                                                            |
