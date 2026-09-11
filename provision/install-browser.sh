@@ -129,8 +129,11 @@ _browser_smoke() {
     extra+=(--no-sandbox --disable-dev-shm-usage)
   fi
   local out
-  if ! out="$("$chrome" --headless=new --disable-gpu --no-first-run \
-    --no-default-browser-check --user-data-dir="$tmp" "${extra[@]}" \
+  # Chrome can stay alive on dbus/GCM after --dump-dom. Bound the probe.
+  if ! out="$(timeout 45 "$chrome" --headless=new --disable-gpu --no-first-run \
+    --no-default-browser-check --disable-background-networking \
+    --disable-component-update --disable-sync --metrics-recording-only \
+    --timeout=15000 --user-data-dir="$tmp" "${extra[@]}" \
     --dump-dom "file://$(readlink -f "$fixture")")"; then
     rm -rf "$tmp"
     log "browser smoke: launch failed"

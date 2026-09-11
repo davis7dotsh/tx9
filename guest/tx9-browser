@@ -164,6 +164,11 @@ def _probe_args(user_data: Path) -> list[str]:
         "--disable-gpu",
         "--no-first-run",
         "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-sync",
+        "--metrics-recording-only",
+        "--timeout=15000",
         f"--user-data-dir={user_data}",
         "--dump-dom",
     ]
