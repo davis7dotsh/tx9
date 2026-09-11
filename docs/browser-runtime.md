@@ -33,20 +33,24 @@ image does not run `npm install -g`, `vp install -g agent-browser`, or
 - `launch_failed`
 - `navigate_failed`
 
-Presence or `--version` is not enough. The probe launches chrome with
-`--headless=new --dump-dom` against the local fixture and requires the
-marker `TX9_BROWSER_FIXTURE_OK`. `hb doctor` fails when the result is not
-`ok`. HTTPS against example.com runs only when `TX9_BROWSER_HTTPS_SMOKE=1`.
+Presence or `--version` is not enough. The probe runs image
+`agent-browser --executable-path` against the local fixture and requires
+the marker `TX9_BROWSER_FIXTURE_OK` in the accessibility snapshot.
+`--dump-dom` is not the health signal. Chrome 153 never finishes that
+command in Docker even when CDP is already up. `hb doctor` fails when the
+result is not `ok`. HTTPS against example.com runs only when
+`TX9_BROWSER_HTTPS_SMOKE=1`.
+
+`agent-browser` does not treat `$PATH/chrome` as a system install. The
+image links `/usr/bin/google-chrome` and `/usr/bin/google-chrome-stable`
+to `/opt/hermes-box/bin/chrome` so a plain `agent-browser open` finds it.
 
 ## Sandbox
 
-The image does not set the SUID bit on `chrome_sandbox`. When user
-namespaces are restricted (the process is root,
-`unprivileged_userns_clone=0`, or
-`apparmor_restrict_unprivileged_userns=1`), the health probe may add
-`--no-sandbox --disable-dev-shm-usage`. Hermes may inject the same flags.
-TX9 does not export `AGENT_BROWSER_ARGS` or
-`AGENT_BROWSER_EXECUTABLE_PATH`.
+The image does not set the SUID bit on `chrome_sandbox`. Hermes and
+agent-browser may add `--no-sandbox --disable-dev-shm-usage` when user
+namespaces cannot create a sandbox. TX9 does not export
+`AGENT_BROWSER_ARGS` or `AGENT_BROWSER_EXECUTABLE_PATH`.
 
 `~/.local` browser binaries stay. `hb doctor` may note when PATH hides
 the image `agent-browser`.

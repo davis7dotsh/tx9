@@ -6,11 +6,58 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 HELPER="$PROJECT_ROOT/guest/tx9-browser"
 FIXTURE="$PROJECT_ROOT/guest/browser-fixture.html"
-mkdir -p "$tmp/bin"
+export TX9_BROWSER_TEST_STATE="$tmp/cli-state"
+mkdir -p "$tmp/bin" "$TX9_BROWSER_TEST_STATE"
 
 cat >"$tmp/bin/cli" <<'EOF'
 #!/bin/sh
-echo 'agent-browser 0.26.0'
+exe=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --executable-path)
+      exe="$2"
+      shift 2
+      ;;
+    --session)
+      shift 2
+      ;;
+    --*)
+      shift
+      ;;
+    *)
+      break
+      ;;
+  esac
+done
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+state="${TX9_BROWSER_TEST_STATE:-${TMPDIR:-/tmp}/tx9-browser-cli-state}"
+mkdir -p "$state"
+case "$cmd" in
+  open)
+    if [ -z "$exe" ] || [ ! -x "$exe" ]; then
+      echo "chrome missing" >&2
+      exit 1
+    fi
+    html="$("$exe" --headless=new --dump-dom --user-data-dir="$state/ud" "${1:-}")" || exit 1
+    printf '%s\n' "$html" >"$state/last.html"
+    echo "✓ opened"
+    ;;
+  snapshot)
+    if [ ! -f "$state/last.html" ]; then
+      echo "no page" >&2
+      exit 1
+    fi
+    cat "$state/last.html"
+    ;;
+  close)
+    rm -f "$state/last.html"
+    exit 0
+    ;;
+  *)
+    echo 'agent-browser 0.26.0'
+    ;;
+esac
 EOF
 
 cat >"$tmp/bin/ldd-ok" <<'EOF'

@@ -11,7 +11,6 @@ import shutil
 import signal
 import subprocess
 import sys
-import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -27,8 +26,10 @@ IMAGE_CLI = (
     HB / "browser" / "bin" / "agent-browser",
 )
 PROBE_PREFIX = "tx9-browser-probe"
+SESSION = "tx9-browser-health"
 FIXTURE_MARKER = "TX9_BROWSER_FIXTURE_OK"
 HTTPS_SMOKE_URL = "https://example.com"
+CLI_TIMEOUT = 45
 BROWSER_YAML_KEYS = ("backend", "cloud_provider", "cdp_url", "engine")
 BROWSER_ENV_KEYS = (
     "BROWSER_USE_API_KEY",
@@ -68,23 +69,6 @@ class Health:
     @property
     def ok(self) -> bool:
         return self.code == "ok"
-
-
-def _sysctl(path: str) -> str | None:
-    try:
-        return Path(path).read_text(encoding="utf-8").strip()
-    except OSError:
-        return None
-
-
-def userns_restricted() -> bool:
-    if os.geteuid() == 0:
-        return True
-    if _sysctl("/proc/sys/kernel/unprivileged_userns_clone") == "0":
-        return True
-    if _sysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") == "1":
-        return True
-    return False
 
 
 def _executable(path: Path) -> bool:
@@ -158,88 +142,76 @@ def check_libs(paths: Paths) -> Health:
     return Health("ok")
 
 
-def _probe_args(user_data: Path) -> list[str]:
-    args = [
-        "--headless=new",
-        "--disable-gpu",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--disable-background-networking",
-        "--disable-component-update",
-        "--disable-sync",
-        "--metrics-recording-only",
-        "--timeout=15000",
-        f"--user-data-dir={user_data}",
-        "--dump-dom",
+def _cli(paths: Paths, args: list[str], timeout: float = CLI_TIMEOUT) -> subprocess.CompletedProcess[str]:
+    cmd = [
+        str(paths.cli),
+        "--executable-path",
+        str(paths.chrome),
+        "--session",
+        SESSION,
+        *args,
     ]
-    # Hermes injects the same pair when userns cannot create a sandbox.
-    if userns_restricted():
-        args.extend(("--no-sandbox", "--disable-dev-shm-usage"))
-    return args
+    return subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
 
 
-def _kill_pg(pgid: int) -> None:
+def _cli_close(paths: Paths) -> None:
     try:
-        os.killpg(pgid, signal.SIGTERM)
-    except ProcessLookupError:
-        return
-    deadline = time.time() + 1.0
-    while time.time() < deadline:
-        try:
-            os.killpg(pgid, 0)
-        except ProcessLookupError:
-            return
-        time.sleep(0.05)
-    try:
-        os.killpg(pgid, signal.SIGKILL)
-    except ProcessLookupError:
+        _cli(paths, ["close"], timeout=15)
+    except (OSError, subprocess.TimeoutExpired):
         return
 
 
-def _dump_dom(chrome: Path, target: str) -> Health:
-    tmp = Path(tempfile.mkdtemp(prefix=f"{PROBE_PREFIX}-"))
-    cmd = [str(chrome), *_probe_args(tmp), target]
-    proc: subprocess.Popen[str] | None = None
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-            start_new_session=True,
-        )
-        try:
-            stdout, stderr = proc.communicate(timeout=45)
-        except subprocess.TimeoutExpired:
-            _kill_pg(proc.pid)
-            proc.communicate(timeout=5)
-            return Health("launch_failed", f"chrome timed out on {target}")
-        if proc.returncode != 0:
-            detail = stderr.strip() or stdout.strip() or f"exit {proc.returncode}"
-            return Health("launch_failed", detail)
-        return Health("ok", stdout)
-    except OSError as exc:
-        return Health("launch_failed", str(exc))
-    finally:
-        if proc is not None and proc.poll() is None:
-            _kill_pg(proc.pid)
-        shutil.rmtree(tmp, ignore_errors=True)
+def _cli_output(proc: subprocess.CompletedProcess[str]) -> str:
+    return f"{proc.stdout}\n{proc.stderr}"
 
 
 def check_launch_and_navigate(paths: Paths) -> Health:
     target = paths.fixture.resolve().as_uri()
-    result = _dump_dom(paths.chrome, target)
-    if result.code != "ok":
-        return result
-    if FIXTURE_MARKER not in result.detail:
-        return Health("navigate_failed", "fixture marker missing from dump-dom")
+    try:
+        opened = _cli(paths, ["open", target])
+    except subprocess.TimeoutExpired:
+        _cli_close(paths)
+        return Health("launch_failed", f"agent-browser open timed out on {target}")
+    except OSError as exc:
+        return Health("launch_failed", str(exc))
+    if opened.returncode != 0:
+        _cli_close(paths)
+        detail = _cli_output(opened).strip() or f"exit {opened.returncode}"
+        return Health("launch_failed", detail)
+    try:
+        snap = _cli(paths, ["snapshot"], timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        _cli_close(paths)
+        return Health("navigate_failed", f"snapshot failed: {exc}")
+    if FIXTURE_MARKER not in _cli_output(snap):
+        _cli_close(paths)
+        return Health("navigate_failed", "fixture marker missing from snapshot")
     if os.environ.get("TX9_BROWSER_HTTPS_SMOKE") == "1":
-        https = _dump_dom(paths.chrome, HTTPS_SMOKE_URL)
-        if https.code != "ok":
-            return Health("navigate_failed", https.detail or f"{HTTPS_SMOKE_URL} failed")
-        html = https.detail.lower()
-        if "<html" not in html and "example" not in html:
-            return Health("navigate_failed", f"{HTTPS_SMOKE_URL} produced no document")
+        try:
+            https = _cli(paths, ["open", HTTPS_SMOKE_URL])
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            _cli_close(paths)
+            return Health("navigate_failed", f"{HTTPS_SMOKE_URL} failed: {exc}")
+        page = _cli_output(https)
+        if https.returncode != 0:
+            _cli_close(paths)
+            return Health("navigate_failed", page.strip() or f"{HTTPS_SMOKE_URL} failed")
+        if "example" not in page.lower() and "<html" not in page.lower():
+            try:
+                title = _cli(paths, ["get", "title"], timeout=15)
+            except (OSError, subprocess.TimeoutExpired):
+                title = None
+            text = _cli_output(title) if title is not None else ""
+            if "example" not in f"{page}\n{text}".lower():
+                _cli_close(paths)
+                return Health("navigate_failed", f"{HTTPS_SMOKE_URL} produced no document")
+    _cli_close(paths)
     return Health("ok")
 
 

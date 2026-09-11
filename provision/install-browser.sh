@@ -34,19 +34,6 @@ _browser_arch() {
   esac
 }
 
-_browser_userns_restricted() {
-  [[ "$(id -u)" -eq 0 ]] && return 0
-  if [[ -r /proc/sys/kernel/unprivileged_userns_clone ]] &&
-    [[ "$(cat /proc/sys/kernel/unprivileged_userns_clone)" == "0" ]]; then
-    return 0
-  fi
-  if [[ -r /proc/sys/kernel/apparmor_restrict_unprivileged_userns ]] &&
-    [[ "$(cat /proc/sys/kernel/apparmor_restrict_unprivileged_userns)" == "1" ]]; then
-    return 0
-  fi
-  return 1
-}
-
 _browser_pins_match() {
   local manifest="$OPT/browser/manifest.json"
   local chrome="$OPT/browser/chrome/$CHROME_DIR/chrome"
@@ -72,6 +59,9 @@ _browser_link() {
   mkdir -p "$OPT/bin" "$OPT/browser/bin" "$OPT/browser/fixtures"
   ln -sfn "../browser/bin/agent-browser" "$OPT/bin/agent-browser"
   ln -sfn "../browser/chrome/$CHROME_DIR/chrome" "$OPT/bin/chrome"
+  # agent-browser looks for system Chrome names, not $PATH/chrome.
+  ln -sfn "$OPT/bin/chrome" /usr/bin/google-chrome
+  ln -sfn "$OPT/bin/chrome" /usr/bin/google-chrome-stable
 }
 
 _browser_write_manifest() {
@@ -118,29 +108,23 @@ _browser_place_fixture() {
 
 _browser_smoke() {
   local chrome="$OPT/bin/chrome"
+  local cli="$OPT/bin/agent-browser"
   local fixture="$OPT/browser/fixtures/smoke.html"
-  [[ -x "$chrome" && -f "$fixture" ]] || {
-    log "browser smoke: chrome or fixture missing"
+  [[ -x "$chrome" && -x "$cli" && -f "$fixture" ]] || {
+    log "browser smoke: chrome, agent-browser, or fixture missing"
     return 1
   }
-  local tmp extra=()
-  tmp="$(mktemp -d /tmp/tx9-browser-probe-XXXXXX)"
-  if _browser_userns_restricted; then
-    extra+=(--no-sandbox --disable-dev-shm-usage)
-  fi
-  local out
-  # Chrome can stay alive on dbus/GCM after --dump-dom. Bound the probe.
-  if ! out="$(timeout 45 "$chrome" --headless=new --disable-gpu --no-first-run \
-    --no-default-browser-check --disable-background-networking \
-    --disable-component-update --disable-sync --metrics-recording-only \
-    --timeout=15000 --user-data-dir="$tmp" "${extra[@]}" \
-    --dump-dom "file://$(readlink -f "$fixture")")"; then
-    rm -rf "$tmp"
+  # Chrome 153 dump-dom never exits in Docker. Drive the same CDP path agents use.
+  if ! timeout 45 "$cli" --executable-path "$chrome" --session tx9-browser-health \
+    open "file://$(readlink -f "$fixture")"; then
+    timeout 15 "$cli" --executable-path "$chrome" --session tx9-browser-health close >/dev/null 2>&1 || true
     log "browser smoke: launch failed"
     return 1
   fi
-  rm -rf "$tmp"
-  grep -q 'TX9_BROWSER_FIXTURE_OK' <<<"$out" || {
+  local snap
+  snap="$(timeout 30 "$cli" --executable-path "$chrome" --session tx9-browser-health snapshot || true)"
+  timeout 15 "$cli" --executable-path "$chrome" --session tx9-browser-health close >/dev/null 2>&1 || true
+  grep -q 'TX9_BROWSER_FIXTURE_OK' <<<"$snap" || {
     log "browser smoke: navigate failed"
     return 1
   }
