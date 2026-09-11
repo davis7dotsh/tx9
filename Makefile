@@ -2,13 +2,14 @@
 
 # tests/regressions-*.sh is globbed so new split-out regression files don't
 # require touching this Makefile.
-SHELL_FILES := guest/hb guest/hb-workload guest/tx9-services guest/lib-mcp.sh guest/profile.sh guest/agent-bash-profile.sh provision/provision.sh docker/entrypoint.sh docker/executor-entrypoint.sh tests/lib.sh tests/static.sh tests/hermes-state.sh $(wildcard tests/regressions-*.sh)
+SHELL_FILES := guest/hb guest/hb-workload guest/tx9-services guest/lib-mcp.sh guest/profile.sh guest/agent-bash-profile.sh provision/provision.sh provision/install-browser.sh docker/entrypoint.sh docker/executor-entrypoint.sh tests/lib.sh tests/static.sh tests/hermes-state.sh $(wildcard tests/regressions-*.sh)
 
 syntax:
 	bash -n $(SHELL_FILES)
 	sh -n scripts/install.sh
 	python3 -c 'compile(open("guest/hermes-state", encoding="utf-8").read(), "guest/hermes-state", "exec")'
 	python3 -c 'compile(open("guest/tx9-logs", encoding="utf-8").read(), "guest/tx9-logs", "exec")'
+	python3 -c 'compile(open("guest/tx9-browser", encoding="utf-8").read(), "guest/tx9-browser", "exec")'
 
 lint:
 	command -v shellcheck >/dev/null || { echo "shellcheck is required for make check" >&2; exit 1; }

@@ -66,7 +66,7 @@ jobs:
       - name: Install jq
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends jq
+          sudo apt-get install -y --no-install-recommends jq python3-yaml
 
       - name: Install shellcheck
         # Pinned to match .depot/workflows/check.yml and local dev, so a

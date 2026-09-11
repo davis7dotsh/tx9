@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>TX9 browser fixture</title>
+</head>
+<body>
+  <h1>TX9 browser fixture</h1>
+  <p id="marker">TX9_BROWSER_FIXTURE_OK</p>
+  <form id="probe">
+    <label for="name">Name</label>
+    <input id="name" name="name" type="text" value="">
+    <button type="button" id="go">Go</button>
+  </form>
+  <p id="out"></p>
+  <script>
+    document.getElementById("go").addEventListener("click", function () {
+      var name = document.getElementById("name").value;
+      document.getElementById("out").textContent = "hello " + name;
+    });
+  </script>
+</body>
+</html>

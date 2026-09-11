@@ -12,14 +12,18 @@ OPT=/opt/hermes-box
 # its shims live in $VP_HOME/bin. https://viteplus.dev/guide/env
 export VP_HOME="$OPT/tooling/vite-plus"
 UV_DIR="$OPT/tooling/uv"
-# $OPT/bin holds repo-owned tools (hb, hb-workload, hermes-state) plus the
-# claude/codex launchers installed below — must be on PATH here too, not
-# just for the agent user (guest/profile.sh), so verify_required's
-# `command -v` checks see what a real shell would see.
+# $OPT/bin holds repo-owned tools (hb, hb-workload, hermes-state,
+# tx9-browser) plus the claude/codex launchers and browser symlinks
+# installed below. It must be on PATH here too, not just for the agent
+# user (guest/profile.sh), so verify_required's `command -v` checks see
+# what a real shell would see.
 export PATH="$OPT/bin:$VP_HOME/bin:$UV_DIR:$PATH"
 export DEBIAN_FRONTEND=noninteractive
 
 log() { printf '\033[35m[provision]\033[0m %s\n' "$*"; }
+
+# shellcheck source=provision/install-browser.sh
+source "$CTX/provision/install-browser.sh"
 
 base_os() {
   log "base packages"
@@ -231,6 +235,9 @@ place_assets() {
   install -m 0755 "$CTX/guest/tx9-services" "$OPT/bin/tx9-services"
   install -m 0755 "$CTX/guest/hermes-state" "$OPT/bin/hermes-state"
   install -m 0755 "$CTX/guest/tx9-logs"      "$OPT/bin/tx9-logs"
+  install -m 0755 "$CTX/guest/tx9-browser"  "$OPT/bin/tx9-browser"
+  mkdir -p "$OPT/browser/fixtures"
+  install -m 0644 "$CTX/provision/browser-fixture.html" "$OPT/browser/fixtures/smoke.html"
   # agent login shell auto-attaches tmux; see guest/agent-bash-profile.sh
   mkdir -p /data/home/agent
   install -m 0644 "$CTX/guest/agent-bash-profile.sh" /data/home/agent/.bash_profile
@@ -264,6 +271,16 @@ verify_required() {
   if [[ "${INSTALL_EXECUTOR:-0}" == 1 ]]; then
     command -v executor >/dev/null 2>&1 || { log "missing required tool: executor"; return 1; }
   fi
+  if [[ -x "$OPT/bin/tx9-browser" ]]; then
+    if id agent >/dev/null 2>&1; then
+      runuser -u agent -- env HOME=/data/home/agent PATH="$PATH" \
+        "$OPT/bin/tx9-browser" verify \
+        || { log "tx9-browser verify FAILED"; return 1; }
+    else
+      "$OPT/bin/tx9-browser" verify \
+        || { log "tx9-browser verify FAILED"; return 1; }
+    fi
+  fi
 }
 
 assets_only() {
@@ -281,6 +298,7 @@ assets_only() {
 main() {
   base_os
   make_agent
+  install_browser
   install_node_uv
   install_claude
   install_codex
@@ -301,6 +319,7 @@ main() {
 tools_only() {
   base_os
   make_agent
+  install_browser
   install_node_uv
   install_claude
   install_codex
