@@ -385,4 +385,80 @@ else:
     raise AssertionError('timeout left a child process running')
 PY
 
+timeout --kill-after=2s 20 python3 - "$HELPER" "$tmp" "$PROJECT_ROOT" <<'PY'
+import os, pathlib, signal, subprocess, sys, time
+
+helper, root, project = sys.argv[1], pathlib.Path(sys.argv[2]), pathlib.Path(sys.argv[3])
+cli = root / 'detached-cli'
+cli.write_text('''#!/usr/bin/env python3
+import os, pathlib, subprocess, sys, time
+args = sys.argv[1:]
+if 'open' in args:
+    child = subprocess.Popen(['/bin/sleep', '60'], start_new_session=True,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    pathlib.Path(os.environ['TX9_BROWSER_DAEMON_PID']).write_text(str(child.pid))
+    if os.environ.get('TX9_BROWSER_TEST_WAIT') == '1':
+        time.sleep(60)
+elif 'snapshot' in args:
+    print('TX9_BROWSER_FIXTURE_OK')
+elif 'close' in args:
+    sys.exit(1)
+''')
+cli.chmod(0o755)
+
+def assert_stopped(pid):
+    stat = pathlib.Path('/proc') / str(pid) / 'stat'
+    for _ in range(100):
+        if not stat.exists() or stat.read_text().split(') ', 1)[1].startswith('Z '):
+            return
+        time.sleep(0.01)
+    raise AssertionError(f'detached probe daemon {pid} survived cleanup')
+
+for interrupt in (False, True):
+    pid_file = root / f'detached-{interrupt}.pid'
+    env = dict(os.environ, TX9_BROWSER_DAEMON_PID=str(pid_file), TX9_BROWSER_TEST_WAIT=str(int(interrupt)))
+    proc = subprocess.Popen([helper, 'health', '--cli', str(cli), '--chrome', '/bin/true',
+                             '--ldd', str(root / 'bin/ldd-ok')], env=env,
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    daemon = None
+    try:
+        for _ in range(200):
+            if pid_file.exists() and pid_file.read_text():
+                daemon = int(pid_file.read_text())
+                break
+            time.sleep(0.01)
+        assert daemon is not None
+        if interrupt:
+            proc.send_signal(signal.SIGTERM)
+        out, err = proc.communicate(timeout=5)
+        assert proc.returncode == (143 if interrupt else 0), (out, err)
+        assert_stopped(daemon)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.wait()
+        if daemon:
+            try: os.kill(daemon, signal.SIGKILL)
+            except ProcessLookupError: pass
+
+# The tools layer has its own smoke caller, which must also reap a failed-close daemon.
+opt = root / 'smoke-opt'
+(opt/'bin').mkdir(parents=True)
+(opt/'browser/fixtures').mkdir(parents=True)
+(opt/'bin/agent-browser').symlink_to(cli)
+(opt/'bin/chrome').symlink_to('/bin/true')
+(opt/'browser/fixtures/smoke.html').write_text('TX9_BROWSER_FIXTURE_OK')
+pid_file = root/'smoke-daemon.pid'
+env = dict(os.environ, OPT=str(opt), TX9_BROWSER_DAEMON_PID=str(pid_file))
+try:
+    proc = subprocess.run(['bash', '-c', 'source "$1/provision/install-browser.sh"; _browser_smoke',
+                           'smoke-test', str(project)], env=env, capture_output=True, text=True, timeout=5)
+    assert proc.returncode == 0, proc
+    assert_stopped(int(pid_file.read_text()))
+finally:
+    if pid_file.exists():
+        try: os.kill(int(pid_file.read_text()), signal.SIGKILL)
+        except ProcessLookupError: pass
+PY
+
 echo "browser helper regression checks passed"

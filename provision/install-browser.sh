@@ -120,7 +120,7 @@ _browser_smoke() (
   # shellcheck disable=SC2329 # Invoked by the subshell EXIT trap.
   _close_browser_smoke() {
     timeout --kill-after=5s 15 "${browser_env[@]}" "$cli" --session "$session" close >/dev/null 2>&1 || true
-    python3 - "$session" <<'PY'
+    python3 - "$session" "$probe" <<'PY'
 import os, signal, sys, time
 from pathlib import Path
 
@@ -130,7 +130,11 @@ for sig in (signal.SIGTERM, signal.SIGKILL):
         if not entry.name.isdigit() or int(entry.name) == os.getpid():
             continue
         try:
-            if sys.argv[1].encode() in (entry / 'cmdline').read_bytes():
+            owned = sys.argv[1].encode() in (entry / 'cmdline').read_bytes()
+            marker = f'AGENT_BROWSER_SOCKET_DIR={sys.argv[2]}'.encode()
+            if not owned:
+                owned = marker in (entry / 'environ').read_bytes().split(b'\0')
+            if owned:
                 os.kill(int(entry.name), sig)
         except (OSError, ProcessLookupError):
             pass

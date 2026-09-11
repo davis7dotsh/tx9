@@ -347,7 +347,16 @@ def probe_pids() -> list[int]:
         cmdline = _proc_cmdline(pid)
         if cmdline is None:
             continue
-        if PROBE_PREFIX in cmdline:
+        owned = PROBE_PREFIX in cmdline
+        if not owned:
+            try:
+                # agent-browser detaches with no session in argv; its private
+                # socket directory still identifies it and its descendants.
+                marker = f"AGENT_BROWSER_SOCKET_DIR={PROBE_DIR}".encode()
+                owned = marker in (entry / "environ").read_bytes().split(b"\0")
+            except OSError:
+                pass
+        if owned:
             found.append(pid)
     return found
 
