@@ -1,0 +1,542 @@
+#!/usr/bin/env python3
+"""Image-owned Chromium + agent-browser health, seed, and versions helper."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+
+HB = Path("/opt/hermes-box")
+DEFAULT_CLI = HB / "bin" / "agent-browser"
+DEFAULT_CHROME = HB / "bin" / "chrome"
+DEFAULT_FIXTURE = HB / "browser" / "fixtures" / "smoke.html"
+DEFAULT_MANIFEST = HB / "browser" / "manifest.json"
+IMAGE_CLI = (
+    HB / "bin" / "agent-browser",
+    HB / "browser" / "bin" / "agent-browser",
+)
+PROBE_PREFIX = "tx9-browser-probe"
+FIXTURE_MARKER = "TX9_BROWSER_FIXTURE_OK"
+HTTPS_SMOKE_URL = "https://example.com"
+BROWSER_YAML_KEYS = ("backend", "cloud_provider", "cdp_url", "engine")
+BROWSER_ENV_KEYS = (
+    "BROWSER_USE_API_KEY",
+    "BROWSERBASE_API_KEY",
+    "FIRECRAWL_API_KEY",
+)
+SEED_YAML = (
+    'browser:\n'
+    '  backend: "off"\n'
+    '  cloud_provider: local\n'
+    '  engine: chrome\n'
+)
+HEALTH_CODES = (
+    "ok",
+    "cli_missing",
+    "browser_missing",
+    "libs_missing",
+    "launch_failed",
+    "navigate_failed",
+)
+
+
+@dataclass(frozen=True)
+class Paths:
+    cli: Path
+    chrome: Path
+    ldd: Path | None
+    fixture: Path
+
+
+@dataclass(frozen=True)
+class Health:
+    code: str
+    detail: str = ""
+    shadow: str | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.code == "ok"
+
+
+def _sysctl(path: str) -> str | None:
+    try:
+        return Path(path).read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+
+
+def userns_restricted() -> bool:
+    if os.geteuid() == 0:
+        return True
+    if _sysctl("/proc/sys/kernel/unprivileged_userns_clone") == "0":
+        return True
+    if _sysctl("/proc/sys/kernel/apparmor_restrict_unprivileged_userns") == "1":
+        return True
+    return False
+
+
+def _executable(path: Path) -> bool:
+    try:
+        return path.is_file() and os.access(path, os.X_OK)
+    except OSError:
+        return False
+
+
+def _path_shadow() -> str | None:
+    found = shutil.which("agent-browser")
+    if found is None:
+        return None
+    found_path = Path(found)
+    try:
+        found_real = found_path.resolve()
+    except OSError:
+        found_real = found_path
+    for image in IMAGE_CLI:
+        try:
+            image_real = image.resolve() if image.exists() else image
+        except OSError:
+            image_real = image
+        if found_path == image or found_real == image_real:
+            return None
+    return found
+
+
+def _with_shadow(health: Health, shadow: str | None) -> Health:
+    return Health(health.code, health.detail, shadow)
+
+
+def check_cli(paths: Paths) -> Health:
+    if _executable(paths.cli):
+        return Health("ok")
+    return Health("cli_missing", f"agent-browser is not an executable file: {paths.cli}")
+
+
+def check_browser(paths: Paths) -> Health:
+    if _executable(paths.chrome):
+        return Health("ok")
+    return Health("browser_missing", f"chrome is not an executable file: {paths.chrome}")
+
+
+def check_libs(paths: Paths) -> Health:
+    if paths.ldd is None:
+        return Health("ok")
+    if not _executable(paths.ldd):
+        return Health("ok")
+    try:
+        chrome = paths.chrome.resolve()
+    except OSError:
+        chrome = paths.chrome
+    try:
+        proc = subprocess.run(
+            [str(paths.ldd), str(chrome)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return Health("libs_missing", f"ldd failed: {exc}")
+    missing = [
+        line.strip()
+        for line in (proc.stdout + "\n" + proc.stderr).splitlines()
+        if "not found" in line
+    ]
+    if missing:
+        return Health("libs_missing", "; ".join(missing))
+    return Health("ok")
+
+
+def _probe_args(user_data: Path) -> list[str]:
+    args = [
+        "--headless=new",
+        "--disable-gpu",
+        "--no-first-run",
+        "--no-default-browser-check",
+        f"--user-data-dir={user_data}",
+        "--dump-dom",
+    ]
+    # Hermes injects the same pair when userns cannot create a sandbox.
+    if userns_restricted():
+        args.extend(("--no-sandbox", "--disable-dev-shm-usage"))
+    return args
+
+
+def _kill_pg(pgid: int) -> None:
+    try:
+        os.killpg(pgid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    deadline = time.time() + 1.0
+    while time.time() < deadline:
+        try:
+            os.killpg(pgid, 0)
+        except ProcessLookupError:
+            return
+        time.sleep(0.05)
+    try:
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+
+
+def _dump_dom(chrome: Path, target: str) -> Health:
+    tmp = Path(tempfile.mkdtemp(prefix=f"{PROBE_PREFIX}-"))
+    cmd = [str(chrome), *_probe_args(tmp), target]
+    proc: subprocess.Popen[str] | None = None
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            start_new_session=True,
+        )
+        try:
+            stdout, stderr = proc.communicate(timeout=45)
+        except subprocess.TimeoutExpired:
+            _kill_pg(proc.pid)
+            proc.communicate(timeout=5)
+            return Health("launch_failed", f"chrome timed out on {target}")
+        if proc.returncode != 0:
+            detail = stderr.strip() or stdout.strip() or f"exit {proc.returncode}"
+            return Health("launch_failed", detail)
+        return Health("ok", stdout)
+    except OSError as exc:
+        return Health("launch_failed", str(exc))
+    finally:
+        if proc is not None and proc.poll() is None:
+            _kill_pg(proc.pid)
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
+def check_launch_and_navigate(paths: Paths) -> Health:
+    target = paths.fixture.resolve().as_uri()
+    result = _dump_dom(paths.chrome, target)
+    if result.code != "ok":
+        return result
+    if FIXTURE_MARKER not in result.detail:
+        return Health("navigate_failed", "fixture marker missing from dump-dom")
+    if os.environ.get("TX9_BROWSER_HTTPS_SMOKE") == "1":
+        https = _dump_dom(paths.chrome, HTTPS_SMOKE_URL)
+        if https.code != "ok":
+            return Health("navigate_failed", https.detail or f"{HTTPS_SMOKE_URL} failed")
+        html = https.detail.lower()
+        if "<html" not in html and "example" not in html:
+            return Health("navigate_failed", f"{HTTPS_SMOKE_URL} produced no document")
+    return Health("ok")
+
+
+def evaluate(paths: Paths) -> Health:
+    shadow = _path_shadow()
+    for step in (check_cli, check_browser, check_libs, check_launch_and_navigate):
+        result = step(paths)
+        if result.code != "ok":
+            return _with_shadow(result, shadow)
+    return Health("ok", "", shadow)
+
+
+def _emit_shadow(health: Health, dest=None) -> None:
+    if not health.shadow:
+        return
+    print(f"info browser PATH shadow: {health.shadow}", file=dest or sys.stderr)
+
+
+def _default_hermes_home() -> Path:
+    env = os.environ.get("HERMES_HOME")
+    if env:
+        return Path(env)
+    return Path.home() / ".hermes"
+
+
+def _env_has_browser_key(text: str) -> bool:
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if line.startswith("export "):
+            line = line[7:].strip()
+        key = line.split("=", 1)[0].strip()
+        if key in BROWSER_ENV_KEYS:
+            return True
+    return False
+
+
+def _yaml_browser_keys(text: str) -> set[str]:
+    found: set[str] = set()
+    in_browser = False
+    browser_indent: int | None = None
+    for raw in text.splitlines():
+        stripped = raw.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        indent = len(raw) - len(raw.lstrip(" \t"))
+        if in_browser and browser_indent is not None and indent <= browser_indent:
+            in_browser = False
+        match = re.match(r"^[\t ]*([^:#\s][^:]*)\s*:", raw)
+        if match is None:
+            continue
+        name = match.group(1).strip().strip("\"'")
+        if indent == 0 and name == "browser":
+            in_browser = True
+            browser_indent = indent
+            continue
+        if indent == 0 and name.startswith("browser."):
+            suffix = name.split(".", 1)[1]
+            if suffix in BROWSER_YAML_KEYS:
+                found.add(suffix)
+            continue
+        if in_browser and name in BROWSER_YAML_KEYS:
+            found.add(name)
+    return found
+
+
+def already_configured(config_text: str, env_text: str) -> bool:
+    if _env_has_browser_key(env_text):
+        return True
+    return bool(_yaml_browser_keys(config_text))
+
+
+def _hermes_set(config: Path) -> bool:
+    hermes = shutil.which("hermes")
+    if hermes is None:
+        return False
+    env = os.environ.copy()
+    env["HERMES_HOME"] = str(config.parent)
+    try:
+        for key, value in (
+            ("browser.backend", "off"),
+            ("browser.cloud_provider", "local"),
+            ("browser.engine", "chrome"),
+        ):
+            proc = subprocess.run(
+                [hermes, "config", "set", key, value],
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=False,
+            )
+            if proc.returncode != 0:
+                return False
+        return True
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+
+
+def seed_config(config: Path, env_path: Path) -> str:
+    config_text = config.read_text(encoding="utf-8") if config.is_file() else ""
+    env_text = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
+    if already_configured(config_text, env_text):
+        return "preserved"
+    if _hermes_set(config) and config.is_file() and already_configured(
+        config.read_text(encoding="utf-8"), env_text
+    ):
+        return "seeded"
+    config.parent.mkdir(parents=True, exist_ok=True)
+    body = config_text
+    if body and not body.endswith("\n"):
+        body += "\n"
+    config.write_text(body + SEED_YAML, encoding="utf-8")
+    return "seeded"
+
+
+def read_versions(manifest: Path) -> dict[str, str]:
+    missing = {
+        "agent_browser": "missing",
+        "chrome": "missing",
+        "arch": "missing",
+    }
+    if not manifest.is_file():
+        return missing
+    try:
+        data = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return missing
+    if not isinstance(data, dict):
+        return missing
+    return {
+        "agent_browser": str(data.get("agent_browser_version") or data.get("agent_browser") or "missing"),
+        "chrome": str(data.get("chrome_version") or data.get("chrome") or "missing"),
+        "arch": str(data.get("arch") or "missing"),
+    }
+
+
+def _proc_cmdline(pid: int) -> str | None:
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return None
+    return raw.replace(b"\x00", b" ").decode("utf-8", "replace")
+
+
+def probe_pids() -> list[int]:
+    found: list[int] = []
+    try:
+        entries = Path("/proc").iterdir()
+    except OSError:
+        return found
+    self_pid = os.getpid()
+    for entry in entries:
+        if not entry.name.isdigit():
+            continue
+        pid = int(entry.name)
+        if pid == self_pid:
+            continue
+        cmdline = _proc_cmdline(pid)
+        if cmdline is None:
+            continue
+        if PROBE_PREFIX in cmdline:
+            found.append(pid)
+    return found
+
+
+def cleanup_probes() -> int:
+    pids = probe_pids()
+    for pid in pids:
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+    deadline = time.time() + 1.0
+    while time.time() < deadline and probe_pids():
+        time.sleep(0.05)
+    for pid in probe_pids():
+        try:
+            os.kill(pid, signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            continue
+    return 0
+
+
+def _paths_from_args(args: argparse.Namespace) -> Paths:
+    ldd: Path | None
+    if args.ldd is not None:
+        ldd = args.ldd
+    else:
+        found = shutil.which("ldd")
+        ldd = Path(found) if found else None
+    return Paths(
+        cli=args.cli or DEFAULT_CLI,
+        chrome=args.chrome or DEFAULT_CHROME,
+        ldd=ldd,
+        fixture=args.fixture or DEFAULT_FIXTURE,
+    )
+
+
+def _add_probe_flags(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--cli", type=Path)
+    parser.add_argument("--chrome", type=Path)
+    parser.add_argument("--ldd", type=Path)
+    parser.add_argument("--fixture", type=Path)
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(prog="tx9-browser")
+    sub = parser.add_subparsers(dest="command", required=True)
+    health = sub.add_parser("health")
+    health.add_argument("--json", action="store_true")
+    _add_probe_flags(health)
+    doctor = sub.add_parser("doctor")
+    _add_probe_flags(doctor)
+    seed = sub.add_parser("seed-config")
+    seed.add_argument("--config", type=Path)
+    seed.add_argument("--env", type=Path)
+    versions = sub.add_parser("versions")
+    versions.add_argument("--json", action="store_true")
+    verify = sub.add_parser("verify")
+    _add_probe_flags(verify)
+    sub.add_parser("cleanup")
+    return parser
+
+
+def cmd_health(args: argparse.Namespace) -> int:
+    health = evaluate(_paths_from_args(args))
+    _emit_shadow(health)
+    if args.json:
+        print(json.dumps({
+            "code": health.code,
+            "detail": health.detail,
+            "shadow": health.shadow,
+        }, sort_keys=True))
+    else:
+        print(health.code)
+    return 0
+
+
+def cmd_doctor(args: argparse.Namespace) -> int:
+    health = evaluate(_paths_from_args(args))
+    if health.ok:
+        print("ok   browser")
+        _emit_shadow(health, dest=sys.stdout)
+        return 0
+    print(f"FAIL browser ({health.code})", file=sys.stderr)
+    if health.detail:
+        print(health.detail, file=sys.stderr)
+    _emit_shadow(health)
+    return 1
+
+
+def cmd_verify(args: argparse.Namespace) -> int:
+    health = evaluate(_paths_from_args(args))
+    _emit_shadow(health)
+    return 0 if health.ok else 1
+
+
+def cmd_seed(args: argparse.Namespace) -> int:
+    home = _default_hermes_home()
+    config = args.config or (home / "config.yaml")
+    env_path = args.env or (home / ".env")
+    try:
+        print(seed_config(config, env_path))
+    except OSError as exc:
+        print(f"seed-config failed: {exc}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_versions(args: argparse.Namespace) -> int:
+    versions = read_versions(DEFAULT_MANIFEST)
+    if args.json:
+        print(json.dumps(versions, sort_keys=True))
+        return 0
+    print(f"agent-browser: {versions['agent_browser']}")
+    print(f"chrome:        {versions['chrome']}")
+    return 0
+
+
+def main() -> int:
+    args = build_parser().parse_args()
+    if args.command == "health":
+        return cmd_health(args)
+    if args.command == "doctor":
+        return cmd_doctor(args)
+    if args.command == "seed-config":
+        return cmd_seed(args)
+    if args.command == "versions":
+        return cmd_versions(args)
+    if args.command == "verify":
+        return cmd_verify(args)
+    if args.command == "cleanup":
+        return cleanup_probes()
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    finally:
+        cleanup_probes()
