@@ -52,6 +52,11 @@ func TestBuildContextTar(t *testing.T) {
 	if mode != 0o755 {
 		t.Errorf("guest/hb mode = %o, want 0755", mode)
 	}
+	if mode, ok := modes["provision/browser-fixture.html"]; !ok {
+		t.Errorf("provision/browser-fixture.html missing from build context tar")
+	} else if mode != 0o644 {
+		t.Errorf("provision/browser-fixture.html mode = %o, want 0644", mode)
+	}
 	for _, want := range []string{"box.env", "provision/provision.sh", "docker/entrypoint.sh", "docker/executor-entrypoint.sh", "guest/hb-workload", "guest/tx9-services", "guest/hermes-state", "guest/tx9-browser"} {
 		if _, ok := modes[want]; !ok {
 			t.Errorf("%s missing from build context tar", want)

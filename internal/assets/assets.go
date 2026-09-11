@@ -96,9 +96,8 @@ func skip(p string) bool {
 
 // fileMode returns the tar mode for path p, restoring the executable bit
 // go:embed strips: any *.sh script, guest/hb and guest/hb-workload (the
-// guest control binaries), guest/hermes-state, guest/tx9-browser, and
-// everything under provision/ need 0755. Everything else is a plain 0644
-// data file.
+// guest control binaries), guest/hermes-state, and guest/tx9-browser.
+// Everything else is a plain 0644 data file.
 func fileMode(p string) int64 {
 	switch {
 	case strings.HasSuffix(p, ".sh"):
@@ -106,8 +105,6 @@ func fileMode(p string) int64 {
 	case p == "guest/hb" || strings.HasPrefix(p, "guest/hb-") || p == "guest/tx9-services":
 		return 0o755
 	case p == "guest/hermes-state" || p == "guest/tx9-browser":
-		return 0o755
-	case strings.HasPrefix(p, "provision/"):
 		return 0o755
 	default:
 		return 0o644

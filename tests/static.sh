@@ -116,7 +116,11 @@ grep -q 'sha256' provision/install-browser.sh
 grep -q 'python3' provision/install-browser.sh
 grep -q '/usr/bin/google-chrome' provision/install-browser.sh
 grep -q 'tx9-browser' guest/hb
-grep -q 'TX9_BROWSER_FIXTURE_OK' guest/browser-fixture.html
+grep -q 'TX9_BROWSER_FIXTURE_OK' provision/browser-fixture.html
+if grep -q 'guest/browser-fixture.html' docker/Dockerfile; then
+  echo "Dockerfile still copies a guest fixture into the tools layer" >&2
+  exit 1
+fi
 grep -q 'snapshot' guest/tx9-browser
 if grep -q -- '--dump-dom' guest/tx9-browser provision/install-browser.sh; then
   echo "browser health still uses --dump-dom" >&2

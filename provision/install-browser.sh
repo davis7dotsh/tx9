@@ -59,7 +59,6 @@ _browser_link() {
   mkdir -p "$OPT/bin" "$OPT/browser/bin" "$OPT/browser/fixtures"
   ln -sfn "../browser/bin/agent-browser" "$OPT/bin/agent-browser"
   ln -sfn "../browser/chrome/$CHROME_DIR/chrome" "$OPT/bin/chrome"
-  # agent-browser looks for system Chrome names, not $PATH/chrome.
   ln -sfn "$OPT/bin/chrome" /usr/bin/google-chrome
   ln -sfn "$OPT/bin/chrome" /usr/bin/google-chrome-stable
 }
@@ -97,7 +96,7 @@ _browser_satisfy() {
 }
 
 _browser_place_fixture() {
-  local src="$CTX/guest/browser-fixture.html"
+  local src="$CTX/provision/browser-fixture.html"
   [[ -n "$CTX" && -f "$src" ]] || {
     log "browser: fixture missing at $src"
     return 1
@@ -114,7 +113,6 @@ _browser_smoke() {
     log "browser smoke: chrome, agent-browser, or fixture missing"
     return 1
   }
-  # Chrome 153 dump-dom never exits in Docker. Drive the same CDP path agents use.
   if ! timeout 45 "$cli" --executable-path "$chrome" --session tx9-browser-health \
     open "file://$(readlink -f "$fixture")"; then
     timeout 15 "$cli" --executable-path "$chrome" --session tx9-browser-health close >/dev/null 2>&1 || true

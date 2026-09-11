@@ -5,7 +5,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
 
 HELPER="$PROJECT_ROOT/guest/tx9-browser"
-FIXTURE="$PROJECT_ROOT/guest/browser-fixture.html"
+FIXTURE="$PROJECT_ROOT/provision/browser-fixture.html"
 export TX9_BROWSER_TEST_STATE="$tmp/cli-state"
 mkdir -p "$tmp/bin" "$TX9_BROWSER_TEST_STATE"
 

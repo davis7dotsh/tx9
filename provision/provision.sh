@@ -237,7 +237,7 @@ place_assets() {
   install -m 0755 "$CTX/guest/tx9-logs"      "$OPT/bin/tx9-logs"
   install -m 0755 "$CTX/guest/tx9-browser"  "$OPT/bin/tx9-browser"
   mkdir -p "$OPT/browser/fixtures"
-  install -m 0644 "$CTX/guest/browser-fixture.html" "$OPT/browser/fixtures/smoke.html"
+  install -m 0644 "$CTX/provision/browser-fixture.html" "$OPT/browser/fixtures/smoke.html"
   # agent login shell auto-attaches tmux; see guest/agent-bash-profile.sh
   mkdir -p /data/home/agent
   install -m 0644 "$CTX/guest/agent-bash-profile.sh" /data/home/agent/.bash_profile
