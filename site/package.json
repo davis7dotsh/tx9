@@ -15,7 +15,7 @@
 		"oxlint": "1.80.0",
 		"prettier": "3.9.6",
 		"typescript": "7.0.2",
-		"wrangler": "4.127.0"
+		"wrangler": "4.131.0"
 	},
 	"engines": {
 		"node": ">=22.18.0"

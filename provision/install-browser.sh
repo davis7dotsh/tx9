@@ -105,7 +105,7 @@ _browser_place_fixture() {
   install -m 0644 "$src" "$OPT/browser/fixtures/smoke.html"
 }
 
-_browser_smoke() {
+_browser_smoke() (
   local chrome="$OPT/bin/chrome"
   local cli="$OPT/bin/agent-browser"
   local fixture="$OPT/browser/fixtures/smoke.html"
@@ -113,20 +113,48 @@ _browser_smoke() {
     log "browser smoke: chrome, agent-browser, or fixture missing"
     return 1
   }
-  if ! timeout 45 "$cli" --executable-path "$chrome" --session tx9-browser-health \
+  local probe session
+  probe="$(mktemp -d /tmp/tx9-browser-build-XXXXXX)"
+  session="${probe##*/}"
+  local -a browser_env=(env "HOME=$probe" "AGENT_BROWSER_SOCKET_DIR=$probe")
+  # shellcheck disable=SC2329 # Invoked by the subshell EXIT trap.
+  _close_browser_smoke() {
+    timeout --kill-after=5s 15 "${browser_env[@]}" "$cli" --session "$session" close >/dev/null 2>&1 || true
+    python3 - "$session" <<'PY'
+import os, signal, sys, time
+from pathlib import Path
+
+# The random session/profile marker belongs only to this smoke invocation.
+for sig in (signal.SIGTERM, signal.SIGKILL):
+    for entry in Path('/proc').iterdir():
+        if not entry.name.isdigit() or int(entry.name) == os.getpid():
+            continue
+        try:
+            if sys.argv[1].encode() in (entry / 'cmdline').read_bytes():
+                os.kill(int(entry.name), sig)
+        except (OSError, ProcessLookupError):
+            pass
+    if sig == signal.SIGTERM:
+        time.sleep(0.2)
+PY
+    rm -rf "$probe"
+  }
+  trap _close_browser_smoke EXIT
+  if ! timeout --kill-after=5s 45 "${browser_env[@]}" "$cli" --executable-path "$chrome" --session "$session" --profile "$probe/profile" \
     open "file://$(readlink -f "$fixture")"; then
-    timeout 15 "$cli" --executable-path "$chrome" --session tx9-browser-health close >/dev/null 2>&1 || true
     log "browser smoke: launch failed"
     return 1
   fi
   local snap
-  snap="$(timeout 30 "$cli" --executable-path "$chrome" --session tx9-browser-health snapshot || true)"
-  timeout 15 "$cli" --executable-path "$chrome" --session tx9-browser-health close >/dev/null 2>&1 || true
+  snap="$(timeout --kill-after=5s 30 "${browser_env[@]}" "$cli" --session "$session" snapshot)" || {
+    log "browser smoke: snapshot failed"
+    return 1
+  }
   grep -q 'TX9_BROWSER_FIXTURE_OK' <<<"$snap" || {
     log "browser smoke: navigate failed"
     return 1
   }
-}
+)
 
 _browser_download() {
   local url="$1" dest="$2" sha="$3"
@@ -134,20 +162,22 @@ _browser_download() {
   printf '%s  %s\n' "$sha" "$dest" | sha256sum -c - >/dev/null
 }
 
-install_browser() {
+install_browser() (
   : "${AGENT_BROWSER_VERSION:?browser pins missing from box.env}"
   : "${CHROME_FOR_TESTING_VERSION:?browser pins missing from box.env}"
   _browser_arch
   mkdir -p "$OPT/browser/bin" "$OPT/browser/chrome" "$OPT/browser/fixtures" "$OPT/bin"
-  apt-get install -y --no-install-recommends unzip libnss3-tools python3 >/dev/null
+  apt-get install -y --no-install-recommends unzip libnss3-tools python3 python3-yaml >/dev/null
 
   if _browser_pins_match; then
     log "browser pins match, skipping download"
     _browser_link
     _browser_satisfy
     _browser_place_fixture
-    _browser_smoke
-    return 0
+    if _browser_smoke; then
+      return 0
+    fi
+    log "browser pins match but health failed; reinstalling"
   fi
 
   local ab_url chrome_url stage
@@ -155,24 +185,25 @@ install_browser() {
   chrome_url="https://storage.googleapis.com/chrome-for-testing-public/${CHROME_FOR_TESTING_VERSION}/${CHROME_PLATFORM}/${CHROME_DIR}.zip"
 
   log "browser (agent-browser ${AGENT_BROWSER_VERSION}, chrome ${CHROME_FOR_TESTING_VERSION}, ${MANIFEST_ARCH})"
-  stage="$(mktemp -d /tmp/tx9-browser-stage-XXXXXX)"
+  stage="$(mktemp -d "$OPT/browser/.stage-XXXXXX")"
+  trap 'rm -rf "$stage"' EXIT
   _browser_download "$ab_url" "$stage/$AB_ASSET" "$AB_SHA256"
   _browser_download "$chrome_url" "$stage/${CHROME_DIR}.zip" "$CHROME_SHA256"
 
-  install -m 0755 "$stage/$AB_ASSET" "$OPT/browser/bin/agent-browser"
-  rm -rf "$OPT/browser/chrome/$CHROME_DIR"
-  unzip -q "$stage/${CHROME_DIR}.zip" -d "$OPT/browser/chrome"
-  rm -rf "$stage"
-
-  [[ -x "$OPT/browser/chrome/$CHROME_DIR/chrome" ]] || {
-    log "browser: chrome binary missing after unpack ($CHROME_DIR)"
+  # Unpack and check completeness before touching a working installation.
+  unzip -q "$stage/${CHROME_DIR}.zip" -d "$stage"
+  [[ -x "$stage/$CHROME_DIR/chrome" && -f "$stage/$CHROME_DIR/deb.deps" ]] || {
+    log "browser: incomplete Chrome archive ($CHROME_DIR)"
     return 1
   }
+  rm -rf "$OPT/browser/chrome/$CHROME_DIR"
+  mv "$stage/$CHROME_DIR" "$OPT/browser/chrome/$CHROME_DIR"
+  install -m 0755 "$stage/$AB_ASSET" "$OPT/browser/bin/agent-browser"
 
   _browser_link
   _browser_satisfy
-  _browser_write_manifest
   _browser_place_fixture
   _browser_smoke
+  _browser_write_manifest
   log "browser installed -> $OPT/bin/agent-browser $OPT/bin/chrome"
-}
+)

@@ -17,8 +17,8 @@ Pins live in `box.env` and were measured on 2026-09-10.
 the build. An amd64 artifact is never treated as arm64.
 
 `install-browser.sh` skips the download when `manifest.json` matches the
-current pins and both binaries exist. OS libraries come from Chrome's own
-`deb.deps` via `apt-get satisfy`, plus `unzip` and `libnss3-tools`. The
+current pins and both binaries pass the smoke check. OS libraries come from Chrome's own
+`deb.deps` via `apt-get satisfy`, plus `unzip`, `libnss3-tools`, and Python with PyYAML. The
 image does not run `npm install -g`, `vp install -g agent-browser`, or
 `agent-browser install --with-deps`.
 
@@ -40,6 +40,11 @@ the marker `TX9_BROWSER_FIXTURE_OK` in the accessibility snapshot.
 command in Docker even when CDP is already up. `hb doctor` fails when the
 result is not `ok`. HTTPS against example.com runs only when
 `TX9_BROWSER_HTTPS_SMOKE=1`.
+
+Probes use private sessions and temporary profiles. Cleanup targets only the
+current invocation, so concurrent health checks cannot close each other's browser.
+Config seeding parses YAML and atomically updates only the requested file,
+retaining existing browser choices and unrelated settings.
 
 `agent-browser` does not treat `$PATH/chrome` as a system install. The
 image links `/usr/bin/google-chrome` and `/usr/bin/google-chrome-stable`

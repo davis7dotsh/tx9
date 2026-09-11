@@ -12,6 +12,7 @@ mkdir -p "$tmp/bin" "$TX9_BROWSER_TEST_STATE"
 cat >"$tmp/bin/cli" <<'EOF'
 #!/bin/sh
 exe=""
+session="default"
 while [ $# -gt 0 ]; do
   case "$1" in
     --executable-path)
@@ -19,6 +20,10 @@ while [ $# -gt 0 ]; do
       shift 2
       ;;
     --session)
+      session="$2"
+      shift 2
+      ;;
+    --profile)
       shift 2
       ;;
     --*)
@@ -32,6 +37,7 @@ done
 cmd="${1:-}"
 [ $# -gt 0 ] && shift
 state="${TX9_BROWSER_TEST_STATE:-${TMPDIR:-/tmp}/tx9-browser-cli-state}"
+state="$state/$session"
 mkdir -p "$state"
 case "$cmd" in
   open)
@@ -44,6 +50,11 @@ case "$cmd" in
     echo "✓ opened"
     ;;
   snapshot)
+    sleep 0.1
+    if [ "${TX9_BROWSER_TEST_BAD_SNAPSHOT:-0}" = 1 ]; then
+      echo TX9_BROWSER_FIXTURE_OK
+      exit 1
+    fi
     if [ ! -f "$state/last.html" ]; then
       echo "no page" >&2
       exit 1
@@ -186,6 +197,12 @@ expect_code navigate_failed \
   --ldd "$tmp/bin/ldd-ok" \
   --fixture "$FIXTURE"
 
+TX9_BROWSER_TEST_BAD_SNAPSHOT=1 expect_code navigate_failed \
+  --cli "$tmp/bin/cli" \
+  --chrome "$tmp/bin/chrome-ok" \
+  --ldd "$tmp/bin/ldd-ok" \
+  --fixture "$FIXTURE"
+
 expect_code ok \
   --cli "$tmp/bin/cli" \
   --chrome "$tmp/bin/chrome-ok" \
@@ -222,12 +239,11 @@ mkdir -p "$tmp/seed-empty"
 : >"$tmp/seed-empty/.env"
 seeded="$("$HELPER" seed-config --config "$tmp/seed-empty/config.yaml" --env "$tmp/seed-empty/.env")"
 [[ "$seeded" == "seeded" ]]
-diff -u - "$tmp/seed-empty/config.yaml" <<'EOF'
-browser:
-  backend: "off"
-  cloud_provider: local
-  engine: chrome
-EOF
+python3 - "$tmp/seed-empty/config.yaml" <<'PY'
+import sys, yaml
+with open(sys.argv[1]) as f:
+    assert yaml.safe_load(f) == {"browser": {"backend": "off", "cloud_provider": "local", "engine": "chrome"}}
+PY
 
 # Existing backend is already selected and must be preserved.
 mkdir -p "$tmp/seed-backend"
@@ -280,9 +296,93 @@ cp /bin/sleep "$tmp/tx9-browser-probe-sleep"
 probe_pid=$!
 pids+=("$probe_pid")
 "$HELPER" cleanup
-if kill -0 "$probe_pid" 2>/dev/null; then
-  echo "cleanup left a tx9-browser-probe process running" >&2
+if ! kill -0 "$probe_pid" 2>/dev/null; then
+  echo "cleanup killed another invocation's probe" >&2
   exit 1
 fi
+
+# Independent sessions must survive overlapping open/snapshot/close commands.
+health --cli "$tmp/bin/cli" --chrome "$tmp/bin/chrome-ok" --ldd "$tmp/bin/ldd-ok" --fixture "$FIXTURE" >"$tmp/health-one" &
+first=$!
+pids+=("$first")
+health --cli "$tmp/bin/cli" --chrome "$tmp/bin/chrome-ok" --ldd "$tmp/bin/ldd-ok" --fixture "$FIXTURE" >"$tmp/health-two" &
+second=$!
+pids+=("$second")
+"$HELPER" versions >/dev/null
+wait "$first"
+wait "$second"
+[[ "$(cat "$tmp/health-one")" == ok && "$(cat "$tmp/health-two")" == ok ]]
+
+python3 - "$HELPER" "$tmp" <<'PY'
+import os, pathlib, subprocess, sys, yaml
+
+helper, root = sys.argv[1], pathlib.Path(sys.argv[2])
+env_path = root / 'empty.env'
+env_path.write_text('')
+default = root / 'config.yaml'
+default.write_text('model: keep-default\n')
+custom = root / 'custom.yaml'
+for before in (
+    'browser: {backend: browser_use, engine: lightpanda}\n',
+    '{browser: {backend: browserbase}}\n',
+    'browser.backend: browser_use\n',
+    'defaults: &chosen {engine: lightpanda}\nbrowser: *chosen\n',
+):
+    custom.write_text(before)
+    proc = subprocess.run([helper, 'seed-config', '--config', str(custom), '--env', str(env_path)], capture_output=True, text=True)
+    assert proc.returncode == 0 and proc.stdout.strip() == 'preserved', proc
+    assert custom.read_text() == before
+
+custom.write_text('model: keep-custom\nbrowser:\n  headless: true\n  timeout: 42\n')
+custom.chmod(0o640)
+proc = subprocess.run([helper, 'seed-config', '--config', str(custom), '--env', str(env_path)], capture_output=True, text=True)
+assert proc.returncode == 0, proc
+data = yaml.safe_load(custom.read_text())
+assert data['model'] == 'keep-custom'
+assert data['browser'] == dict(headless=True, timeout=42, backend='off', cloud_provider='local', engine='chrome')
+assert custom.stat().st_mode & 0o777 == 0o640
+assert default.read_text() == 'model: keep-default\n'
+for before in ('browser: [invalid', '- not-a-mapping\n', 'browser: disabled\n'):
+    custom.write_text(before)
+    proc = subprocess.run([helper, 'seed-config', '--config', str(custom), '--env', str(env_path)], capture_output=True, text=True)
+    assert proc.returncode != 0, proc
+    assert custom.read_text() == before
+PY
+
+timeout --kill-after=2s 10 python3 - "$HELPER" "$tmp" <<'PY'
+import importlib.machinery, importlib.util, pathlib, subprocess, sys, time
+
+loader = importlib.machinery.SourceFileLoader('browser_timeout_test', sys.argv[1])
+spec = importlib.util.spec_from_loader(loader.name, loader)
+module = importlib.util.module_from_spec(spec)
+sys.modules[loader.name] = module
+loader.exec_module(module)
+root = pathlib.Path(sys.argv[2])
+pid_file = root / 'timeout-child.pid'
+cli = root / 'wedged-cli'
+cli.write_text('#!/usr/bin/env python3\nimport pathlib, signal, subprocess, sys, time\n'
+               'signal.signal(signal.SIGTERM, signal.SIG_IGN)\n'
+               'child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])\n'
+               f'pathlib.Path({str(pid_file)!r}).write_text(str(child.pid))\n'
+               'time.sleep(60)\n')
+cli.chmod(0o755)
+paths = module.Paths(cli=cli, chrome=pathlib.Path('/bin/true'), ldd=None, fixture=root)
+started = time.monotonic()
+try:
+    module._cli(paths, ['open'], timeout=0.5)
+    raise AssertionError('wedged CLI unexpectedly returned')
+except subprocess.TimeoutExpired:
+    assert time.monotonic() - started < 3
+finally:
+    module.cleanup_probes()
+    module.shutil.rmtree(module.PROBE_DIR, ignore_errors=True)
+child_stat = pathlib.Path('/proc') / pid_file.read_text() / 'stat'
+for _ in range(100):
+    if not child_stat.exists() or child_stat.read_text().split(') ', 1)[1].startswith('Z '):
+        break
+    time.sleep(0.01)
+else:
+    raise AssertionError('timeout left a child process running')
+PY
 
 echo "browser helper regression checks passed"

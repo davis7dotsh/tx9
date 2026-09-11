@@ -249,7 +249,7 @@ npm audit --audit-level=high
 ```
 
 These commands do not start development servers or build container images.
-They require Bash, Make, Python 3, jq, ShellCheck, gzip and tar, the Go
+They require Bash, Make, Python 3 with PyYAML (`python3-yaml` on Ubuntu), jq, ShellCheck, gzip and tar, the Go
 toolchain declared in `go.mod`, and Node 22.18 or newer with npm. Go modules
 and npm packages must be available or downloaded first. With an older Go 1.26
 patch release installed, `go` downloads the declared toolchain on first use

@@ -6,12 +6,13 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import re
 import shutil
 import signal
 import subprocess
 import sys
+import tempfile
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -25,8 +26,9 @@ IMAGE_CLI = (
     HB / "bin" / "agent-browser",
     HB / "browser" / "bin" / "agent-browser",
 )
-PROBE_PREFIX = "tx9-browser-probe"
-SESSION = "tx9-browser-health"
+PROBE_PREFIX = f"tx9-browser-probe-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+PROBE_DIR = Path("/tmp") / PROBE_PREFIX
+SESSION = PROBE_PREFIX
 FIXTURE_MARKER = "TX9_BROWSER_FIXTURE_OK"
 HTTPS_SMOKE_URL = "https://example.com"
 CLI_TIMEOUT = 45
@@ -35,12 +37,6 @@ BROWSER_ENV_KEYS = (
     "BROWSER_USE_API_KEY",
     "BROWSERBASE_API_KEY",
     "FIRECRAWL_API_KEY",
-)
-SEED_YAML = (
-    'browser:\n'
-    '  backend: "off"\n'
-    '  cloud_provider: local\n'
-    '  engine: chrome\n'
 )
 HEALTH_CODES = (
     "ok",
@@ -139,25 +135,43 @@ def check_libs(paths: Paths) -> Health:
     ]
     if missing:
         return Health("libs_missing", "; ".join(missing))
+    if proc.returncode != 0:
+        return Health("libs_missing", "ldd failed to inspect chrome")
     return Health("ok")
 
 
 def _cli(paths: Paths, args: list[str], timeout: float = CLI_TIMEOUT) -> subprocess.CompletedProcess[str]:
+    PROBE_DIR.mkdir(mode=0o700, exist_ok=True)
+    # A health check owns its browser and ignores user session/CDP configuration.
+    env = {key: value for key, value in os.environ.items() if not key.startswith("AGENT_BROWSER_")}
+    env["HOME"] = str(PROBE_DIR)
+    env["AGENT_BROWSER_SOCKET_DIR"] = str(PROBE_DIR)
     cmd = [
         str(paths.cli),
         "--executable-path",
         str(paths.chrome),
         "--session",
         SESSION,
+        "--profile",
+        str(PROBE_DIR / "profile"),
         *args,
     ]
-    return subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        timeout=timeout,
-        check=False,
-    )
+    # Files avoid an inherited stdout pipe keeping timeout recovery blocked.
+    with tempfile.TemporaryFile(mode="w+") as out, tempfile.TemporaryFile(mode="w+") as err:
+        with subprocess.Popen(cmd, stdout=out, stderr=err, env=env, cwd=PROBE_DIR,
+                              start_new_session=True) as proc:
+            try:
+                proc.wait(timeout=timeout)
+            except BaseException:
+                # Interrupts must also reap the command before Popen waits on exit.
+                try:
+                    os.killpg(proc.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                raise
+            out.seek(0)
+            err.seek(0)
+            return subprocess.CompletedProcess(cmd, proc.returncode, out.read(), err.read())
 
 
 def _cli_close(paths: Paths) -> None:
@@ -189,7 +203,7 @@ def check_launch_and_navigate(paths: Paths) -> Health:
     except (OSError, subprocess.TimeoutExpired) as exc:
         _cli_close(paths)
         return Health("navigate_failed", f"snapshot failed: {exc}")
-    if FIXTURE_MARKER not in _cli_output(snap):
+    if snap.returncode != 0 or FIXTURE_MARKER not in snap.stdout:
         _cli_close(paths)
         return Health("navigate_failed", "fixture marker missing from snapshot")
     if os.environ.get("TX9_BROWSER_HTTPS_SMOKE") == "1":
@@ -250,82 +264,41 @@ def _env_has_browser_key(text: str) -> bool:
     return False
 
 
-def _yaml_browser_keys(text: str) -> set[str]:
-    found: set[str] = set()
-    in_browser = False
-    browser_indent: int | None = None
-    for raw in text.splitlines():
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = len(raw) - len(raw.lstrip(" \t"))
-        if in_browser and browser_indent is not None and indent <= browser_indent:
-            in_browser = False
-        match = re.match(r"^[\t ]*([^:#\s][^:]*)\s*:", raw)
-        if match is None:
-            continue
-        name = match.group(1).strip().strip("\"'")
-        if indent == 0 and name == "browser":
-            in_browser = True
-            browser_indent = indent
-            continue
-        if indent == 0 and name.startswith("browser."):
-            suffix = name.split(".", 1)[1]
-            if suffix in BROWSER_YAML_KEYS:
-                found.add(suffix)
-            continue
-        if in_browser and name in BROWSER_YAML_KEYS:
-            found.add(name)
-    return found
-
-
-def already_configured(config_text: str, env_text: str) -> bool:
-    if _env_has_browser_key(env_text):
-        return True
-    return bool(_yaml_browser_keys(config_text))
-
-
-def _hermes_set(config: Path) -> bool:
-    hermes = shutil.which("hermes")
-    if hermes is None:
-        return False
-    env = os.environ.copy()
-    env["HERMES_HOME"] = str(config.parent)
-    try:
-        for key, value in (
-            ("browser.backend", "off"),
-            ("browser.cloud_provider", "local"),
-            ("browser.engine", "chrome"),
-        ):
-            proc = subprocess.run(
-                [hermes, "config", "set", key, value],
-                env=env,
-                capture_output=True,
-                text=True,
-                timeout=30,
-                check=False,
-            )
-            if proc.returncode != 0:
-                return False
-        return True
-    except (OSError, subprocess.TimeoutExpired):
-        return False
-
-
 def seed_config(config: Path, env_path: Path) -> str:
+    import yaml
+
+    config = config.resolve()
     config_text = config.read_text(encoding="utf-8") if config.is_file() else ""
     env_text = env_path.read_text(encoding="utf-8") if env_path.is_file() else ""
-    if already_configured(config_text, env_text):
+    if _env_has_browser_key(env_text) or any(key in os.environ for key in BROWSER_ENV_KEYS):
         return "preserved"
-    if _hermes_set(config) and config.is_file() and already_configured(
-        config.read_text(encoding="utf-8"), env_text
-    ):
-        return "seeded"
+    try:
+        data = yaml.safe_load(config_text)
+    except yaml.YAMLError as exc:
+        # Parser diagnostics may contain secrets from the configuration.
+        raise ValueError("invalid YAML; configuration left unchanged") from exc
+    if data is None:
+        data = {}
+    if not isinstance(data, dict):
+        raise ValueError("configuration must be a YAML mapping")
+    browser = data.get("browser")
+    if browser is None:
+        browser = {}
+    if not isinstance(browser, dict):
+        raise ValueError("browser configuration must be a YAML mapping")
+    if any(key in browser or f"browser.{key}" in data for key in BROWSER_YAML_KEYS):
+        return "preserved"
+    data["browser"] = {**browser, "backend": "off", "cloud_provider": "local", "engine": "chrome"}
     config.parent.mkdir(parents=True, exist_ok=True)
-    body = config_text
-    if body and not body.endswith("\n"):
-        body += "\n"
-    config.write_text(body + SEED_YAML, encoding="utf-8")
+    mode = config.stat().st_mode & 0o777 if config.exists() else 0o600
+    fd, name = tempfile.mkstemp(prefix=".browser-config-", dir=config.parent)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            os.fchmod(handle.fileno(), mode)
+            yaml.safe_dump(data, handle, sort_keys=False, allow_unicode=True)
+        os.replace(name, config)
+    finally:
+        Path(name).unlink(missing_ok=True)
     return "seeded"
 
 
@@ -388,8 +361,8 @@ def cleanup_probes() -> int:
             continue
         except PermissionError:
             continue
-    deadline = time.time() + 1.0
-    while time.time() < deadline and probe_pids():
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline and probe_pids():
         time.sleep(0.05)
     for pid in probe_pids():
         try:
@@ -479,7 +452,7 @@ def cmd_seed(args: argparse.Namespace) -> int:
     env_path = args.env or (home / ".env")
     try:
         print(seed_config(config, env_path))
-    except OSError as exc:
+    except (OSError, ValueError, ImportError) as exc:
         print(f"seed-config failed: {exc}", file=sys.stderr)
         return 1
     return 0
@@ -513,7 +486,13 @@ def main() -> int:
 
 
 if __name__ == "__main__":
+    def interrupted(signum, _frame):
+        raise SystemExit(128 + signum)
+
+    signal.signal(signal.SIGTERM, interrupted)
+    signal.signal(signal.SIGINT, interrupted)
     try:
         sys.exit(main())
     finally:
         cleanup_probes()
+        shutil.rmtree(PROBE_DIR, ignore_errors=True)
