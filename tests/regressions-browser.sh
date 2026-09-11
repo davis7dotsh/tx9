@@ -347,7 +347,8 @@ for before in ('browser: [invalid', '- not-a-mapping\n', 'browser: disabled\n'):
     proc = subprocess.run([helper, 'seed-config', '--config', str(custom), '--env', str(env_path)], capture_output=True, text=True)
     assert proc.returncode != 0, proc
     assert custom.read_text() == before
-for key, value in (('AGENT_BROWSER_ENGINE', 'lightpanda'), ('BROWSER_CDP_URL', 'http://127.0.0.1:9222')):
+for key, value in (('AGENT_BROWSER_ENGINE', 'lightpanda'), ('BROWSER_CDP_URL', 'http://127.0.0.1:9222'),
+                   ('CAMOFOX_URL', 'http://127.0.0.1:9377')):
     for from_env_file in (False, True):
         custom.write_text('model: keep-custom\n')
         env_path.write_text(f'{key}={value}\n' if from_env_file else '')
