@@ -347,6 +347,17 @@ for before in ('browser: [invalid', '- not-a-mapping\n', 'browser: disabled\n'):
     proc = subprocess.run([helper, 'seed-config', '--config', str(custom), '--env', str(env_path)], capture_output=True, text=True)
     assert proc.returncode != 0, proc
     assert custom.read_text() == before
+for key, value in (('AGENT_BROWSER_ENGINE', 'lightpanda'), ('BROWSER_CDP_URL', 'http://127.0.0.1:9222')):
+    for from_env_file in (False, True):
+        custom.write_text('model: keep-custom\n')
+        env_path.write_text(f'{key}={value}\n' if from_env_file else '')
+        env = dict(os.environ)
+        if not from_env_file:
+            env[key] = value
+        proc = subprocess.run([helper, 'seed-config', '--config', str(custom), '--env', str(env_path)],
+                              env=env, capture_output=True, text=True)
+        assert proc.returncode == 0 and proc.stdout.strip() == 'preserved', proc
+        assert custom.read_text() == 'model: keep-custom\n'
 PY
 
 timeout --kill-after=2s 10 python3 - "$HELPER" "$tmp" <<'PY'

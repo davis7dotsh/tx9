@@ -34,6 +34,8 @@ HTTPS_SMOKE_URL = "https://example.com"
 CLI_TIMEOUT = 45
 BROWSER_YAML_KEYS = ("backend", "cloud_provider", "cdp_url", "engine")
 BROWSER_ENV_KEYS = (
+    "AGENT_BROWSER_ENGINE",
+    "BROWSER_CDP_URL",
     "BROWSER_USE_API_KEY",
     "BROWSERBASE_API_KEY",
     "FIRECRAWL_API_KEY",
