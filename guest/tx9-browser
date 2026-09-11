@@ -133,7 +133,7 @@ def check_libs(paths: Paths) -> Health:
     if paths.ldd is None:
         return Health("ok")
     if not _executable(paths.ldd):
-        return Health("ok")
+        return Health("libs_missing", f"ldd is not an executable file: {paths.ldd}")
     try:
         chrome = paths.chrome.resolve()
     except OSError:
@@ -474,7 +474,7 @@ def cmd_health(args: argparse.Namespace) -> int:
         }, sort_keys=True))
     else:
         print(health.code)
-    return 0
+    return 0 if health.ok else 1
 
 
 def cmd_doctor(args: argparse.Namespace) -> int:

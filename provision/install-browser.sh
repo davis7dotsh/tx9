@@ -154,7 +154,7 @@ install_browser() {
   : "${CHROME_FOR_TESTING_VERSION:?browser pins missing from box.env}"
   _browser_arch
   mkdir -p "$OPT/browser/bin" "$OPT/browser/chrome" "$OPT/browser/fixtures" "$OPT/bin"
-  apt-get install -y --no-install-recommends unzip libnss3-tools >/dev/null
+  apt-get install -y --no-install-recommends unzip libnss3-tools python3 >/dev/null
 
   if _browser_pins_match; then
     log "browser pins match, skipping download"

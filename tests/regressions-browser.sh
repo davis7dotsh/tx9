@@ -76,10 +76,18 @@ health() {
 expect_code() {
   local want="$1"
   shift
-  local got
-  got="$(health "$@")"
+  local got rc=0
+  got="$(health "$@")" || rc=$?
   if [[ "$got" != "$want" ]]; then
     echo "health code: want $want, got $got ($*)" >&2
+    exit 1
+  fi
+  if [[ "$want" == "ok" && "$rc" -ne 0 ]]; then
+    echo "health exited $rc for ok ($*)" >&2
+    exit 1
+  fi
+  if [[ "$want" != "ok" && "$rc" -eq 0 ]]; then
+    echo "health exited 0 for $want ($*)" >&2
     exit 1
   fi
 }
@@ -98,6 +106,12 @@ expect_code browser_missing \
 
 rm -f "$tmp/chrome-launched"
 TX9_BROWSER_TEST_LAUNCH_LOG="$tmp/chrome-launched" expect_code libs_missing \
+  --cli "$tmp/bin/cli" \
+  --chrome "$tmp/bin/chrome-ok" \
+  --ldd "$tmp/missing-ldd" \
+  --fixture "$FIXTURE"
+
+expect_code libs_missing \
   --cli "$tmp/bin/cli" \
   --chrome "$tmp/bin/chrome-launch-log" \
   --ldd "$tmp/bin/ldd-missing" \
@@ -193,6 +207,26 @@ diff -u - "$tmp/seed-provider/config.yaml" <<'EOF'
 browser:
   cloud_provider: browserbase
 EOF
+
+mkdir -p "$tmp/seed-cdp"
+printf 'browser:\n  cdp_url: http://127.0.0.1:9222\n' >"$tmp/seed-cdp/config.yaml"
+: >"$tmp/seed-cdp/.env"
+[[ "$("$HELPER" seed-config --config "$tmp/seed-cdp/config.yaml" --env "$tmp/seed-cdp/.env")" == "preserved" ]]
+
+mkdir -p "$tmp/seed-engine"
+printf 'browser:\n  engine: lightpanda\n' >"$tmp/seed-engine/config.yaml"
+: >"$tmp/seed-engine/.env"
+[[ "$("$HELPER" seed-config --config "$tmp/seed-engine/config.yaml" --env "$tmp/seed-engine/.env")" == "preserved" ]]
+
+mkdir -p "$tmp/seed-browserbase"
+printf 'BROWSERBASE_API_KEY=sk-test\n' >"$tmp/seed-browserbase/.env"
+[[ "$("$HELPER" seed-config --config "$tmp/seed-browserbase/config.yaml" --env "$tmp/seed-browserbase/.env")" == "preserved" ]]
+[[ ! -e "$tmp/seed-browserbase/config.yaml" ]]
+
+mkdir -p "$tmp/seed-firecrawl"
+printf 'FIRECRAWL_API_KEY=sk-test\n' >"$tmp/seed-firecrawl/.env"
+[[ "$("$HELPER" seed-config --config "$tmp/seed-firecrawl/config.yaml" --env "$tmp/seed-firecrawl/.env")" == "preserved" ]]
+[[ ! -e "$tmp/seed-firecrawl/config.yaml" ]]
 
 cp /bin/sleep "$tmp/tx9-browser-probe-sleep"
 "$tmp/tx9-browser-probe-sleep" 60 &

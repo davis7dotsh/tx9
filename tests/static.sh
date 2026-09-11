@@ -113,6 +113,7 @@ if grep -q 'AGENT_BROWSER_ARGS' guest/profile.sh; then
 fi
 grep -q 'apt-get satisfy' provision/install-browser.sh
 grep -q 'sha256' provision/install-browser.sh
+grep -q 'python3' provision/install-browser.sh
 grep -q 'tx9-browser' guest/hb
 grep -q 'TX9_BROWSER_FIXTURE_OK' guest/browser-fixture.html
 
