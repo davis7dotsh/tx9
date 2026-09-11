@@ -23,6 +23,9 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # skeleton) rebuilds in seconds when guest/ changes.
 COPY box.env /tmp/ctx/box.env
 COPY provision/ /tmp/ctx/provision/
+# Fixture only: tools-layer chrome --dump-dom needs it, and copying all of
+# guest/ here would bust the tools cache on every hb edit.
+COPY guest/browser-fixture.html /tmp/ctx/guest/browser-fixture.html
 RUN bash /tmp/ctx/provision/provision.sh tools
 
 COPY guest/ /tmp/ctx/guest/
