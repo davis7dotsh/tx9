@@ -17,6 +17,7 @@ files=(
   guest/profile.sh
   guest/agent-bash-profile.sh
   provision/provision.sh
+  provision/install-browser.sh
   docker/entrypoint.sh
   docker/executor-entrypoint.sh
   tests/lib.sh
@@ -27,7 +28,8 @@ files=(
 bash -n "${files[@]}"
 python3 -c 'compile(open("guest/hermes-state", encoding="utf-8").read(), "guest/hermes-state", "exec")'
 python3 -c 'compile(open("guest/tx9-logs", encoding="utf-8").read(), "guest/tx9-logs", "exec")'
-for file in guest/hb guest/hb-workload guest/tx9-services guest/hermes-state guest/tx9-logs provision/provision.sh tests/hermes-state.sh "${regression_files[@]}"; do
+python3 -c 'compile(open("guest/tx9-browser", encoding="utf-8").read(), "guest/tx9-browser", "exec")'
+for file in guest/hb guest/hb-workload guest/tx9-services guest/hermes-state guest/tx9-logs guest/tx9-browser provision/provision.sh provision/install-browser.sh tests/hermes-state.sh "${regression_files[@]}"; do
   [[ -x "$file" ]] || { echo "not executable: $file" >&2; exit 1; }
 done
 
@@ -92,10 +94,27 @@ grep -q 'env default lts' provision/provision.sh
 grep -q 'claude.ai/install.sh' provision/provision.sh
 grep -q 'chatgpt.com/codex/install.sh' provision/provision.sh
 grep -Fq -- '--dir | --dir=* | --hermes-home' provision/provision.sh
-if grep -q 'npm install -g' provision/provision.sh; then
-  echo "provision.sh still installs npm globals directly (use vp install -g)" >&2
+if grep -q 'npm install -g' provision/provision.sh provision/install-browser.sh; then
+  echo "provision still installs npm globals directly (use vp install -g)" >&2
   exit 1
 fi
+if grep -q -- '--with-deps' provision/provision.sh provision/install-browser.sh guest/tx9-browser guest/profile.sh; then
+  echo "browser install still uses --with-deps" >&2
+  exit 1
+fi
+grep -Fq 'HERMES_INSTALL_ARGS="--skip-browser"' box.env
+if grep -q 'AGENT_BROWSER_EXECUTABLE_PATH' guest/profile.sh; then
+  echo "profile.sh exports AGENT_BROWSER_EXECUTABLE_PATH" >&2
+  exit 1
+fi
+if grep -q 'AGENT_BROWSER_ARGS' guest/profile.sh; then
+  echo "profile.sh exports AGENT_BROWSER_ARGS" >&2
+  exit 1
+fi
+grep -q 'apt-get satisfy' provision/install-browser.sh
+grep -q 'sha256' provision/install-browser.sh
+grep -q 'tx9-browser' guest/hb
+grep -q 'TX9_BROWSER_FIXTURE_OK' guest/browser-fixture.html
 
 # --- docker build assets --------------------------------------------------
 grep -q 'provision.sh tools' docker/Dockerfile
