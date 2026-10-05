@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"sync"
 	"text/tabwriter"
 
 	"github.com/davis7dotsh/tx9/internal/box"
@@ -20,6 +21,9 @@ func cmdList(args []string) error {
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("list: unexpected positional arguments (usage: tx9 list)")
+	}
 
 	return withDocker(func(ctx context.Context, cli *docker.Client) error {
 		boxes, err := box.List(ctx, cli)
@@ -31,22 +35,49 @@ func cmdList(args []string) error {
 			return nil
 		}
 
+		urls := collectListURLs(boxes, func(b *box.Box) (string, error) {
+			port, err := box.HostPort(ctx, cli, b)
+			if err != nil {
+				return "", err
+			}
+			return box.DashboardURL(port, b.ExecutorWebBaseURL), nil
+		})
 		w := tabwriter.NewWriter(os.Stdout, 0, 4, 2, ' ', 0)
 		fmt.Fprintln(w, "NAME\tSTATE\tIMAGE VERSION\tURL")
-		for _, b := range boxes {
-			state := b.DerivedState()
-
-			url := "-"
-			if state == "running" {
-				if port, err := box.HostPort(ctx, cli, &b); err == nil {
-					url = box.DashboardURL(port, b.ExecutorWebBaseURL)
-				}
-			}
-
-			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", b.Name, state, imageVersionDisplay(b.Version), url)
+		for i, b := range boxes {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%s\n", b.Name, b.DerivedState(), imageVersionDisplay(b.Version), urls[i])
 		}
 		return w.Flush()
 	})
+}
+
+// Limit daemon load while inspecting independent dashboards in parallel.
+// Indexed writes preserve the box list's sorted order and tolerate disappearing
+// containers without hiding other boxes' URLs.
+func collectListURLs(boxes []box.Box, lookup func(*box.Box) (string, error)) []string {
+	urls := make([]string, len(boxes))
+	for i := range urls {
+		urls[i] = "-"
+	}
+	var wg sync.WaitGroup
+	jobs := make(chan int)
+	for range min(4, len(boxes)) {
+		wg.Go(func() {
+			for i := range jobs {
+				if url, err := lookup(&boxes[i]); err == nil {
+					urls[i] = url
+				}
+			}
+		})
+	}
+	for i := range boxes {
+		if boxes[i].DerivedState() == "running" {
+			jobs <- i
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	return urls
 }
 
 // imageVersionDisplay formats a box's tx9.version label against the

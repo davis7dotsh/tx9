@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"flag"
 	"io"
 	"testing"
@@ -22,6 +23,9 @@ func TestParseFlagsAnywhere(t *testing.T) {
 		{"value flag after positional", []string{"mybox", "--path", "/tmp/x"}, false, "/tmp/x", []string{"mybox"}},
 		{"value flag equals form", []string{"mybox", "--path=/tmp/y"}, false, "/tmp/y", []string{"mybox"}},
 		{"double dash stops parsing", []string{"mybox", "--", "--force"}, false, "", []string{"mybox", "--force"}},
+		{"leading double dash keeps flag positional", []string{"--", "--force"}, false, "", []string{"--force"}},
+		{"leading double dash keeps help positional", []string{"--", "--help"}, false, "", []string{"--help"}},
+		{"flags before leading dash positional", []string{"--force", "--", "--path"}, true, "", []string{"--path"}},
 		{"no flags", []string{"mybox"}, false, "", []string{"mybox"}},
 	}
 	for _, tc := range cases {
@@ -49,5 +53,25 @@ func TestParseFlagsAnywhere(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestParseFlagsAnywhereMissingValueDoesNotConsumeBoxName(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	path := fs.String("path", "", "")
+	if err := parseFlagsAnywhere(fs, []string{"mybox", "--path"}); err == nil {
+		t.Fatal("missing flag value was accepted")
+	}
+	if *path != "" {
+		t.Fatalf("box name consumed as flag value: %q", *path)
+	}
+}
+
+func TestParseFlagsAnywherePreservesUnknownFlagErrors(t *testing.T) {
+	fs := flag.NewFlagSet("test", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	if err := parseFlagsAnywhere(fs, []string{"mybox", "--unknown"}); err == nil || errors.Is(err, flag.ErrHelp) {
+		t.Fatalf("unknown flag was not rejected: %v", err)
 	}
 }

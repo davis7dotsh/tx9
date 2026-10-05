@@ -291,10 +291,35 @@ def _table_count(conn: sqlite3.Connection, table: str) -> int | None:
 
 
 def inspect_home(home: Path, checkpoint: bool = False) -> dict[str, object]:
+    # Inspect the active tree once. Backups/caches may contain entire older
+    # Hermes homes; counting or parsing those invents drift in cutover checks
+    # and makes verification scale with unrelated retained copies.
+    database_paths: list[Path] = []
+    cron_paths: list[Path] = []
+    gateway_paths: list[Path] = []
+    inventory = {"session_files": 0, "memory_files": 0, "skill_files": 0}
+    for directory, subdirectories, names in os.walk(home):
+        parent = Path(directory)
+        subdirectories[:] = [
+            name for name in subdirectories
+            if name not in EXCLUDED_DIRS and not (parent / name).is_symlink()
+        ]
+        parts = parent.relative_to(home).parts
+        for name in names:
+            path = parent / name
+            if path.is_symlink() or not path.is_file():
+                continue
+            for area, key in (("sessions", "session_files"), ("memories", "memory_files"), ("skills", "skill_files")):
+                if area in parts:
+                    inventory[key] += 1
+            if path.suffix == ".db":
+                database_paths.append(path)
+            elif name == "jobs.json" and parent.name == "cron":
+                cron_paths.append(path)
+            elif name == "gateway_state.json":
+                gateway_paths.append(path)
     databases: list[dict[str, object]] = []
-    for db in sorted(home.rglob("*.db")) if home.exists() else []:
-        if db.is_symlink() or any(part in EXCLUDED_DIRS for part in db.relative_to(home).parts):
-            continue
+    for db in sorted(database_paths):
         uri = f"{db.absolute().as_uri()}?mode={'rw' if checkpoint else 'ro'}"
         conn = sqlite3.connect(uri, uri=True, timeout=30)
         try:
@@ -332,9 +357,7 @@ def inspect_home(home: Path, checkpoint: bool = False) -> dict[str, object]:
 
     cron_jobs = 0
     active_cron_jobs = 0
-    for cron_file in sorted(home.rglob("jobs.json")) if home.exists() else []:
-        if cron_file.parent.name != "cron":
-            continue
+    for cron_file in sorted(cron_paths):
         data = json.loads(cron_file.read_text())
         jobs = data if isinstance(data, list) else data.get("jobs", []) if isinstance(data, dict) else []
         cron_jobs += len(jobs)
@@ -343,9 +366,11 @@ def inspect_home(home: Path, checkpoint: bool = False) -> dict[str, object]:
         )
 
     gateway_states: list[dict[str, str]] = []
-    for state_file in sorted(home.rglob("gateway_state.json")) if home.exists() else []:
+    for state_file in sorted(gateway_paths):
         try:
             data = json.loads(state_file.read_text())
+            if not isinstance(data, dict):
+                raise ValueError("gateway state must be a JSON object")
             gateway_states.append({
                 "path": str(state_file.relative_to(home)),
                 "state": str(data.get("gateway_state", data.get("state", "unknown"))),
@@ -361,23 +386,12 @@ def inspect_home(home: Path, checkpoint: bool = False) -> dict[str, object]:
                 discord_configured = True
                 break
 
-    def count_area(name: str) -> int:
-        return sum(
-            1
-            for directory in home.rglob(name)
-            if directory.is_dir()
-            for candidate in directory.rglob("*")
-            if candidate.is_file()
-        ) if home.exists() else 0
-
     return {
         "home": str(home),
         "exists": home.is_dir(),
         "databases": databases,
         "inventory": {
-            "session_files": count_area("sessions"),
-            "memory_files": count_area("memories"),
-            "skill_files": count_area("skills"),
+            **inventory,
             "cron_jobs": cron_jobs,
             "active_cron_jobs": active_cron_jobs,
         },

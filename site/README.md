@@ -12,7 +12,11 @@ downloads out of an R2 bucket.
 | `/install` (and `/install.sh`) | `scripts/install.sh`, imported at build time via the `src/install.txt` symlink — no copy step, can't drift. (The `.txt` alias is load-bearing: Cloudflare's API WAF rejects worker uploads containing a `*.sh` module with shell content.) |
 | `/releases/latest` | current version as bare text (e.g. `0.1.0`) |
 | `/releases/latest/<asset>` | 302 to the versioned path |
-| `/releases/<version>/<asset>` | binary / `checksums.txt` from R2 |
+| `/releases/<version>/<asset>` | binary / `checksums.txt` streamed from R2; GET supports a single byte range (`206`), unsatisfiable ranges return `416`, HEAD reads metadata only |
+
+Release downloads retain immutable caching and ETag revalidation. `If-Range`
+resumes only for a matching strong ETag; otherwise the full object is sent.
+Malformed and multipart ranges fall back to a normal download.
 
 ## R2 bucket layout (`tx9-releases`)
 
@@ -62,7 +66,7 @@ for checks and release uploads, without package install scripts.
 ## Develop / deploy
 
 ```bash
-npm run dev      # local worker with a local R2 stub
+npm run dev -- --ip 0.0.0.0 --port 8794  # local Worker and R2, reachable remotely
 npm run deploy
 ```
 

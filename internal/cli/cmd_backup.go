@@ -125,9 +125,6 @@ func cmdBackup(args []string) error {
 		}
 
 		weQuiesced, err := quiesceForBackup(ctx, cli, b, tok)
-		if err != nil {
-			return fmt.Errorf("backup %s: %w", name, err)
-		}
 		if weQuiesced {
 			defer func() {
 				fmt.Println("tx9: resuming box")
@@ -135,6 +132,9 @@ func cmdBackup(args []string) error {
 					fmt.Fprintf(os.Stderr, "tx9: warning: failed to resume box %s after backup, resume it manually with `hb resume`: %v\n", name, rerr)
 				}
 			}()
+		}
+		if err != nil {
+			return fmt.Errorf("backup %s: %w", name, err)
 		}
 
 		// boxd's cmd_save always runs these two after quiescing,
@@ -210,7 +210,6 @@ func cmdBackup(args []string) error {
 		stagingPath := filepath.Join(destDir, fmt.Sprintf(".%s.staging-%d", finalName, os.Getpid()))
 
 		if err := writeTx9Staged(stagingPath, meta, dataFile); err != nil {
-			os.Remove(stagingPath)
 			return fmt.Errorf("backup %s: %w", name, err)
 		}
 		// ln (hard link), not mv/cp: fails loudly if finalPath already
@@ -234,7 +233,8 @@ func cmdBackup(args []string) error {
 
 // quiesceForBackup implements dossier §6.1: check `hb is-paused`; if not
 // already paused, call `hb pause` and report that the caller must resume
-// afterward. A non-nil error from `is-paused` is treated as "not paused"
+// afterward, including on failure: pause persists the marker and stops
+// services before its checkpoint can fail. A non-nil error from `is-paused` is treated as "not paused"
 // (hb's own is-paused check exits non-zero in that case, mirroring boxd's
 // `_guest_hb` usage).
 func quiesceForBackup(ctx context.Context, cli *docker.Client, b *box.Box, token string) (weQuiesced bool, err error) {
@@ -244,7 +244,7 @@ func quiesceForBackup(ctx context.Context, cli *docker.Client, b *box.Box, token
 	}
 	fmt.Println("tx9: pausing box for a consistent snapshot")
 	if err := box.HB(ctx, cli, b, token, os.Stdout, os.Stderr, "pause"); err != nil {
-		return false, fmt.Errorf("pause: %w", err)
+		return true, fmt.Errorf("pause: %w", err)
 	}
 	return true, nil
 }
@@ -268,14 +268,23 @@ func writeTx9Staged(stagingPath string, meta archive.Metadata, dataFile string) 
 	if err != nil {
 		return fmt.Errorf("stage archive: %w", err)
 	}
-	writeErr := archive.WriteTx9(out, meta, dataFile)
-	closeErr := out.Close()
-	if writeErr != nil {
-		return fmt.Errorf("stage archive: %w", writeErr)
+	succeeded := false
+	defer func() {
+		_ = out.Close()
+		if !succeeded {
+			_ = os.Remove(stagingPath)
+		}
+	}()
+	if err := archive.WriteTx9(out, meta, dataFile); err != nil {
+		return fmt.Errorf("stage archive: %w", err)
 	}
-	if closeErr != nil {
-		return fmt.Errorf("stage archive: %w", closeErr)
+	if err := out.Sync(); err != nil {
+		return fmt.Errorf("stage archive: %w", err)
 	}
+	if err := out.Close(); err != nil {
+		return fmt.Errorf("stage archive: %w", err)
+	}
+	succeeded = true
 	return nil
 }
 

@@ -185,3 +185,56 @@ func (f fakeMountFileInfo) Mode() os.FileMode  { return f.mode }
 func (f fakeMountFileInfo) ModTime() time.Time { return time.Time{} }
 func (f fakeMountFileInfo) IsDir() bool        { return true }
 func (f fakeMountFileInfo) Sys() any           { return f.stat }
+
+func TestAgentMountSetRejectsConflictingSupplementalGroupPermissions(t *testing.T) {
+	first, second := t.TempDir(), t.TempDir()
+	info, err := os.Stat(first)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid == agentUID || stat.Gid == 0 || stat.Gid == agentGID {
+		t.Skip("fixture requires a non-agent, non-root host group")
+	}
+	if err := os.Chmod(first, 0o707); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(second, 0o770); err != nil {
+		t.Fatal(err)
+	}
+	mounts := []AgentMount{
+		{Source: first, Target: "/mnt/other-access"},
+		{Source: second, Target: "/mnt/group-access"},
+	}
+	// Each mount alone is accessible, but the second grants membership in
+	// the first's group, whose restrictive bits then override its other bits.
+	for _, mount := range mounts {
+		if err := PreflightAgentMounts([]AgentMount{mount}); err != nil {
+			t.Fatalf("individual mount should be accessible: %v", err)
+		}
+	}
+	if err := PreflightAgentMounts(mounts); err == nil {
+		t.Fatal("mount set accepted a supplemental group that makes an earlier directory inaccessible")
+	}
+}
+
+func TestSupplementalGroupMembershipOverridesOtherPermissions(t *testing.T) {
+	for _, fixture := range []struct {
+		name    string
+		uid     uint32
+		mode    os.FileMode
+		wantErr bool
+	}{
+		{name: "supplemental group denies otherwise writable directory", uid: 1000, mode: 0o707, wantErr: true},
+		{name: "supplemental group grants write access", uid: 1000, mode: 0o770},
+		{name: "owner still takes precedence", uid: agentUID, mode: 0o707},
+	} {
+		t.Run(fixture.name, func(t *testing.T) {
+			info := fakeMountFileInfo{mode: fixture.mode | os.ModeDir, stat: &syscall.Stat_t{Uid: fixture.uid, Gid: 2000}}
+			_, err := supplementalGroupWithMembership(info, false, map[string]bool{"2000": true})
+			if (err != nil) != fixture.wantErr {
+				t.Errorf("error=%v, wantErr=%v", err, fixture.wantErr)
+			}
+		})
+	}
+}

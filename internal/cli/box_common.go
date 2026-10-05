@@ -36,13 +36,21 @@ func parseFlagsAnywhere(fs *flag.FlagSet, args []string) error {
 				name = name[:eq]
 			} else if f := fs.Lookup(name); f != nil {
 				if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); !ok || !bf.IsBoolFlag() {
-					if i+1 < len(args) {
-						i++
-						flags = append(flags, args[i])
+					if i+1 >= len(args) {
+						// Parse without earlier positionals: they must not
+						// become the missing flag's value after reordering.
+						return fs.Parse(flags)
 					}
+					i++
+					flags = append(flags, args[i])
 				}
 			}
 		}
+	}
+	// Keep a leading dash positional after a literal "--" delimiter.
+	// The delimiter also prevents reordered positionals being parsed as flags.
+	if len(positionals) > 0 {
+		flags = append(flags, "--")
 	}
 	return fs.Parse(append(flags, positionals...))
 }

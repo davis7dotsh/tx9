@@ -50,6 +50,9 @@ format:
 # naming here MUST match internal/selfupdate.AssetName and
 # .depot/workflows/release.yml: plain, uncompressed executables named
 # tx9_<GOOS>_<GOARCH>, plus a checksums.txt in `sha256sum` output format.
+# Disable cgo for every release target, including the native Linux build.
+# Otherwise that one artifact needs the runner's glibc loader/version and
+# cannot run on musl hosts or older Linux distributions.
 DIST_PLATFORMS := linux/amd64 linux/arm64 darwin/amd64 darwin/arm64
 
 dist:
@@ -59,7 +62,7 @@ dist:
 		goos=$${platform%/*}; goarch=$${platform#*/}; \
 		out="dist/tx9_$${goos}_$${goarch}"; \
 		echo "building $$out"; \
-		GOOS=$$goos GOARCH=$$goarch go build -buildvcs=false -ldflags "-X github.com/davis7dotsh/tx9/internal/version.Version=$(VERSION)" -o "$$out" . || exit 1; \
+		CGO_ENABLED=0 GOOS=$$goos GOARCH=$$goarch go build -buildvcs=false -ldflags "-X github.com/davis7dotsh/tx9/internal/version.Version=$(VERSION)" -o "$$out" . || exit 1; \
 	done
 	cd dist && { command -v sha256sum >/dev/null 2>&1 && sha256sum tx9_* > checksums.txt || shasum -a 256 tx9_* > checksums.txt; }
 	@echo "dist/ ready (VERSION=$(VERSION))"

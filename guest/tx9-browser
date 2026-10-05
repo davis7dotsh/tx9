@@ -387,15 +387,15 @@ def cleanup_probes() -> int:
 def _paths_from_args(args: argparse.Namespace) -> Paths:
     ldd: Path | None
     if args.ldd is not None:
-        ldd = args.ldd
+        ldd = args.ldd.resolve()
     else:
         found = shutil.which("ldd")
         ldd = Path(found) if found else None
     return Paths(
-        cli=args.cli or DEFAULT_CLI,
-        chrome=args.chrome or DEFAULT_CHROME,
+        cli=(args.cli or DEFAULT_CLI).absolute(),
+        chrome=(args.chrome or DEFAULT_CHROME).absolute(),
         ldd=ldd,
-        fixture=args.fixture or DEFAULT_FIXTURE,
+        fixture=(args.fixture or DEFAULT_FIXTURE).absolute(),
     )
 
 

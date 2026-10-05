@@ -12,9 +12,10 @@ Separate containers do not keep Executor credentials confidential from that
 agent. Read the [security model](docs/security-model.md) before connecting
 sensitive accounts or host storage.
 
-The [August 2026 audit](docs/audit-2026-08-27.md) records the fixes, validation,
-and remaining decisions. Package versions and advisory results are in the
-[dependency audit](docs/dependency-audit-2026-08-27.md).
+The [October 2026 reliability and performance pass](docs/audit-2026-10-04.md)
+records the latest fixes and measurements. The [August 2026 audit](docs/audit-2026-08-27.md)
+records earlier validation and remaining decisions. Package versions and earlier
+advisory results are in the [dependency audit](docs/dependency-audit-2026-08-27.md).
 
 For a stable HTTPS Executor origin and OAuth callbacks over a tailnet, see
 [Tailscale HTTPS for Executor](docs/tailscale-executor.md).

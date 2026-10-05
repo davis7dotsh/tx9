@@ -810,10 +810,12 @@ class RotatingWriter:
                 self._rotate()
             fd = os.open(
                 self.path,
-                os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW,
+                os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC | os.O_NOFOLLOW | os.O_NONBLOCK,
                 0o600,
             )
             try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError(f"refusing non-regular log destination: {self.path}")
                 view = memoryview(payload)
                 while view:
                     written = os.write(fd, view)
@@ -1388,12 +1390,12 @@ def source_wanted(source: str, selected: set[str] | None) -> bool:
 
 def parse_timestamp(value: Any) -> dt.datetime | None:
     if isinstance(value, (int, float)):
-        seconds = float(value)
-        if seconds > 100_000_000_000:
-            seconds /= 1000
-        if seconds < MIN_PLAUSIBLE_EPOCH_SECONDS:
-            return None
         try:
+            seconds = float(value)
+            if seconds > 100_000_000_000:
+                seconds /= 1000
+            if seconds < MIN_PLAUSIBLE_EPOCH_SECONDS:
+                return None
             return dt.datetime.fromtimestamp(seconds, UTC)
         except (OverflowError, OSError, ValueError):
             return None
@@ -1410,7 +1412,10 @@ def parse_timestamp(value: Any) -> dt.datetime | None:
         return None
     if parsed.tzinfo is None:
         parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+    try:
+        return parsed.astimezone(UTC)
+    except (OverflowError, ValueError):
+        return None
 
 
 LEVELS = {"debug": 0, "info": 1, "warn": 2, "error": 3}
@@ -1478,7 +1483,10 @@ def parse_since(value: str) -> dt.datetime | None:
         multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400, "w": 604800}[
             duration.group(2).lower()
         ]
-        return utc_now() - dt.timedelta(seconds=amount * multiplier)
+        try:
+            return utc_now() - dt.timedelta(seconds=amount * multiplier)
+        except OverflowError as exc:
+            raise ValueError("--since duration exceeds the supported date range") from exc
     parsed = parse_timestamp(value)
     if parsed is None:
         raise ValueError(f"invalid --since value {value!r}; use a duration such as 24h or an RFC3339 timestamp")
@@ -1502,7 +1510,7 @@ def rotated_paths(active: Path, root: Path) -> list[Path]:
         if not candidate.name.startswith(active.name + "."):
             continue
         suffix = candidate.name.removeprefix(active.name + ".")
-        if suffix.isdigit():
+        if suffix.isascii() and suffix.isdigit():
             rotations.append((int(suffix), candidate))
     return [path for _, path in sorted(rotations, reverse=True)] + ([active] if active_present else [])
 
@@ -1510,6 +1518,8 @@ def rotated_paths(active: Path, root: Path) -> list[Path]:
 def json_safe(value: Any, depth: int = 0) -> Any:
     if depth >= MAX_NORMALIZE_DEPTH:
         return TRUNCATED
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
     if isinstance(value, str):
         return truncate_utf8(value, MAX_NORMALIZE_STRING_BYTES)
     if value is None or isinstance(value, (int, float, bool)):
@@ -1738,14 +1748,26 @@ def read_jsonl(
                 )
 
 
+RAW_TIMESTAMP_PREFIX_RE = re.compile(
+    r"^\[?(\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?"
+    r"(?:[.,]\d+)?(?:[Zz]|[+-]\d{2}:?\d{2})?)"
+)
+
+
+def raw_timestamp(message: str) -> dt.datetime | None:
+    match = RAW_TIMESTAMP_PREFIX_RE.match(message)
+    if match is not None:
+        return parse_timestamp(match.group(1))
+    parts = message.split(maxsplit=1)
+    return parse_timestamp(parts[0]) if parts else None
+
+
 def raw_record_start(message: str) -> bool:
     """A raw line starts a new logical record iff it opens with a parseable
     timestamp or a level-led logging prefix; anything else continues the
     previous record (tracebacks, embedded file contents, ps output)."""
 
-    parts = message.split(maxsplit=1)
-    first = parts[0] if parts else ""
-    if parse_timestamp(first) is not None:
+    if raw_timestamp(message) is not None:
         return True
     return LEVEL_PREFIX_RE.match(message[:256]) is not None
 
@@ -1771,8 +1793,7 @@ def read_raw(
             pending_lines = 0
 
             def build(message: str, line_number: int) -> dict[str, Any]:
-                first = message.split(maxsplit=1)[0] if message else ""
-                timestamp = parse_timestamp(first) or fallback_timestamp(modified_at, line_number)
+                timestamp = raw_timestamp(message) or fallback_timestamp(modified_at, line_number)
                 return normalized_event(
                     box=box,
                     source=source,
@@ -1854,12 +1875,24 @@ def runtime_source(stem: str, scope: str) -> str:
     return source
 
 
+def active_log_paths(files: Iterable[Path]) -> list[Path]:
+    active_paths: set[Path] = set()
+    for path in files:
+        candidate = path
+        suffix = path.suffix[1:]
+        if suffix.isascii() and suffix.isdigit():
+            candidate = path.with_suffix("")
+        if candidate.suffix in {".log", ".jsonl"}:
+            active_paths.add(candidate)
+    return sorted(active_paths)
+
+
 def read_runtime_logs(
     root: Path, *, scope: str, box: str, selected: set[str] | None = None
 ) -> Iterator[dict[str, Any]]:
     log_dir = root / "logs"
-    files = list(iter_regular_files(root, log_dir, recursive=False))
-    for active in sorted(path for path in files if path.suffix == ".jsonl"):
+    files = active_log_paths(iter_regular_files(root, log_dir, recursive=False))
+    for active in (path for path in files if path.suffix == ".jsonl"):
         source = runtime_source(active.stem, scope)
         if not source_wanted(source, selected):
             continue
@@ -1873,7 +1906,7 @@ def read_runtime_logs(
         "executor": "executor.jsonl",
     }
     names = {path.name for path in files}
-    for active in sorted(path for path in files if path.suffix == ".log"):
+    for active in (path for path in files if path.suffix == ".log"):
         replacement = structured_replacements.get(active.stem, active.stem + ".jsonl")
         if replacement and replacement in names:
             continue
@@ -2064,16 +2097,8 @@ def read_hermes_logs(home: Path, *, root: Path, box: str) -> Iterator[dict[str, 
     hermes_home = home / ".hermes"
     candidates: set[Path] = set()
     direct_logs = hermes_home / "logs"
-    candidates.update(
-        path
-        for path in iter_regular_files(root, direct_logs, recursive=True)
-        if path.suffix in {".log", ".jsonl"}
-    )
-    candidates.update(
-        path
-        for path in iter_regular_files(root, hermes_home, recursive=False)
-        if path.suffix in {".log", ".jsonl"}
-    )
+    candidates.update(active_log_paths(iter_regular_files(root, direct_logs, recursive=True)))
+    candidates.update(active_log_paths(iter_regular_files(root, hermes_home, recursive=False)))
     for path in sorted(candidates):
         if path.suffix == ".jsonl":
             yield from read_jsonl(
@@ -2085,7 +2110,9 @@ def read_hermes_logs(home: Path, *, root: Path, box: str) -> Iterator[dict[str, 
             )
 
 
-def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int, dict[str, Any]]]:
+def filtered_events(
+    args: argparse.Namespace, *, apply_redaction: bool = True
+) -> Iterator[tuple[dt.datetime, int, dict[str, Any]]]:
     selected = selected_sources(args.source)
     since = parse_since(args.since)
     agent_root = Path(args.agent_root)
@@ -2115,7 +2142,7 @@ def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int
         )
 
     minimum_level = LEVELS[args.level] if getattr(args, "level", "") else None
-    exact_values = token_env_values()
+    exact_values = token_env_values() if apply_redaction and not args.no_redact else ()
     sequence = 0
     for stream in streams:
         for event in stream:
@@ -2132,12 +2159,13 @@ def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int
                 effective = LEVELS.get(str(event.get("level", "")), LEVELS["info"])
                 if effective < minimum_level:
                     continue
-            searchable = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
-            if args.grep and args.grep.casefold() not in searchable.casefold():
-                continue
+            if args.grep:
+                searchable = json.dumps(event, ensure_ascii=False, sort_keys=True, default=str)
+                if args.grep.casefold() not in searchable.casefold():
+                    continue
             event["source"] = source
             event["box"] = args.box
-            if not args.no_redact:
+            if apply_redaction and not args.no_redact:
                 event = redact_value(event, exact_values)
             yield timestamp, sequence, event
             sequence += 1
@@ -2145,15 +2173,21 @@ def filtered_events(args: argparse.Namespace) -> Iterator[tuple[dt.datetime, int
 
 def collect_events(args: argparse.Namespace) -> list[dict[str, Any]]:
     if args.tail is None:
-        events = list(filtered_events(args))
+        events = list(filtered_events(args, apply_redaction=False))
     else:
         events = heapq.nlargest(
             args.tail,
-            filtered_events(args),
+            filtered_events(args, apply_redaction=False),
             key=lambda item: (item[0], item[1]),
         )
     events.sort(key=lambda item: (item[0], item[1]))
-    return [event for _, _, event in events]
+    exact_values = token_env_values() if not args.no_redact else ()
+    # Tail selection uses source timestamps and sequence only. Redact the
+    # retained events after selection rather than processing discarded history.
+    return [
+        event if args.no_redact else redact_value(event, exact_values)
+        for _, _, event in events
+    ]
 
 
 def query_command(args: argparse.Namespace) -> int:

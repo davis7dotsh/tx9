@@ -32,7 +32,8 @@ const (
 
 	// requestTimeout bounds the small requests (/releases/latest and
 	// checksums.txt) end to end.
-	requestTimeout = 30 * time.Second
+	requestTimeout    = 30 * time.Second
+	maxChecksumsBytes = 1 << 20
 
 	// maxAssetBytes caps the binary download. Release binaries are ~12MiB,
 	// so this is generous headroom, but it keeps a misbehaving or
@@ -223,7 +224,9 @@ func Update(opts Options) (*Result, error) {
 // fetchBytes downloads url and returns its full body. Used for the small
 // checksums.txt asset.
 func fetchBytes(client *http.Client, url string) ([]byte, error) {
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -238,7 +241,14 @@ func fetchBytes(client *http.Client, url string) ([]byte, error) {
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GET %s: %s", url, resp.Status)
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, 1<<20)) // 1MiB is generous for a checksums file
+	data, err := io.ReadAll(io.LimitReader(resp.Body, maxChecksumsBytes+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(data) > maxChecksumsBytes {
+		return nil, fmt.Errorf("GET %s: response exceeds the %d byte limit", url, maxChecksumsBytes)
+	}
+	return data, nil
 }
 
 // downloadToFile streams url's body into an already-open destination while

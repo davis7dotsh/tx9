@@ -21,7 +21,7 @@ daemon.
 ### Dev validation (hermetic, no Docker needed)
 
 - `make check` runs syntax + shellcheck + static contracts + guest regressions
-  + `go vet`/`gofmt`/`go build`/`go test`. This is the full CI gate
+  + `go vet`/`gofmt`/`go test` (which compiles all packages). This is the full CI gate
   (`.depot/workflows/check.yml`) and is the primary thing to run before
   committing. Build just the CLI with `make tx9` (output: `bin/tx9`, gitignored).
 
@@ -43,12 +43,11 @@ daemon.
   `box.env`, `provision/`, `guest/`, and the `docker/` files. Editing `box.env`
   or those assets has **no effect on `tx9 create` until you rebuild the binary**
   (`make tx9`). Don't expect Docker's `COPY box.env` layer to change otherwise.
-- **A full box build currently fails on the Hermes `[messaging]` extra.** The
-  upstream `hermes-agent` package refuses to be built from source, so
-  `provision.sh`'s `uv pip install .[messaging]` step (`install_hermes_messaging_deps`)
-  errors out with "Building wheels or sdists for hermes-agent is not supported".
-  Everything else (vite+/node, uv, claude-code, codex, executor) provisions
-  fine. To build and run a working box for testing, set `INSTALL_HERMES=0` in
-  `box.env` and rebuild the binary (`make tx9`) first; the box then comes up with
-  the Executor daemon + dashboard and passes `tx9 doctor`. This is a temporary
-  test toggle — do not commit it.
+- **Hermes fresh installs pin the official installer and source.** The pins in
+  `box.env` select stable v2026.9.24 and retain its image-owned FHS checkout and
+  venv. Current upstream main uses a different package-manager layout, so do
+  not replace only the installer URL with latest. Both the checked installer
+  digest and forced source commit must agree. Messaging dependencies use an
+  editable `uv pip install -e ".[messaging]"` because upstream refuses ordinary
+  source wheel builds. Existing usable installs are retained. Diagnose build
+  failures with the default `INSTALL_HERMES=1`; do not commit a test bypass.

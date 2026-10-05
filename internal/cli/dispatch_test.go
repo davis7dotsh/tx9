@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"io"
+	"os"
 	"strings"
 	"testing"
 )
@@ -96,5 +97,46 @@ func TestNoArgumentsFallsBackToCommandsWhenOverviewFails(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "daemon unavailable") {
 		t.Fatalf("stderr missing cause:\n%s", stderr.String())
+	}
+}
+
+func TestSubcommandHelpSucceedsWithoutDocker(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "invalid://help-must-not-connect")
+	originalStderr := os.Stderr
+	file, err := os.CreateTemp(t.TempDir(), "help-output")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer file.Close()
+	os.Stderr = file
+	t.Cleanup(func() { os.Stderr = originalStderr })
+	for _, spec := range commandSpecs {
+		t.Run(spec.name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			status := runWithOverview([]string{"tx9", spec.name, "--help"}, nil, func(io.Writer) error {
+				t.Fatal("help attempted to collect overview")
+				return nil
+			}, &stdout, &stderr)
+			if status != 0 || stderr.Len() != 0 {
+				t.Fatalf("help status=%d stderr=%s", status, stderr.String())
+			}
+		})
+	}
+	for _, args := range [][]string{
+		{"mount", "add", "--help"}, {"mount", "list", "--help"}, {"mount", "remove", "--help"},
+		{"resources", "set", "--help"}, {"resources", "reset", "--help"}, {"logs", "export", "--help"},
+		{"delete", "fixture", "--help"},
+	} {
+		var stdout, stderr bytes.Buffer
+		if status := runWithOverview(append([]string{"tx9"}, args...), nil, nil, &stdout, &stderr); status != 0 || stderr.Len() != 0 {
+			t.Errorf("%v: status=%d stderr=%s", args, status, stderr.String())
+		}
+	}
+}
+
+func TestSubcommandUnknownFlagsFail(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	if status := runWithOverview([]string{"tx9", "list", "--unknown"}, nil, nil, &stdout, &stderr); status != 1 || !strings.Contains(stderr.String(), "flag provided but not defined") {
+		t.Fatalf("unknown flag status=%d stderr=%s", status, stderr.String())
 	}
 }

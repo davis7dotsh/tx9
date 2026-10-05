@@ -43,11 +43,22 @@ func (c *Client) ExecStream(ctx context.Context, containerID string, cmd []strin
 		return 0, fmt.Errorf("docker: exec read output: %w", err)
 	}
 
-	inspect, err := c.cli.ContainerExecInspect(ctx, created.ID)
-	if err != nil {
-		return 0, fmt.Errorf("docker: exec inspect: %w", err)
+	// EOF only means the output attachment closed. Wait for Docker's final
+	// process status so a still-running exec cannot look like exit code 0.
+	for {
+		inspect, err := c.cli.ContainerExecInspect(ctx, created.ID)
+		if err != nil {
+			return 0, fmt.Errorf("docker: exec inspect: %w", err)
+		}
+		if !inspect.Running {
+			return inspect.ExitCode, nil
+		}
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(100 * time.Millisecond):
+		}
 	}
-	return inspect.ExitCode, nil
 }
 
 // EphemeralOpts parameterizes RunEphemeral.

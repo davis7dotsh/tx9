@@ -29,6 +29,9 @@ func cmdPrune(args []string) error {
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
 	}
+	if fs.NArg() != 0 {
+		return fmt.Errorf("prune: unexpected positional arguments (usage: tx9 prune)")
+	}
 
 	return withDocker(func(ctx context.Context, cli *docker.Client) error {
 		removedImages, err := pruneImages(ctx, cli)
@@ -97,13 +100,17 @@ func pruneImages(ctx context.Context, cli *docker.Client) ([]string, error) {
 			continue
 		}
 
-		if err := cli.ImageRemove(ctx, img.ID); err != nil {
-			return removed, err
-		}
-		if len(img.RepoTags) > 0 {
-			removed = append(removed, img.RepoTags[0])
-		} else {
-			removed = append(removed, img.ID)
+		// Removing an ID with multiple tags conflicts in Docker, and its
+		// aliases may belong to unrelated repositories. Untag only tx9's
+		// obsolete versions; Docker removes the image on its last tag.
+		for _, tag := range img.RepoTags {
+			if !strings.HasPrefix(tag, "tx9-box:") {
+				continue
+			}
+			if err := cli.ImageRemove(ctx, tag); err != nil {
+				return removed, err
+			}
+			removed = append(removed, tag)
 		}
 	}
 	return removed, nil

@@ -50,6 +50,13 @@ make_agent() {
   chmod 0440 /etc/sudoers.d/agent
 }
 
+# Reconcile every ownership mismatch without issuing chown for nodes that are
+# already correct. On overlayfs, even an unchanged chown copies image files
+# into the writable layer; cached Hermes checkouts/venvs must stay shared.
+own_agent_tree() {
+  find "$1" \( ! -user agent -o ! -group agent \) -exec chown -h agent:agent {} +
+}
+
 install_node_uv() {
   # Vite+ owns the Node.js runtime: its node/npm/npx shims land in
   # $VP_HOME/bin and resolve to the managed install, defaulted to LTS below.
@@ -107,11 +114,11 @@ install_hermes() {
   if command -v hermes >/dev/null 2>&1 && [[ -x "$install_dir/venv/bin/python" ]]; then
     log "hermes already installed — skipping reinstall"
     install_hermes_messaging_deps "$install_dir" || return 1
-    chown -R agent:agent "$install_dir"
+    own_agent_tree "$install_dir"
     return 0
   fi
-  log "hermes (official installer)"
-  # The normal curl setup. Running as root with no --dir lets the installer's
+  log "hermes (pinned official stable installer)"
+  # Running as root with no --dir lets the installer's
   # own FHS auto-detection place code at /usr/local/lib/hermes-agent and link
   # the `hermes` command into /usr/local/bin. HERMES_HOME pins the durable
   # state (auth, sessions, skills, memory) onto /data.
@@ -122,14 +129,42 @@ install_hermes() {
   for arg in "${args[@]}"; do
     case "$arg" in
       --dir | --dir=* | --hermes-home | --hermes-home=* | --skip-setup | --skip-setup=* | \
-      --non-interactive | --non-interactive=*)
+      --non-interactive | --non-interactive=* | --branch | --branch=* | -Branch | \
+      --commit | --commit=* | -Commit | --force-commit | -ForceCommit | --no-venv | \
+      --manifest | -Manifest | --stage | --stage=* | -Stage | --ensure-deps | --ensure-deps=* | \
+      -HermesHome | -NonInteractive)
         log "HERMES_INSTALL_ARGS cannot override protected installer option: $arg"
         return 1
         ;;
     esac
   done
-  if curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
-      | bash -s -- "${args[@]}" --hermes-home "$HERMES_HOME" --skip-setup --non-interactive; then
+  if ! [[ "${HERMES_INSTALL_COMMIT:-}" =~ ^[0-9a-f]{40}$ &&
+    "${HERMES_INSTALLER_SHA256:-}" =~ ^[0-9a-f]{64}$ ]]; then
+    log "hermes install FAILED: valid source/installer pins are required"
+    return 1
+  fi
+  local installer install_status=0
+  installer="$(mktemp)"
+  if ! curl -fsSL --retry 3 --connect-timeout 10 --max-time 120 \
+    "https://raw.githubusercontent.com/NousResearch/hermes-agent/$HERMES_INSTALL_COMMIT/scripts/install.sh" \
+    -o "$installer"; then
+    rm -f "$installer"
+    log "hermes installer download FAILED"
+    return 1
+  fi
+  if ! printf '%s  %s\n' "$HERMES_INSTALLER_SHA256" "$installer" | sha256sum --check - >/dev/null; then
+    rm -f "$installer"
+    log "hermes installer checksum FAILED"
+    return 1
+  fi
+  # --force-commit is needed even on a fresh clone: the stable pin is normally
+  # an ancestor of main, which the upstream installer otherwise ignores. Do
+  # not let an inherited directory override disable its root/FHS detection.
+  env -u HERMES_INSTALL_DIR bash "$installer" "${args[@]}" \
+    --commit "$HERMES_INSTALL_COMMIT" --force-commit \
+    --hermes-home "$HERMES_HOME" --skip-setup --non-interactive || install_status=$?
+  rm -f "$installer"
+  if ((install_status == 0)); then
     # Put the launcher on $OPT/bin too so verify_required and the agent user
     # (guest/profile.sh puts $OPT/bin first) see it regardless of where the
     # installer linked it (/usr/local/bin under root/FHS today).
@@ -147,7 +182,7 @@ install_hermes() {
     # agent owns the code checkout + venv so `hermes update` (which runs
     # `uv pip install --upgrade hermes-agent` into the venv) works without
     # sudo. Verified: update fails with EACCES on venv/bin otherwise.
-    chown -R agent:agent "$install_dir"
+    own_agent_tree "$install_dir"
     log "hermes installed -> $(command -v hermes || echo "$OPT/bin/hermes")"
   else
     log "hermes install FAILED"
@@ -196,15 +231,17 @@ install_executor() {
   # holds it to. Lets `assets` repair mode call this safely on every run
   # instead of only on a full reinstall, without masking a version bump.
   if command -v executor >/dev/null 2>&1; then
-    if [[ -z "${EXECUTOR_VERSION:-}" ]]; then
-      log "executor already installed — skipping reinstall"
-      return 0
-    fi
     local installed_version
-    installed_version="$(executor --version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)"
-    if [[ "$installed_version" == "$EXECUTOR_VERSION" ]]; then
-      log "executor already installed at pinned $EXECUTOR_VERSION — skipping reinstall"
-      return 0
+    # A launcher on PATH can survive a failed global install while its runtime
+    # is missing. Probe it before skipping; a failed/empty probe must let repair
+    # reinstall instead of aborting this script under errexit + pipefail.
+    if installed_version="$(executor --version 2>/dev/null)" && \
+      [[ "$installed_version" =~ ([0-9]+\.[0-9]+\.[0-9]+) ]]; then
+      installed_version="${BASH_REMATCH[1]}"
+      if [[ -z "${EXECUTOR_VERSION:-}" || "$installed_version" == "$EXECUTOR_VERSION" ]]; then
+        log "executor already installed at $installed_version — skipping reinstall"
+        return 0
+      fi
     fi
   fi
   local pkg="executor${EXECUTOR_VERSION:+@$EXECUTOR_VERSION}"

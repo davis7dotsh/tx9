@@ -191,9 +191,17 @@ func RecreateAgent(ctx context.Context, cli *docker.Client, b *Box, token string
 	if err != nil {
 		return false, fmt.Errorf("box: recreate agent %s: %w", b.Name, err)
 	}
-	image := inspect.Config.Image
-	if image == "" {
-		return false, fmt.Errorf("box: recreate agent %s: existing container has no image reference", b.Name)
+	if inspect.Config == nil || !ownedByBox(inspect.Config.Labels, b.Name) {
+		return false, fmt.Errorf("box: recreate agent %s: existing container is not owned by this box", b.Name)
+	}
+	// Config.Image is the original tag, which may have moved since create.
+	// Pin the replacement and capability probe to the actual existing image.
+	if inspect.ContainerJSONBase == nil || inspect.Image == "" {
+		return false, fmt.Errorf("box: recreate agent %s: existing container has no image ID", b.Name)
+	}
+	image := inspect.Image
+	if inspect.State == nil {
+		return false, fmt.Errorf("box: recreate agent %s: existing container inspect response has no state", b.Name)
 	}
 	if inspect.HostConfig == nil {
 		return false, fmt.Errorf("box: recreate agent %s: existing container inspect response has no host config", b.Name)
@@ -203,7 +211,7 @@ func RecreateAgent(ctx context.Context, cli *docker.Client, b *Box, token string
 		MemoryBytes: inspect.HostConfig.Memory,
 	}
 
-	wasRunning := b.AgentState == "running"
+	wasRunning := inspect.State.Running
 	// Current images register TX9_AGENT_MOUNT_GIDS in their entrypoint on
 	// every boot; only images predating that need an exec-based group setup
 	// against a running replacement. Detect which case this is before any

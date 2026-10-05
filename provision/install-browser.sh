@@ -83,7 +83,7 @@ PY
 }
 
 _browser_satisfy() {
-  local deb_deps="$OPT/browser/chrome/$CHROME_DIR/deb.deps"
+  local deb_deps="${1:-$OPT/browser/chrome/$CHROME_DIR/deb.deps}"
   [[ -f "$deb_deps" ]] || {
     log "browser: deb.deps missing at $deb_deps"
     return 1
@@ -106,9 +106,9 @@ _browser_place_fixture() {
 }
 
 _browser_smoke() (
-  local chrome="$OPT/bin/chrome"
-  local cli="$OPT/bin/agent-browser"
-  local fixture="$OPT/browser/fixtures/smoke.html"
+  local chrome="${1:-$OPT/bin/chrome}"
+  local cli="${2:-$OPT/bin/agent-browser}"
+  local fixture="${3:-$OPT/browser/fixtures/smoke.html}"
   [[ -x "$chrome" && -x "$cli" && -f "$fixture" ]] || {
     log "browser smoke: chrome, agent-browser, or fixture missing"
     return 1
@@ -200,14 +200,19 @@ install_browser() (
     log "browser: incomplete Chrome archive ($CHROME_DIR)"
     return 1
   }
+  # Dependencies and a real navigation must succeed for the staged pair. A
+  # candidate that cannot start must not replace the previously working tools.
+  chmod 0755 "$stage/$AB_ASSET"
+  _browser_satisfy "$stage/$CHROME_DIR/deb.deps"
+  _browser_smoke "$stage/$CHROME_DIR/chrome" "$stage/$AB_ASSET" \
+    "$CTX/provision/browser-fixture.html"
+
   rm -rf "$OPT/browser/chrome/$CHROME_DIR"
   mv "$stage/$CHROME_DIR" "$OPT/browser/chrome/$CHROME_DIR"
-  install -m 0755 "$stage/$AB_ASSET" "$OPT/browser/bin/agent-browser"
+  mv "$stage/$AB_ASSET" "$OPT/browser/bin/agent-browser"
 
   _browser_link
-  _browser_satisfy
   _browser_place_fixture
-  _browser_smoke
   _browser_write_manifest
   log "browser installed -> $OPT/bin/agent-browser $OPT/bin/chrome"
 )

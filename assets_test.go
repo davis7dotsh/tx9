@@ -1,30 +1,18 @@
-package assets
+package main
 
 import (
 	"archive/tar"
 	"io"
-	"io/fs"
-	"os"
-	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/davis7dotsh/tx9/internal/assets"
 )
 
-// repoRootFS builds an fs.FS over the same subset of the repo the real
-// go:embed directive in the root assets.go covers, without needing to
-// import package main (which is impossible — see assets.go's doc comment).
-func repoRootFS(t *testing.T) fs.FS {
-	t.Helper()
-	wd, err := os.Getwd()
-	if err != nil {
-		t.Fatalf("Getwd: %v", err)
-	}
-	root := filepath.Join(wd, "..", "..")
-	return os.DirFS(root)
-}
-
+// Check the actual embedded build context rather than walking the checkout,
+// which can contain large node_modules trees and unrelated local files.
 func TestBuildContextTar(t *testing.T) {
-	r, err := BuildContextTar(repoRootFS(t))
+	r, err := assets.BuildContextTar(BuildContext)
 	if err != nil {
 		t.Fatalf("BuildContextTar: %v", err)
 	}

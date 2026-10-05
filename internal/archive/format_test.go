@@ -231,3 +231,64 @@ func TestReadMetadata_FutureFormatVersion(t *testing.T) {
 		t.Fatal("expected error for a future format_version")
 	}
 }
+
+func TestExtractDataPreservesExistingOutputs(t *testing.T) {
+	for _, symlink := range []bool{false, true} {
+		t.Run(fmt.Sprint("symlink=", symlink), func(t *testing.T) {
+			dir := t.TempDir()
+			payload := filepath.Join(dir, "source")
+			if err := os.WriteFile(payload, []byte("archive payload"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			var contents bytes.Buffer
+			if err := WriteTx9(&contents, Metadata{BoxName: "fixture"}, payload); err != nil {
+				t.Fatal(err)
+			}
+			path := filepath.Join(dir, "fixture.tx9")
+			if err := os.WriteFile(path, contents.Bytes(), 0600); err != nil {
+				t.Fatal(err)
+			}
+			target := filepath.Join(dir, "existing")
+			if err := os.WriteFile(target, []byte("preserve me"), 0644); err != nil {
+				t.Fatal(err)
+			}
+			dest := target
+			if symlink {
+				dest = filepath.Join(dir, "link")
+				if err := os.Symlink(target, dest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if _, err := ExtractData(path, dest); err == nil {
+				t.Error("existing output was accepted")
+			}
+			got, err := os.ReadFile(target)
+			if err != nil || string(got) != "preserve me" {
+				t.Fatalf("existing output changed: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestExtractDataRemovesFailedOutput(t *testing.T) {
+	dir := t.TempDir()
+	var contents bytes.Buffer
+	tw := tar.NewWriter(&contents)
+	writeTestTarMember(t, tw, metadataMember, []byte(`{"box_name":"fixture","format_version":1}`))
+	writeTestTarMember(t, tw, dataMemberPlain, []byte("payload"))
+	writeTestTarMember(t, tw, "unexpected", nil)
+	if err := tw.Close(); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(dir, "fixture.tx9")
+	if err := os.WriteFile(path, contents.Bytes(), 0600); err != nil {
+		t.Fatal(err)
+	}
+	dest := filepath.Join(dir, "data.tar.gz")
+	if _, err := ExtractData(path, dest); err == nil {
+		t.Fatal("archive with an extra member was accepted")
+	}
+	if _, err := os.Stat(dest); !os.IsNotExist(err) {
+		t.Fatalf("failed extraction left a payload behind: %v", err)
+	}
+}
