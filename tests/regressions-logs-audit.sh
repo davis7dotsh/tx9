@@ -126,6 +126,26 @@ assert recent[0]["message"].endswith("\n  continuation retained")
 assert all(event["level"] == "warn" for event in recent)
 assert logs.raw_timestamp("0.23 0.17 0.21 loadavg") is None
 
+# ISO timestamps permit an hour-only timezone offset. Preserve it before
+# normalizing so filters and newest-event selection use UTC, not local time.
+for timestamp in (
+    "2026-10-04T14:00:00+01", "2026-10-04T14:00:00+0100", "2026-10-04T14:00:00+01:00",
+    "2026-10-04T12:00:00-01", "2026-10-04T12:00:00-0100", "2026-10-04T12:00:00-01:00",
+):
+    assert logs.isoformat(logs.raw_timestamp(timestamp + " WARNING offset fixture")) == "2026-10-04T13:00:00.000Z"
+write(agent / ".hermes/logs/short-offset.log", "".join([
+    "2026-10-04T14:00:00+01 WARNING short offset fixture east\n",
+    "2026-10-04T12:00:00-01 WARNING short offset fixture west\n",
+    "2026-10-04T13:30:00Z WARNING short offset fixture latest\n",
+]))
+for events in (
+    query("--source", "hermes", "--grep", "short offset fixture", "--since", "2026-10-04T13:15:00Z"),
+    query("--source", "hermes", "--grep", "short offset fixture", "--tail", "1"),
+    export("--source", "hermes", "--grep", "short offset fixture", "--tail", "1"),
+):
+    assert len(events) == 1 and events[0]["message"].endswith("short offset fixture latest"), events
+    assert events[0]["timestamp"] == "2026-10-04T13:30:00.000Z", events
+
 # Agent-controlled invalid timestamps must fall back instead of terminating
 # the entire query/export, and non-finite native data must remain valid JSON.
 invalid = [10**400, "0001-01-01T00:00:00+01:00", "9999-12-31T23:59:59-01:00"]
