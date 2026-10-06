@@ -391,7 +391,11 @@ finally:
     module.shutil.rmtree(module.PROBE_DIR, ignore_errors=True)
 child_stat = pathlib.Path('/proc') / pid_file.read_text() / 'stat'
 for _ in range(100):
-    if not child_stat.exists() or child_stat.read_text().split(') ', 1)[1].startswith('Z '):
+    try:
+        state = child_stat.read_text()
+    except (FileNotFoundError, ProcessLookupError):
+        break
+    if state.split(') ', 1)[1].startswith('Z '):
         break
     time.sleep(0.01)
 else:
@@ -422,7 +426,11 @@ cli.chmod(0o755)
 def assert_stopped(pid):
     stat = pathlib.Path('/proc') / str(pid) / 'stat'
     for _ in range(100):
-        if not stat.exists() or stat.read_text().split(') ', 1)[1].startswith('Z '):
+        try:
+            state = stat.read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            return
+        if state.split(') ', 1)[1].startswith('Z '):
             return
         time.sleep(0.01)
     raise AssertionError(f'detached probe daemon {pid} survived cleanup')
