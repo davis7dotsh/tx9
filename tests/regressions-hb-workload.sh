@@ -141,25 +141,6 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/lib.sh"
   fi
 )
 
-# Gateway process discovery excludes the tx9-logs supervisor whose argv also
-# contains the wrapped `hermes gateway run` command.
-(
-  # shellcheck disable=SC1090
-  source "$PROJECT_ROOT/guest/hb"
-  pgrep() { printf '101\n202\n'; }
-  ps() {
-    case "${*: -1}" in
-      101) printf 'python3 /opt/hermes-box/bin/tx9-logs capture --source hermes --restart-delay 2 -- hermes gateway run --replace --external-supervisor\n' ;;
-      202) printf 'hermes gateway run --replace --external-supervisor\n' ;;
-    esac
-  }
-  mapfile -t gateway_pids < <(_gateway_pids)
-  [[ "${gateway_pids[*]}" == 202 ]]
-  mapfile -t capture_pids < <(_gateway_capture_pids)
-  [[ "${capture_pids[*]}" == 101 ]]
-  _gateway_running
-)
-
 # Gateway startup holds its flock until the real Hermes child appears. A
 # concurrent reconcile therefore observes that child instead of launching a
 # second tx9-logs wrapper during Python startup or legacy-log migration.

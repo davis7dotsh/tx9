@@ -147,6 +147,7 @@ for daemon in gateway executor; do
     _seed_browser_config() { :; }
     init
     pkill() { touch "$tmp/$daemon.stopped"; }
+    _signal_gateway() { touch "$tmp/$daemon.stopped"; }
     _gateway_or_capture_running() { return 1; }
     executor() { :; }
     _wait_port() { return 0; }

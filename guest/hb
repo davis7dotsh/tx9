@@ -288,24 +288,128 @@ _executor_up() {
   _release_daemon_lock "$EXECUTOR_LOCK"
 }
 
-_gateway_pids() {
-  local pid command_line
-  while IFS= read -r pid; do
-    [[ -n "$pid" ]] || continue
-    command_line="$(ps -o args= -p "$pid" 2>/dev/null)" || continue
-    [[ "$command_line" != *"tx9-logs capture"* ]] || continue
-    printf '%s\n' "$pid"
-  done < <(pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true)
+# Process identity uses argv boundaries: capture supervisors and Python exec
+# shims can contain the gateway command without being the Hermes child itself.
+_gateway_process_pids() {
+  python3 - "$1" "$(id -u)" <<'PYTHON'
+import ast
+import os
+import pathlib
+import re
+import sys
+
+kind, uid = sys.argv[1], int(sys.argv[2])
+python_name = re.compile(r"python(?:[0-9]+(?:\.[0-9]+)*)?")
+
+
+def invocation(argv, name):
+    if argv and pathlib.Path(argv[0]).name == name:
+        return argv[1:]
+    if len(argv) < 2:
+        return []
+    executable = pathlib.Path(argv[0]).name
+    python = bool(python_name.fullmatch(executable))
+    if not python and executable not in ("bash", "sh", "dash"):
+        return []
+    script = 1
+    while script < len(argv) and argv[script].startswith("-"):
+        option = argv[script]
+        if option == "--":
+            script += 1
+            break
+        if python:
+            if option in ("-W", "-X"):
+                script += 2
+                continue
+            if not (re.fullmatch(r"-[bBdEiIOPqRsSuvx]+", option) or
+                    option.startswith(("-W", "-X"))):
+                return []  # In particular, -c/-m are not script invocations.
+        else:
+            if option in ("-o", "-O", "--rcfile", "--init-file"):
+                script += 2
+                continue
+            if not (re.fullmatch(r"-[abefhiklmnprtuvxBCEHPT]+", option) or
+                    option in ("--noprofile", "--norc", "--posix", "--restricted", "--verbose", "--login")):
+                return []  # Reject -c and combined command shims such as -lc.
+        script += 1
+    return argv[script + 1:] if script < len(argv) and pathlib.Path(argv[script]).name == name else []
+
+
+def console_gateway(argv):
+    args = invocation(argv, "hermes")
+    return any(args[index:index + 2] == ["gateway", "run"] for index in range(len(args)))
+
+
+def bootstrap_gateway(argv):
+    if (len(argv) < 6 or not python_name.fullmatch(pathlib.Path(argv[0]).name) or
+            argv[1:3] != ["-I", "-c"] or argv[4:6] != ["gateway", "run"]):
+        return False
+    try:
+        tree = ast.parse(argv[3])
+    except (SyntaxError, ValueError):
+        return False
+    # Hermes PM launches its imported CLI entrypoint in isolated Python. Parse
+    # the code without importing/executing it; comments and quoted decoys do
+    # not establish identity, nor does an exec shim that only mentions Hermes.
+    names = set()
+    for statement in tree.body:
+        if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            names.discard(statement.name)
+            continue
+        for node in ast.walk(statement):
+            if isinstance(node, ast.Name) and isinstance(node.ctx, (ast.Store, ast.Del)):
+                names.discard(node.id)
+            elif isinstance(node, (ast.Import, ast.ImportFrom)):
+                names.difference_update(alias.asname or alias.name.split(".")[0] for alias in node.names)
+        if isinstance(statement, ast.ImportFrom) and statement.level == 0 and statement.module == "hermes_cli.main":
+            names.update(alias.asname or alias.name for alias in statement.names if alias.name == "main")
+    call = tree.body[-1].value if tree.body and isinstance(tree.body[-1], ast.Expr) else None
+    if (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute) and
+            isinstance(call.func.value, ast.Name) and call.func.value.id == "sys" and
+            call.func.attr == "exit" and len(call.args) == 1):
+        call = call.args[0]
+    return isinstance(call, ast.Call) and isinstance(call.func, ast.Name) and call.func.id in names
+
+
+def capture(argv):
+    args = invocation(argv, "tx9-logs")
+    if not args or args[0] != "capture" or "--" not in args:
+        return False
+    boundary = args.index("--")
+    return (any(args[index:index + 2] == ["--source", "hermes"] for index in range(boundary - 1)) and
+            console_gateway(args[boundary + 1:]))
+
+
+gateways, captures = [], []
+for entry in pathlib.Path("/proc").iterdir():
+    if not entry.name.isdecimal():
+        continue
+    try:
+        if entry.stat().st_uid != uid:
+            continue
+        argv = (entry / "cmdline").read_bytes().split(b"\0")[:-1]
+        argv = [os.fsdecode(argument) for argument in argv]
+    except OSError:
+        continue  # Process exited or is not readable by this caller.
+    if capture(argv):
+        captures.append(entry.name)
+    elif console_gateway(argv) or bootstrap_gateway(argv):
+        gateways.append(entry.name)
+# Stop supervisors first so intentional child termination cannot restart them.
+for pid in (captures if kind == "capture" else gateways if kind == "gateway" else captures + gateways):
+    print(pid)
+PYTHON
 }
 
-_gateway_capture_pids() {
-  local pid command_line
+_gateway_pids() { _gateway_process_pids gateway; }
+_gateway_capture_pids() { _gateway_process_pids capture; }
+
+_signal_gateway() {
+  local signal="$1" pid
   while IFS= read -r pid; do
     [[ -n "$pid" ]] || continue
-    command_line="$(ps -o args= -p "$pid" 2>/dev/null)" || continue
-    [[ "$command_line" == *"tx9-logs capture"* && "$command_line" == *"--source hermes"* ]] || continue
-    printf '%s\n' "$pid"
-  done < <(pgrep -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true)
+    kill "-$signal" "$pid" 2>/dev/null || true
+  done < <(_gateway_process_pids all)
 }
 
 _gateway_running() {
@@ -477,15 +581,14 @@ _stop_executor_locked() {
 
 _stop_gateway_locked() {
   local attempt
-  # The capture argv includes `hermes gateway run`, so this TERM reaches the
-  # wrapper as well as the child. The wrapper must see the signal: otherwise
-  # --restart-delay would bring the gateway back after an intentional stop.
-  pkill -TERM -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true
+  # Health and stop share process identity, including an orphaned PM child.
+  # Supervisors also receive TERM to prevent their automatic restart loop.
+  _signal_gateway TERM
   for ((attempt = 0; attempt < 30; attempt++)); do
     _gateway_or_capture_running || break
     sleep 1
   done
-  pkill -KILL -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true
+  _signal_gateway KILL
   rm -f "$GATEWAY_PID"
   ! _gateway_or_capture_running || { echo "Hermes gateway failed to stop" >&2; return 1; }
 }
