@@ -19,5 +19,10 @@
 	},
 	"engines": {
 		"node": ">=22.18.0"
+	},
+	"overrides": {
+		"miniflare": {
+			"sharp": "0.35.5"
+		}
 	}
 }
