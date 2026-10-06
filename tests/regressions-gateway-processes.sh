@@ -66,6 +66,7 @@ for line in sys.stdin:
 ''')
 env = dict(os.environ, HB_DATA=str(root / 'data'), INSTALL_HERMES='1',
            TEST_GATEWAY_PID=str(root / 'gateway.pid'), TEST_GATEWAY_FILTER=str(filter_script),
+           TEST_GATEWAY_OWNER=str(root),
            PATH=f'{launcher.parent}:{os.environ["PATH"]}')
 
 
@@ -100,6 +101,42 @@ def finish(proc):
     if proc.poll() is None:
         os.killpg(proc.pid, signal.SIGTERM)
     proc.wait(timeout=3)
+
+
+def cleanup_owned():
+    # Discovery excludes the sentinel; cleanup owns it too, even if a signal
+    # arrives after spawn but before its Popen is appended to `processes`.
+    expected = os.fsencode('TEST_GATEWAY_OWNER=' + env['TEST_GATEWAY_OWNER'])
+    for _ in range(10):
+        found = False
+        for entry in pathlib.Path('/proc').iterdir():
+            if not entry.name.isdecimal() or int(entry.name) == os.getpid():
+                continue
+            try:
+                pidfd = os.pidfd_open(int(entry.name))
+            except ProcessLookupError:
+                continue
+            try:
+                if entry.stat().st_uid != os.geteuid():
+                    continue
+                try:
+                    environment = (entry / 'environ').read_bytes().split(b'\0')
+                except OSError:
+                    continue
+                if expected not in environment:
+                    continue
+                # The pidfd pins this process identity while ownership is
+                # checked, so a recycled numeric PID cannot receive the kill.
+                signal.pidfd_send_signal(pidfd, signal.SIGKILL)
+                found = True
+            except (FileNotFoundError, ProcessLookupError):
+                continue
+            finally:
+                os.close(pidfd)
+        if not found:
+            return
+        time.sleep(0.02)  # Rescan children forked while their wrapper stopped.
+    raise AssertionError('fixture-owned processes survived cleanup')
 
 
 try:
@@ -195,16 +232,18 @@ time.sleep(60)
     assert all(decoy.poll() is None for decoy in unrelated)
     assert sentinel.poll() is None
 finally:
-    for proc in processes:
-        try:
-            finish(proc)
-        except ProcessLookupError:
-            pass
-    if 'orphan' in locals():
-        try:
-            os.kill(orphan, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
+    try:
+        # Detached children can exist before their PID is published or read.
+        # Clean every inherited owner marker without relying on `orphan`
+        # or on a Popen having already been appended to `processes`.
+        cleanup_owned()
+    finally:
+        for proc in processes:
+            try:
+                finish(proc)
+            except ProcessLookupError:
+                pass
+
 PY
 
 echo "gateway process regression checks passed"
