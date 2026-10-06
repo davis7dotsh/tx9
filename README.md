@@ -272,8 +272,9 @@ release workflow builds all four platforms, publishes the GitHub release,
 uploads the versioned R2 assets, and promotes `/releases/latest` last.
 
 Unchanged versions do not publish. Existing tags are never moved. Delayed
-older releases cannot replace a newer published latest version. Local
-unversioned builds remain `dev`; rehearse release artifacts with
+older releases cannot replace a newer published latest version. A missing R2
+latest object initializes the first release; other read failures block
+publication. Local unversioned builds remain `dev`; rehearse release artifacts with
 `make dist VERSION=0.12.0`.
 
 The public Worker is deployed separately (`npm run deploy` from `site/` with
