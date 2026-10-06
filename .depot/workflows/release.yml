@@ -1,7 +1,8 @@
 name: release
 
 # Tag-push CI for tx9's distribution (docs/tx9-cli-design.md decision 10):
-# push a `vX.Y.Z` tag, get cross-compiled binaries + checksums.txt published
+# check.yml tags a VERSION bump after main passes its checks. That tag
+# (or a manually pushed `vX.Y.Z` tag) publishes binaries + checksums.txt
 # to two places from one build:
 #
 #   1. A GitHub release with generated release notes, retained as an archive.
@@ -110,16 +111,44 @@ jobs:
             echo "tag ${GITHUB_REF_NAME} is not a plain vX.Y.Z release tag; refusing to publish" >&2
             exit 1
           fi
+          expected="$(cat VERSION)"
+          if [ "$version" != "$expected" ]; then
+            echo "tag version $version does not match VERSION ($expected); refusing to publish" >&2
+            exit 1
+          fi
+          notes="docs/releases/v${version}.md"
+          if [ ! -s "$notes" ]; then
+            echo "release notes missing: $notes" >&2
+            exit 1
+          fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "notes=$notes" >> "$GITHUB_OUTPUT"
 
       - name: Build dist/ (cross-compiled binaries + checksums.txt)
         run: make dist VERSION=${{ steps.version.outputs.version }}
+
+      # Release jobs are serialized. Read the authoritative R2 pointer
+      # inside that lock so delayed older checks cannot roll latest backward.
+      # R2 is the canonical fully published version; GitHub latest follows it.
+      - name: Plan latest release promotion
+        id: publication
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          current_version_file="$RUNNER_TEMP/tx9-current-release.txt"
+          ./site/node_modules/.bin/wrangler r2 object get tx9-releases/latest.txt \
+            --file "$current_version_file" --remote
+          python3 scripts/release-plan.py "$VERSION" "$current_version_file"
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
         with:
           files: dist/*
+          body_path: ${{ steps.version.outputs.notes }}
           generate_release_notes: true
+          make_latest: ${{ steps.publication.outputs.latest }}
 
       # Mirror dist/ into R2 for the tx9.col-agents.com install path. Versioned
       # objects go first; latest.txt is flipped last so /releases/latest
@@ -129,7 +158,7 @@ jobs:
       # the GitHub release step mean the
       # two channels can briefly disagree — re-run the job; uploads are
       # idempotent.
-      - name: Publish to R2 (tx9.col-agents.com)
+      - name: Publish versioned assets to R2 (tx9.col-agents.com)
         env:
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
@@ -139,6 +168,14 @@ jobs:
             ./site/node_modules/.bin/wrangler r2 object put "tx9-releases/${VERSION}/$(basename "$f")" \
               --file "$f" --remote
           done
+
+      - name: Promote latest R2 release
+        if: ${{ steps.publication.outputs.promote == 'true' }}
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
           printf '%s\n' "$VERSION" > latest.txt
           ./site/node_modules/.bin/wrangler r2 object put "tx9-releases/latest.txt" \
             --file latest.txt --remote

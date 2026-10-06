@@ -10,6 +10,8 @@ syntax:
 	python3 -c 'compile(open("guest/hermes-state", encoding="utf-8").read(), "guest/hermes-state", "exec")'
 	python3 -c 'compile(open("guest/tx9-logs", encoding="utf-8").read(), "guest/tx9-logs", "exec")'
 	python3 -c 'compile(open("guest/tx9-browser", encoding="utf-8").read(), "guest/tx9-browser", "exec")'
+	python3 -c 'compile(open("scripts/release-tag.py", encoding="utf-8").read(), "scripts/release-tag.py", "exec")'
+	python3 -c 'compile(open("scripts/release-plan.py", encoding="utf-8").read(), "scripts/release-plan.py", "exec")'
 
 lint:
 	command -v shellcheck >/dev/null || { echo "shellcheck is required for make check" >&2; exit 1; }

@@ -261,3 +261,21 @@ disposable helper tests. The audit used an existing `ubuntu:24.04` image.
 
 `.depot/workflows/check.yml` runs the Go/guest and site checks through Depot
 CI for pushes to `main` and pull requests against any branch, including stacks.
+
+## Releases
+
+The next release version is recorded in `VERSION`; its curated notes are in
+`docs/releases/v<version>.md`. To publish a release, update both in a pull
+request and merge it into `main`. After main's Go/guest and site checks pass,
+CI creates the matching `v<version>` tag at that merge commit. The existing
+release workflow builds all four platforms, publishes the GitHub release,
+uploads the versioned R2 assets, and promotes `/releases/latest` last.
+
+Unchanged versions do not publish. Existing tags are never moved. Delayed
+older releases cannot replace a newer published latest version. Local
+unversioned builds remain `dev`; rehearse release artifacts with
+`make dist VERSION=0.12.0`.
+
+The public Worker is deployed separately (`npm run deploy` from `site/` with
+appropriate Worker permissions); the CLI release workflow only uploads R2
+release objects. See the release notes for the included Worker changes.
