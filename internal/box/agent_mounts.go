@@ -152,6 +152,7 @@ func validateAgentMount(mount AgentMount) error {
 type preparedAgentMount struct {
 	bind  string
 	group string
+	info  os.FileInfo
 }
 
 func prepareAgentMounts(mounts []AgentMount) ([]string, []string, error) {
@@ -159,6 +160,7 @@ func prepareAgentMounts(mounts []AgentMount) ([]string, []string, error) {
 		return nil, nil, err
 	}
 	binds := make([]string, 0, len(mounts))
+	preparedMounts := make([]preparedAgentMount, 0, len(mounts))
 	groupSet := map[string]bool{}
 	for _, mount := range mounts {
 		prepared, err := prepareAgentMount(mount)
@@ -166,8 +168,17 @@ func prepareAgentMounts(mounts []AgentMount) ([]string, []string, error) {
 			return nil, nil, err
 		}
 		binds = append(binds, prepared.bind)
+		preparedMounts = append(preparedMounts, prepared)
 		if prepared.group != "" {
 			groupSet[prepared.group] = true
+		}
+	}
+	// A group added for one mount applies to every mount. Recheck the full
+	// set because group membership can override otherwise sufficient other
+	// bits on another directory.
+	for i, prepared := range preparedMounts {
+		if _, err := supplementalGroupWithMembership(prepared.info, mounts[i].ReadOnly, groupSet); err != nil {
+			return nil, nil, fmt.Errorf("agent mount source %q with the combined mount groups: %w", mounts[i].Source, err)
 		}
 	}
 	groups := make([]string, 0, len(groupSet))
@@ -204,10 +215,14 @@ func prepareAgentMount(mount AgentMount) (preparedAgentMount, error) {
 	if err != nil {
 		return preparedAgentMount{}, fmt.Errorf("agent mount source %q: %w", mount.Source, err)
 	}
-	return preparedAgentMount{bind: bind, group: group}, nil
+	return preparedAgentMount{bind: bind, group: group, info: info}, nil
 }
 
 func supplementalGroup(info os.FileInfo, readOnly bool) (string, error) {
+	return supplementalGroupWithMembership(info, readOnly, nil)
+}
+
+func supplementalGroupWithMembership(info os.FileInfo, readOnly bool, groups map[string]bool) (string, error) {
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok {
 		return "", nil
@@ -231,12 +246,12 @@ func supplementalGroup(info os.FileInfo, readOnly bool) (string, error) {
 		}
 		return "", fmt.Errorf("directory mode %04o does not give its owner (agent UID %d) %s access", info.Mode().Perm(), agentUID, mode)
 	}
-	if stat.Gid == agentGID {
-		// The agent's primary group applies without any supplemental group.
+	if stat.Gid == agentGID || groups[strconv.FormatUint(uint64(stat.Gid), 10)] {
+		// Primary and supplemental groups both take precedence over other.
 		if (permissions>>3)&needed == needed {
 			return "", nil
 		}
-		return "", fmt.Errorf("directory mode %04o does not give its group (agent GID %d) %s access", info.Mode().Perm(), agentGID, mode)
+		return "", fmt.Errorf("directory mode %04o does not give its group (GID %d) %s access", info.Mode().Perm(), stat.Gid, mode)
 	}
 	if permissions&needed == needed {
 		// Not the owner and not in the directory's group: the other class

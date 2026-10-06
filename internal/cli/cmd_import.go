@@ -63,8 +63,8 @@ func cmdImport(args []string) error {
 	if err := parseFlagsAnywhere(fs, args); err != nil {
 		return err
 	}
-	if fs.NArg() < 1 {
-		return fmt.Errorf("import: archive file required (usage: tx9 import <file.tx9>)")
+	if fs.NArg() != 1 {
+		return fmt.Errorf("import: expected exactly one archive file (usage: tx9 import <file.tx9>)")
 	}
 	archivePath := fs.Arg(0)
 

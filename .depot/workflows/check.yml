@@ -60,3 +60,21 @@ jobs:
       - run: npm run lint
       - run: npm test
       - run: npm audit --audit-level=high
+  release-tag:
+    # Depot's GitHub App token emits a real tag-push event. Publishing stays in
+    # release.yml, so this main-branch job cannot build/publish a second release.
+    needs: [make-check, site-check]
+    if: ${{ success() && github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: depot-ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Tag a checked VERSION bump
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: python3 scripts/release-tag.py

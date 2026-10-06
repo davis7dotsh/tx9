@@ -118,3 +118,22 @@ func TestGeneratedNameRetriesAreBoundedAndDoNotHideDockerErrors(t *testing.T) {
 		})
 	}
 }
+
+func TestCreateRejectsInvalidInputBeforeConnectingToDocker(t *testing.T) {
+	t.Setenv("DOCKER_HOST", "invalid://create-must-not-connect")
+	for _, tc := range []struct {
+		args []string
+		want string
+	}{
+		{[]string{"invalid/name"}, "must match"},
+		{[]string{"fixture", "--agent-cpus", "nonsense"}, "--agent-cpus"},
+		{[]string{"--executor-publish", "not-an-address"}, "executor publish address"},
+		{[]string{"fixture", "--executor-web-base-url", "https://example.com/path"}, "only scheme, host"},
+	} {
+		t.Run(strings.Join(tc.args, " "), func(t *testing.T) {
+			if err := cmdCreate(tc.args); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("error=%v, want %q before Docker connection", err, tc.want)
+			}
+		})
+	}
+}

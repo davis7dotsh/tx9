@@ -30,6 +30,21 @@ func cmdCreate(args []string) error {
 		return fmt.Errorf("create: expected at most one box name (usage: tx9 create [box])")
 	}
 	requested := fs.Arg(0)
+	if requested != "" {
+		if err := names.Validate(requested); err != nil {
+			return fmt.Errorf("create: %w", err)
+		}
+	}
+	// Fresh configuration does not depend on persisted state or a generated
+	// name. Reject invalid options before contacting or modifying Docker.
+	executorConfig, err := executorFlags.loadFresh(requested)
+	if err != nil {
+		return fmt.Errorf("create: %w", err)
+	}
+	resources, err := resourceFlags.apply(box.DefaultResources())
+	if err != nil {
+		return fmt.Errorf("create: %w", err)
+	}
 
 	ctx := context.Background()
 	cli, err := docker.NewClient(ctx)
@@ -54,16 +69,6 @@ func cmdCreate(args []string) error {
 		if err != nil {
 			return fmt.Errorf("create: %w", err)
 		}
-	} else if err := names.Validate(name); err != nil {
-		return fmt.Errorf("create: %w", err)
-	}
-	executorConfig, err := executorFlags.loadFresh(name)
-	if err != nil {
-		return fmt.Errorf("create %s: %w", name, err)
-	}
-	resources, err := resourceFlags.apply(box.DefaultResources())
-	if err != nil {
-		return fmt.Errorf("create %s: %w", name, err)
 	}
 
 	lockPath, err := state.LockPath(name)

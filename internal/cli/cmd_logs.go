@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -220,17 +221,24 @@ func logsHelperArgs(action, name string, opts logsQueryOptions) []string {
 }
 
 func boxImageRef(ctx context.Context, cli *docker.Client, b *box.Box) (string, error) {
+	var inspectionErrors []error
 	for _, id := range []string{b.AgentID, b.ExecutorID} {
 		if id == "" {
 			continue
 		}
 		inspect, err := cli.ContainerInspect(ctx, id)
 		if err != nil {
+			inspectionErrors = append(inspectionErrors, err)
 			continue
+		}
+		// Tags can be rebuilt or moved after a container was created. Run
+		// the helper from its actual image, retaining the box's log format.
+		if inspect.ContainerJSONBase != nil && inspect.Image != "" {
+			return inspect.Image, nil
 		}
 		if inspect.Config != nil && inspect.Config.Image != "" {
 			return inspect.Config.Image, nil
 		}
 	}
-	return "", fmt.Errorf("could not determine a box image from its containers")
+	return "", errors.Join(fmt.Errorf("could not determine a box image from its containers"), errors.Join(inspectionErrors...))
 }

@@ -2,7 +2,6 @@
 package state
 
 import (
-	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -75,37 +74,32 @@ func LockPath(name string) (string, error) {
 	return filepath.Join(dir, name+".lock"), nil
 }
 
-// ReadBoxEnv reads a KEY=VALUE env file into a map. Returns an empty map
-// (no error) if the file does not exist.
+// ReadBoxEnv reads a KEY=VALUE env file into a map, preserving value
+// whitespace. Returns an empty map (no error) if the file does not exist.
 func ReadBoxEnv(name string) (map[string]string, error) {
 	path, err := BoxEnvPath(name)
 	if err != nil {
 		return nil, err
 	}
-	f, err := os.Open(path)
+	contents, err := os.ReadFile(path)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return map[string]string{}, nil
 		}
 		return nil, fmt.Errorf("state: readBoxEnv: %w", err)
 	}
-	defer f.Close()
-
 	env := map[string]string{}
-	scanner := bufio.NewScanner(f)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+	for _, line := range strings.Split(string(contents), "\n") {
+		line = strings.TrimSuffix(line, "\r")
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 		k, v, ok := strings.Cut(line, "=")
 		if !ok {
 			continue
 		}
-		env[k] = v
-	}
-	if err := scanner.Err(); err != nil {
-		return nil, fmt.Errorf("state: readBoxEnv: %w", err)
+		env[strings.TrimSpace(k)] = v
 	}
 	return env, nil
 }

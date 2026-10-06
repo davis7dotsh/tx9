@@ -12,9 +12,10 @@ Separate containers do not keep Executor credentials confidential from that
 agent. Read the [security model](docs/security-model.md) before connecting
 sensitive accounts or host storage.
 
-The [August 2026 audit](docs/audit-2026-08-27.md) records the fixes, validation,
-and remaining decisions. Package versions and advisory results are in the
-[dependency audit](docs/dependency-audit-2026-08-27.md).
+The [October 2026 reliability and performance pass](docs/audit-2026-10-04.md)
+records the latest fixes and measurements. The [August 2026 audit](docs/audit-2026-08-27.md)
+records earlier validation and remaining decisions. Package versions and earlier
+advisory results are in the [dependency audit](docs/dependency-audit-2026-08-27.md).
 
 For a stable HTTPS Executor origin and OAuth callbacks over a tailnet, see
 [Tailscale HTTPS for Executor](docs/tailscale-executor.md).
@@ -260,3 +261,22 @@ disposable helper tests. The audit used an existing `ubuntu:24.04` image.
 
 `.depot/workflows/check.yml` runs the Go/guest and site checks through Depot
 CI for pushes to `main` and pull requests against any branch, including stacks.
+
+## Releases
+
+The next release version is recorded in `VERSION`; its curated notes are in
+`docs/releases/v<version>.md`. To publish a release, update both in a pull
+request and merge it into `main`. After main's Go/guest and site checks pass,
+CI creates the matching `v<version>` tag at that merge commit. The existing
+release workflow builds all four platforms, publishes the GitHub release,
+uploads the versioned R2 assets, and promotes `/releases/latest` last.
+
+Unchanged versions do not publish. Existing tags are never moved. Delayed
+older releases cannot replace a newer published latest version. A missing R2
+latest object initializes the first release; other read failures block
+publication. Local unversioned builds remain `dev`; rehearse release artifacts with
+`make dist VERSION=0.12.0`.
+
+The public Worker is deployed separately (`npm run deploy` from `site/` with
+appropriate Worker permissions); the CLI release workflow only uploads R2
+release objects. See the release notes for the included Worker changes.

@@ -22,6 +22,7 @@ set -eu
 
 ORIGIN="${TX9_ORIGIN:-https://tx9.col-agents.com}"
 INSTALL_DIR="${TX9_INSTALL_DIR:-$HOME/.local/bin}"
+while [ "${ORIGIN%/}" != "$ORIGIN" ]; do ORIGIN=${ORIGIN%/}; done
 
 log() {
   printf 'tx9-install: %s\n' "$*" >&2
@@ -72,7 +73,7 @@ trap 'rm -rf "$tmpdir"' EXIT
 trap 'exit 1' INT TERM HUP
 
 log "resolving latest version..."
-version=$(curl -fsSL "${ORIGIN}/releases/latest") \
+version=$(curl -fsSL --connect-timeout 30 --max-time 30 --max-filesize 4096 "${ORIGIN}/releases/latest") \
   || die "could not resolve the latest version from ${ORIGIN}/releases/latest (no release published yet?)"
 # Strict X.Y.Z, mirroring site/src/index.ts's VERSION_RE — anything else
 # (including dot-only strings like "..", which would path-traverse the
@@ -90,17 +91,34 @@ asset_url="${base_url}/${asset}"
 checksums_url="${base_url}/checksums.txt"
 
 log "downloading ${asset} ${version}..."
-if ! curl -fsSL "$asset_url" -o "$tmpdir/$asset"; then
+if ! curl -fsSL --connect-timeout 30 --speed-limit 1 --speed-time 30 --max-filesize 268435456 "$asset_url" -o "$tmpdir/$asset"; then
   die "download failed: $asset_url (unsupported platform, or a partially published release)"
 fi
 
 log "downloading checksums.txt..."
-if ! curl -fsSL "$checksums_url" -o "$tmpdir/checksums.txt"; then
+if ! curl -fsSL --connect-timeout 30 --max-time 30 --max-filesize 1048576 "$checksums_url" -o "$tmpdir/checksums.txt"; then
   die "download failed: $checksums_url"
 fi
 
-expected=$(awk -v want="$asset" '$2 == want { print $1; found=1 } END { if (!found) exit 1 }' "$tmpdir/checksums.txt") \
-  || die "no checksum entry for ${asset} in checksums.txt"
+expected=$(awk -v want="$asset" '
+  { sub(/\r$/, "") }
+  /^[[:space:]]*(#|$)/ { next }
+  {
+    name = $2
+    sub(/^\*/, "", name)
+    digest = tolower($1)
+    if (NF != 2 || length(digest) != 64 || digest ~ /[^0-9a-f]/ || name == "" || seen[name]++) {
+      invalid = 1
+      exit
+    }
+    if (name == want) expected = digest
+  }
+  END {
+    if (invalid || expected == "") exit 1
+    print expected
+  }
+' "$tmpdir/checksums.txt") \
+  || die "invalid checksums.txt or no checksum entry for ${asset}"
 
 if command -v sha256sum >/dev/null 2>&1; then
   actual=$(sha256sum "$tmpdir/$asset" | awk '{ print $1 }')

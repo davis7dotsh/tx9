@@ -267,6 +267,10 @@ _executor_up() {
     return 0
   }
   _acquire_daemon_lock "$EXECUTOR_LOCK" || { echo "could not acquire Executor lock" >&2; return 1; }
+  if [[ -e "$QUIESCE_FILE" ]]; then
+    _release_daemon_lock "$EXECUTOR_LOCK"
+    return 0
+  fi
   if _port_open; then
     _steady_report executor running "executor daemon: running"
     _release_daemon_lock "$EXECUTOR_LOCK"
@@ -362,6 +366,12 @@ _start_gateway() {
   [[ ! -e "$QUIESCE_FILE" && ! -e "$GATEWAY_DISABLED" ]] || return 0
   command -v hermes >/dev/null 2>&1 || { echo "hermes not installed" >&2; return 1; }
   _acquire_daemon_lock "$GATEWAY_LOCK" "$GATEWAY_LOCK_WAIT_SECONDS" || { echo "could not acquire Hermes gateway lock" >&2; return 2; }
+  # A stop request can persist its policy while this starter waits for flock.
+  # Decide again inside the critical section before observing or launching a writer.
+  if [[ -e "$QUIESCE_FILE" || -e "$GATEWAY_DISABLED" ]]; then
+    _release_daemon_lock "$GATEWAY_LOCK"
+    return 0
+  fi
   mapfile -t gateway_pids < <(_gateway_pids)
   if ((${#gateway_pids[@]} > 0)); then
     if ((${#gateway_pids[@]} != 1)); then
@@ -455,7 +465,7 @@ reconcile() {
   _start_gateway
 }
 
-_stop_executor() {
+_stop_executor_locked() {
   # Remote executor has its own container lifecycle; quiescing this box must
   # not (and cannot) stop it. boxd stops the executor service around saves.
   _exec_remote && return 0
@@ -465,7 +475,7 @@ _stop_executor() {
   _wait_port closed || { echo "executor failed to stop" >&2; return 1; }
 }
 
-_stop_gateway() {
+_stop_gateway_locked() {
   local attempt
   # The capture argv includes `hermes gateway run`, so this TERM reaches the
   # wrapper as well as the child. The wrapper must see the signal: otherwise
@@ -478,6 +488,25 @@ _stop_gateway() {
   pkill -KILL -u "$(id -u)" -f '[h]ermes( .*)? gateway run' 2>/dev/null || true
   rm -f "$GATEWAY_PID"
   ! _gateway_or_capture_running || { echo "Hermes gateway failed to stop" >&2; return 1; }
+}
+
+# Stop shares the startup lock: the durable marker blocks queued starters,
+# and waiting for an in-flight starter prevents a late exec after quiescence.
+_stop_executor() {
+  _exec_remote && return 0
+  _acquire_daemon_lock "$EXECUTOR_LOCK" 40 || { echo "could not acquire Executor stop lock" >&2; return 1; }
+  _stop_executor_locked
+  local status=$?
+  _release_daemon_lock "$EXECUTOR_LOCK"
+  return "$status"
+}
+
+_stop_gateway() {
+  _acquire_daemon_lock "$GATEWAY_LOCK" "$GATEWAY_LOCK_WAIT_SECONDS" || { echo "could not acquire Hermes gateway stop lock" >&2; return 1; }
+  _stop_gateway_locked
+  local status=$?
+  _release_daemon_lock "$GATEWAY_LOCK"
+  return "$status"
 }
 
 pause() {
@@ -600,12 +629,14 @@ executor_token() {
 
 _write_token_env() {
   local token="$1" tmp
-  mkdir -p "$(dirname "$TOKEN_ENV")"
-  tmp="${TOKEN_ENV}.tmp.$$"
+  mkdir -p "$(dirname "$TOKEN_ENV")" || return 1
   umask 077
-  printf "export EXECUTOR_MCP_TOKEN='%s'\n" "$token" >"$tmp"
-  mv "$tmp" "$TOKEN_ENV"
-  chmod 0600 "$TOKEN_ENV"
+  tmp="$(mktemp "${TOKEN_ENV}.tmp.XXXXXX")" || return 1
+  if ! printf 'export EXECUTOR_MCP_TOKEN=%q\n' "$token" >"$tmp" ||
+     ! chmod 0600 "$tmp" || ! mv "$tmp" "$TOKEN_ENV"; then
+    rm -f "$tmp"
+    return 1
+  fi
 }
 
 _unwire_legacy() {
@@ -735,12 +766,12 @@ wire_mcp() {
     return 0
   fi
   _exec_remote || command -v executor >/dev/null 2>&1 || { echo "executor not installed" >&2; return 1; }
-  up >/dev/null
+  up >/dev/null || { echo "box readiness failed; MCP configuration left unchanged" >&2; return 1; }
   local token url failed=0 hermes_installed=0 hermes_reload_lock_held=0
   url="$(_executor_url)"
   token="$(executor_token)"
   [[ -n "$token" ]] || { echo "executor token unavailable" >&2; return 1; }
-  _write_token_env "$token"
+  _write_token_env "$token" || { echo "could not persist Executor MCP credentials; configuration left unchanged" >&2; return 1; }
   export EXECUTOR_MCP_TOKEN="$token"
   if command -v hermes >/dev/null 2>&1; then
     hermes_installed=1
@@ -826,7 +857,7 @@ wire_once() {
   # wiring from a box with a different executor host (e.g. loopback -> compose
   # remote).
   if [[ -f "$WIRED" && "$(cat "$WIRED")" == "$WIRE_VERSION" && -r "$TOKEN_ENV" && -n "$token" ]] &&
-    grep -Fq "$token" "$TOKEN_ENV" &&
+    grep -Fxq "$(printf 'export EXECUTOR_MCP_TOKEN=%q' "$token")" "$TOKEN_ENV" &&
     grep -qF "url = \"$url\"" "$CODEX_HOME/config.toml" 2>/dev/null &&
     _hermes_http_config; then return 0; fi
   wire_mcp
@@ -855,7 +886,7 @@ write_manifest() {
 }
 
 status() {
-  local gateway_status services_count
+  local gateway_status services_count data_usage
   if [[ -e "$GATEWAY_DISABLED" ]]; then
     gateway_status=disabled
   elif _gateway_running; then
@@ -875,7 +906,13 @@ status() {
   printf 'mcp:      %s\n' "$([[ -f "$WIRED" ]] && cat "$WIRED" || echo unwired)"
   services_count="$(find "$SERVICES_DIR" -mindepth 1 -maxdepth 1 -printf x 2>/dev/null | wc -c | tr -d ' ')"
   printf "services: %s drop-in entries (run 'hb services')\n" "$services_count"
-  printf 'data:     %s\n' "$(du -sh "$DATA" 2>/dev/null | cut -f1)"
+  # du can print a partial total before failing on a non-enumerable tree.
+  if data_usage="$(du -sh "$DATA" 2>/dev/null)"; then
+    data_usage="${data_usage%%$'\t'*}"
+  else
+    data_usage=unavailable
+  fi
+  printf 'data:     %s\n' "$data_usage"
 }
 
 services() { _services_helper status; }

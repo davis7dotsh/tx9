@@ -165,7 +165,11 @@ func ValidateDataTar(r io.Reader) error {
 	}
 
 	// Third pass: every member's parent must resolve to a directory, and
-	// hardlinks must resolve to a regular file.
+	// hardlinks must resolve to a regular file. The index is complete and
+	// immutable now, so siblings can reuse a successfully checked parent.
+	// This avoids repeating link traversal and allocating cycle-detection
+	// state for every file in a large directory.
+	parents := make(map[string]*tarMember)
 	for _, key := range idx.order {
 		if key == "" {
 			continue
@@ -175,9 +179,14 @@ func ValidateDataTar(r io.Reader) error {
 			parent = key[:i]
 		}
 		if parent != "" {
-			parentEntry, err := idx.resolve(parent)
-			if err != nil {
-				return err
+			parentEntry, ok := parents[parent]
+			if !ok {
+				var err error
+				parentEntry, err = idx.resolve(parent)
+				if err != nil {
+					return err
+				}
+				parents[parent] = parentEntry
 			}
 			if !parentEntry.IsDir {
 				return fmt.Errorf("archive member parent is not a directory: %s", key)

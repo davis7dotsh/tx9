@@ -1,6 +1,7 @@
 package selfupdate
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net/http"
@@ -53,7 +54,9 @@ var versionRE = regexp.MustCompile(`^\d+\.\d+\.\d+$`)
 // release version and returns it as a plain "X.Y.Z" string.
 func fetchLatestVersion(client *http.Client, origin string) (string, error) {
 	url := origin + "/releases/latest"
-	req, err := http.NewRequest(http.MethodGet, url, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), requestTimeout)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return "", fmt.Errorf("selfupdate: build request: %w", err)
 	}
@@ -73,9 +76,12 @@ func fetchLatestVersion(client *http.Client, origin string) (string, error) {
 		return "", fmt.Errorf("selfupdate: GET %s returned %s: %s", url, resp.Status, strings.TrimSpace(string(body)))
 	}
 
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4097))
 	if err != nil {
 		return "", fmt.Errorf("selfupdate: read %s: %w", url, err)
+	}
+	if len(body) > 4096 {
+		return "", fmt.Errorf("selfupdate: GET %s: response exceeds the 4096 byte limit", url)
 	}
 	version := strings.TrimSpace(string(body))
 	if !versionRE.MatchString(version) {

@@ -2,17 +2,22 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/docker/docker/api/types/image"
 
 	"github.com/davis7dotsh/tx9/internal/docker"
 	"github.com/davis7dotsh/tx9/internal/lock"
 	"github.com/davis7dotsh/tx9/internal/state"
+	"github.com/davis7dotsh/tx9/internal/version"
 )
 
 func TestPruneKeepsStateForDurableObjectsAndInspectionFailures(t *testing.T) {
@@ -128,5 +133,54 @@ func TestPruneStateSkipsInProgressAndDeletesOrphan(t *testing.T) {
 	path, _ := state.BoxEnvPath("box")
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("orphan file remains: %v", err)
+	}
+}
+
+func TestPruneRemovesOnlyUnusedTX9ImageTags(t *testing.T) {
+	var removed []string
+	images := []image.Summary{
+		{ID: "sha256:obsolete", RepoTags: []string{"tx9-box:old-a", "tx9-box:old-b", "other-project:keep"}},
+		{ID: "sha256:current", RepoTags: []string{"tx9-box:" + version.Version, "tx9-box:older-same-image"}},
+		{ID: "sha256:used", RepoTags: []string{"tx9-box:used"}},
+		{ID: "sha256:used-by-tag", RepoTags: []string{"tx9-box:used-by-tag"}},
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		path := strings.TrimPrefix(r.URL.Path, "/v1.47")
+		switch {
+		case path == "/_ping":
+			w.Header().Set("Api-Version", "1.47")
+		case path == "/images/json":
+			_ = json.NewEncoder(w).Encode(images)
+		case path == "/containers/json":
+			fmt.Fprint(w, `[{"Image":"tx9-box:used","ImageID":"sha256:used"},{"Image":"tx9-box:used-by-tag","ImageID":"sha256:other-id"}]`)
+		case r.Method == http.MethodDelete && strings.HasPrefix(path, "/images/"):
+			ref := strings.TrimPrefix(path, "/images/")
+			if !strings.HasPrefix(ref, "tx9-box:") {
+				t.Errorf("prune tried removing image ID or unrelated alias: %s", ref)
+				http.Error(w, `{"message":"image has multiple tags"}`, http.StatusConflict)
+				return
+			}
+			removed = append(removed, ref)
+			fmt.Fprint(w, `[]`)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			http.Error(w, `{"message":"unexpected request"}`, http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("DOCKER_HOST", server.URL)
+	t.Setenv("DOCKER_API_VERSION", "1.47")
+	t.Setenv("DOCKER_TLS_VERIFY", "")
+	t.Setenv("DOCKER_CERT_PATH", "")
+	cli, err := docker.NewClient(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer cli.Close()
+	got, err := pruneImages(context.Background(), cli)
+	want := []string{"tx9-box:old-a", "tx9-box:old-b"}
+	if err != nil || !reflect.DeepEqual(got, want) || !reflect.DeepEqual(removed, want) {
+		t.Fatalf("prune returned=%v deleted=%v error=%v; want only %v", got, removed, err, want)
 	}
 }

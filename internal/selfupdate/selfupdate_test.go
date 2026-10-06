@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -586,5 +587,83 @@ func TestUpdateRejectsOversizedContentLength(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "larger than the") {
 		t.Fatalf("Update: err = %v, want content-length error", err)
+	}
+}
+
+func TestUpdateRejectsOversizedMetadata(t *testing.T) {
+	for _, asset := range []string{"latest", "checksums.txt"} {
+		t.Run(asset, func(t *testing.T) {
+			content := []byte("release binary")
+			sum := sha256.Sum256(content)
+			checksum := fmt.Sprintf("%x  tx9_linux_amd64\n", sum)
+			downloaded := false
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/releases/latest":
+					if asset == "latest" {
+						fmt.Fprint(w, "1.2.4"+strings.Repeat(" ", 4096-len("1.2.4"))+"invalid suffix")
+					} else {
+						fmt.Fprint(w, "1.2.4")
+					}
+				case "/releases/1.2.4/checksums.txt":
+					fmt.Fprint(w, checksum)
+					if asset == "checksums.txt" {
+						// Keep each padding line below Scanner's line limit, so
+						// accepting the truncated prefix would be observable.
+						fmt.Fprint(w, strings.Repeat("\n", maxChecksumsBytes-len(checksum))+checksum)
+					}
+				case "/releases/1.2.4/tx9_linux_amd64":
+					downloaded = true
+					_, _ = w.Write(content)
+				}
+			}))
+			defer srv.Close()
+			dir := t.TempDir()
+			exePath := filepath.Join(dir, "tx9")
+			if err := os.WriteFile(exePath, []byte("old release"), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Update(Options{
+				CurrentVersion: "1.2.3", Origin: srv.URL, GOOS: "linux", GOARCH: "amd64",
+				HTTPClient: srv.Client(), execPathOverride: exePath,
+			})
+			if err == nil || !strings.Contains(err.Error(), "byte limit") {
+				t.Fatalf("Update accepted oversized %s: %v", asset, err)
+			}
+			if downloaded {
+				t.Fatal("downloaded binary after invalid release metadata")
+			}
+			got, err := os.ReadFile(exePath)
+			if err != nil || string(got) != "old release" {
+				t.Fatalf("failed update changed old release: %q, %v", got, err)
+			}
+			assertNoStagedBinaries(t, dir)
+		})
+	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(req *http.Request) (*http.Response, error) {
+	return f(req)
+}
+
+func TestMetadataRequestsHaveDeadlineWithUntimedClient(t *testing.T) {
+	client := &http.Client{Transport: roundTripFunc(func(req *http.Request) (*http.Response, error) {
+		deadline, ok := req.Context().Deadline()
+		if !ok || time.Until(deadline) > requestTimeout {
+			t.Error("release metadata request is missing its bounded deadline")
+		}
+		body := "1.2.4"
+		if strings.HasSuffix(req.URL.Path, "checksums.txt") {
+			body = strings.Repeat("a", 64) + "  tx9_linux_amd64\n"
+		}
+		return &http.Response{StatusCode: http.StatusOK, Body: io.NopCloser(strings.NewReader(body))}, nil
+	})}
+	if _, err := fetchLatestVersion(client, "https://releases.invalid"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := fetchBytes(client, "https://releases.invalid/releases/1.2.4/checksums.txt"); err != nil {
+		t.Fatal(err)
 	}
 }

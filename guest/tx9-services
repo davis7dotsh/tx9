@@ -303,7 +303,7 @@ _definition_reason() {
 
 _reconcile_locked() {
   local path name fingerprint state_file current_helper='' helper_available=1 failed=0
-  local -A desired=()
+  local -A desired=() stop_failed=()
   while IFS= read -r -d '' path; do
     name="${path##*/}"
     if ! _valid_definition "$path" || ! _safe_name "$name"; then
@@ -343,12 +343,16 @@ _reconcile_locked() {
         "$STATE_DELAY" == "$RESTART_DELAY" ]]; then
       continue
     fi
-    _stop_one "$name" "$path" || failed=1
+    if ! _stop_one "$name" "$path"; then
+      failed=1
+      stop_failed["$name"]=1
+    fi
   done
   shopt -u nullglob
 
   [[ ! -e "$QUIESCE_FILE" ]] || return "$failed"
   for name in "${!desired[@]}"; do
+    [[ -z "${stop_failed[$name]+yes}" ]] || continue
     state_file="$STATE_DIR/$name.state"
     path="$DEFINITIONS/$name"
     [[ "$helper_available" == 1 ]] || continue

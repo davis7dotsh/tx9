@@ -5,6 +5,8 @@
 package cli
 
 import (
+	"errors"
+	"flag"
 	"fmt"
 	"io"
 	"io/fs"
@@ -116,6 +118,9 @@ func runWithOverview(args []string, buildContext fs.FS, overview func(io.Writer)
 	}
 
 	if err := fn(rest); err != nil {
+		if errors.Is(err, flag.ErrHelp) {
+			return 0
+		}
 		fmt.Fprintf(stderr, "tx9: %v\n", err)
 		return 1
 	}

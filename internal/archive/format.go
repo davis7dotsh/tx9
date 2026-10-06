@@ -174,8 +174,10 @@ func ReadMetadata(path string) (Metadata, error) {
 
 // ExtractData reads the .tx9 file at path and writes its second tar member
 // (the data payload — gzip tar, or GPG-wrapped gzip tar if the metadata
-// says Encrypted) verbatim to destFile. Returns the metadata read along the
-// way, so callers don't need a separate ReadMetadata call.
+// says Encrypted) verbatim to a new private file at destFile. Existing
+// files and symlinks are never overwritten; failed outputs are removed.
+// Returns the metadata read along the way, so callers don't need a
+// separate ReadMetadata call.
 func ExtractData(path, destFile string) (Metadata, error) {
 	f, err := os.Open(path)
 	if err != nil {
@@ -200,11 +202,17 @@ func ExtractData(path, destFile string) (Metadata, error) {
 		return Metadata{}, fmt.Errorf("archive: %s: data member must be a regular file", path)
 	}
 
-	out, err := os.OpenFile(destFile, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0600)
+	out, err := os.OpenFile(destFile, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
 	if err != nil {
 		return Metadata{}, fmt.Errorf("archive: create %s: %w", destFile, err)
 	}
-	defer out.Close()
+	succeeded := false
+	defer func() {
+		_ = out.Close()
+		if !succeeded {
+			_ = os.Remove(destFile)
+		}
+	}()
 	if _, err := io.Copy(out, tr); err != nil {
 		return Metadata{}, fmt.Errorf("archive: extract data from %s: %w", path, err)
 	}
@@ -217,5 +225,6 @@ func ExtractData(path, destFile string) (Metadata, error) {
 	if err := out.Close(); err != nil {
 		return Metadata{}, fmt.Errorf("archive: close extracted data: %w", err)
 	}
+	succeeded = true
 	return meta, nil
 }

@@ -17,6 +17,12 @@ func cmdMount(args []string) error {
 		return fmt.Errorf("mount: action required (usage: tx9 mount <add|list|remove> ...)")
 	}
 	switch args[0] {
+	case "-h", "-help", "--help":
+		fmt.Fprintln(os.Stderr, "Usage: tx9 mount <add|list|remove> ...")
+		fmt.Fprintln(os.Stderr, "  add <box> <source> <target>  add a persistent host mount")
+		fmt.Fprintln(os.Stderr, "  list <box>                 list configured mounts")
+		fmt.Fprintln(os.Stderr, "  remove <box> <target>      remove a configured mount")
+		return flag.ErrHelp
 	case "add":
 		return cmdMountAdd(args[1:])
 	case "list":

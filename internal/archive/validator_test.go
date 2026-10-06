@@ -18,7 +18,7 @@ type testEntry struct {
 	Body     string
 }
 
-func buildTarGz(t *testing.T, entries []testEntry) []byte {
+func buildTarGz(t testing.TB, entries []testEntry) []byte {
 	t.Helper()
 	var buf bytes.Buffer
 	gz := gzip.NewWriter(&buf)
@@ -356,5 +356,20 @@ func TestValidateDataTar_TruncatedGzip(t *testing.T) {
 	truncated := data[:len(data)/2]
 	if err := ValidateDataTar(bytes.NewReader(truncated)); err == nil {
 		t.Fatal("expected error for truncated archive")
+	}
+}
+
+func BenchmarkValidateDataTar(b *testing.B) {
+	entries := validBase()
+	for i := 0; i < 10_000; i++ {
+		entries = append(entries, file(fmt.Sprintf("home/agent/file-%05d", i), "payload"))
+	}
+	data := buildTarGz(b, entries)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if err := ValidateDataTar(bytes.NewReader(data)); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

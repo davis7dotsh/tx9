@@ -54,6 +54,26 @@ async function latestVersion(env: Env): Promise<string | null> {
 	return VERSION_RE.test(version) ? version : null;
 }
 
+function matchesEtag(condition: string | null, etag: string) {
+	return (
+		condition !== null &&
+		(condition.trim() === "*" ||
+			condition.split(",").some((tag) => tag.trim().replace(/^W\//u, "") === etag))
+	);
+}
+
+// Support a single byte range for resumable downloads. Ignore malformed
+// or multipart requests as HTTP permits, rather than buffering binaries
+// to assemble multipart bodies in the Worker.
+function releaseRange(header: string | null, size: number) {
+	const match = header?.match(/^bytes=(\d*)-(\d*)$/iu);
+	if (!match || (!match[1] && !match[2])) return null;
+	const offset = match[1] ? Number(match[1]) : Math.max(0, size - Number(match[2]));
+	const end = match[1] && match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
+	if (size === 0 || offset > end) return "unsatisfiable";
+	return { offset, length: end - offset + 1 };
+}
+
 async function serveReleaseObject(
 	env: Env,
 	version: string,
@@ -63,26 +83,38 @@ async function serveReleaseObject(
 	if (!VERSION_RE.test(version)) return text("not found\n", 404);
 	if (!isAsset(asset)) return text("not found\n", 404);
 
-	// HEAD needs only metadata — head() skips pulling the (binary-sized)
-	// body out of R2 entirely.
 	const key = `${version}/${asset}`;
-	let object: R2Object | null;
-	let body: ReadableStream | null = null;
 	const condition = request.headers.get("If-None-Match");
+	// Range applies only to GET. Ordinary GET keeps its single conditional
+	// R2 read; HEAD never requests the binary body.
+	const rangeHeader = request.method === "GET" ? request.headers.get("Range") : null;
+	let range: { offset: number; length: number } | null = null;
+	let object: R2Object | null = null;
+	let body: ReadableStream | null = null;
 	let unchanged = false;
-	if (request.method === "HEAD") {
+	if (request.method === "HEAD" || rangeHeader !== null) {
 		object = await env.RELEASES.head(key);
-		unchanged =
-			object !== null &&
-			condition !== null &&
-			(condition.trim() === "*" ||
-				condition.split(",").some((tag) => tag.trim().replace(/^W\//u, "") === object?.httpEtag));
-	} else {
+		if (!object) return text("not found\n", 404);
+		unchanged = matchesEtag(condition, object.httpEtag);
+		const ifRange = request.headers.get("If-Range");
+		if (!unchanged && (ifRange === null || ifRange.trim() === object.httpEtag)) {
+			const parsed = releaseRange(rangeHeader, object.size);
+			if (parsed === "unsatisfiable") {
+				return text("range not satisfiable\n", 416, {
+					"Content-Range": `bytes */${object.size}`,
+					"Accept-Ranges": "bytes",
+					"Cache-Control": "no-store",
+				});
+			}
+			range = parsed;
+		}
+	}
+	if (request.method !== "HEAD" && !unchanged) {
 		// Pass only the supported validator. R2 omits the body when it
 		// matches, avoiding a binary download for a cache revalidation.
 		const onlyIf = new Headers();
 		if (condition !== null) onlyIf.set("If-None-Match", condition);
-		const got = await env.RELEASES.get(key, { onlyIf });
+		const got = await env.RELEASES.get(key, { onlyIf, ...(range ? { range } : {}) });
 		object = got;
 		unchanged = got !== null && !("body" in got);
 		body = got && "body" in got ? got.body : null;
@@ -99,10 +131,17 @@ async function serveReleaseObject(
 	}
 
 	return new Response(body, {
+		status: range ? 206 : 200,
 		headers: {
 			"Content-Type":
 				asset === CHECKSUMS ? "text/plain; charset=utf-8" : "application/octet-stream",
-			"Content-Length": String(object.size),
+			"Content-Length": String(range ? range.length : object.size),
+			...(range
+				? {
+						"Content-Range": `bytes ${range.offset}-${range.offset + range.length - 1}/${object.size}`,
+					}
+				: {}),
+			"Accept-Ranges": "bytes",
 			ETag: object.httpEtag,
 			// Versioned paths are immutable by construction; the mutable
 			// pointer is latest.txt, which is served no-store below.
