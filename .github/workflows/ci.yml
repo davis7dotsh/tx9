@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  go:
+    name: Go
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      # -buildvcs=false matches the Makefile. Go fails the build when VCS
+      # metadata is unavailable, which includes the default shallow checkout
+      # and this repo's linked worktrees. The CLI version comes from -ldflags.
+      #
+      # internal/docker's live helper tests run only when TX9_TEST_DOCKER_IMAGE
+      # names an already installed shell image. Leave it unset so this job does
+      # not pull images or start containers. See CONTRIBUTING.md.
+      - name: gofmt
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            printf 'gofmt: unformatted files:\n%s\n' "$unformatted" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet -buildvcs=false ./...
+
+      - name: go build
+        run: go build -buildvcs=false -o "${RUNNER_TEMP}/tx9" .
+
+      - name: go test
+        run: go test -buildvcs=false ./...
