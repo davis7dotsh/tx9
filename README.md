@@ -22,6 +22,48 @@ For a stable HTTPS Executor origin and OAuth callbacks over a tailnet, see
 For host directories and NAS shares that should be visible inside an agent,
 see [Host mounts](docs/host-mounts.md).
 
+## Install
+
+Prerequisites:
+
+- Linux or macOS (amd64 or arm64) with a running Docker daemon — `docker info` should succeed. Creating a box needs internet access for the first image build.
+- To build from source: Go matching `go.mod` (currently Go 1.26).
+
+Install the latest release:
+
+```bash
+curl -fsSL https://tx9.col-agents.com/install | sh
+# installs to ~/.local/bin/tx9 (override with TX9_INSTALL_DIR)
+```
+
+Or with Go (reports version `dev`; use a release binary or `make tx9` for a stamped version):
+
+```bash
+go install github.com/davis7dotsh/tx9@latest
+```
+
+Or build from source:
+
+```bash
+git clone https://github.com/davis7dotsh/tx9.git
+cd tx9
+make tx9          # writes ./bin/tx9
+./bin/tx9
+```
+
+## Quickstart
+
+```bash
+tx9 create            # optional name: tx9 create my-box; first run builds the box image and can take a while
+tx9 list              # list boxes, status, and dashboard URLs
+tx9 enter my-box      # shell into the agent container
+tx9 doctor my-box     # health checks
+tx9 open my-box       # authenticated Executor dashboard URL
+tx9 delete my-box     # remove the box when done
+```
+
+Run `tx9` with no arguments for an overview of every box. See [Contributing](CONTRIBUTING.md) to build and test from source.
+
 ## Model
 
 ```text
@@ -261,6 +303,9 @@ disposable helper tests. The audit used an existing `ubuntu:24.04` image.
 
 `.depot/workflows/check.yml` runs the Go/guest and site checks through Depot
 CI for pushes to `main` and pull requests against any branch, including stacks.
+`.github/workflows/check.yml` runs `gofmt`, `go vet`, `go build`, and
+`go test ./...` on GitHub Actions for pushes to `main` and every pull request,
+with no Docker daemon required.
 
 ## Releases
 

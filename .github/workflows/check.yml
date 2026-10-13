@@ -1,0 +1,56 @@
+name: check
+
+# GitHub Actions gate for contributors without Depot CI access.
+# .depot/workflows/check.yml remains the release gate (full `make check`
+# plus the site checks); this workflow covers the Go module only and
+# needs no Docker daemon, secrets, or network beyond module downloads.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  go-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: gofmt check
+        run: |
+          unformatted="$(gofmt -l .)"
+          if [ -n "$unformatted" ]; then
+            echo "gofmt: unformatted files:" >&2
+            echo "$unformatted" >&2
+            echo "run 'make format' and commit the result" >&2
+            exit 1
+          fi
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: go build
+        run: go build ./...
+
+      # Docker integration tests self-skip unless TX9_TEST_DOCKER_IMAGE
+      # names an already-installed shell-capable image (see
+      # internal/docker), so this stays green and fast without a daemon.
+      # To run them locally:
+      #   docker pull ubuntu:24.04
+      #   TX9_TEST_DOCKER_IMAGE=ubuntu:24.04 go test ./internal/docker/
+      - name: go test
+        run: go test ./...
