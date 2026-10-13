@@ -346,6 +346,42 @@ func TestValidateDataTar_MemberCapExceeded(t *testing.T) {
 	}
 }
 
+// TestValidateDataTar_UncompressedCapExceeded exercises the total
+// uncompressed-size guard without needing a 100 GiB archive: the var
+// (not const) is lowered for the duration of the test. The payload is
+// split across two files so a per-member check cannot pass it.
+func TestValidateDataTar_UncompressedCapExceeded(t *testing.T) {
+	orig := maxArchiveUncompressedBytes
+	maxArchiveUncompressedBytes = 10
+	defer func() { maxArchiveUncompressedBytes = orig }()
+
+	entries := append(validBase(),
+		file("home/agent/a", "123456"),
+		file("home/agent/b", "12345"),
+	)
+	err := runValidate(t, entries)
+	if err == nil {
+		t.Fatal("expected error for archive exceeding the uncompressed cap")
+	}
+	if !strings.Contains(err.Error(), "uncompressed size") {
+		t.Fatalf("expected an uncompressed-cap error, got: %v", err)
+	}
+}
+
+func TestValidateDataTar_UncompressedCapBoundary(t *testing.T) {
+	orig := maxArchiveUncompressedBytes
+	maxArchiveUncompressedBytes = 11
+	defer func() { maxArchiveUncompressedBytes = orig }()
+
+	entries := append(validBase(),
+		file("home/agent/a", "123456"),
+		file("home/agent/b", "12345"),
+	)
+	if err := runValidate(t, entries); err != nil {
+		t.Fatalf("archive exactly at the uncompressed cap should pass, got: %v", err)
+	}
+}
+
 func TestValidateDataTar_TruncatedGzip(t *testing.T) {
 	// Cut the stream in half rather than trimming a few trailing bytes: the
 	// gzip footer alone can be dropped without tripping an error, since the
