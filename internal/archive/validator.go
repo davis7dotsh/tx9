@@ -29,6 +29,16 @@ import (
 // to generate a million-entry archive.
 var maxArchiveMembers = 1_000_000
 
+// maxArchiveUncompressedBytes hard-caps the summed size of regular-file
+// members ValidateDataTar will accept, so a small crafted .tx9 whose
+// gzip stream expands without bound cannot pass validation and then
+// fill the target volume (or backup host disk) during extraction. It
+// mirrors guest/hermes-state's MAX_UNCOMPRESSED safety ceiling — a
+// decompression-bomb guard, not a per-box storage quota (volume budgets
+// stay advisory; see internal/box Resources). A var so tests can lower
+// it without generating a huge archive.
+var maxArchiveUncompressedBytes int64 = 100 * 1024 * 1024 * 1024
+
 // Match the Linux filesystem's symlink traversal bound instead of allowing
 // link-resolution work to grow with the total number of archive members.
 const maxArchiveLinkHops = 40
@@ -44,6 +54,7 @@ func ValidateDataTar(r io.Reader) error {
 	// members = archive.getmembers() — the Python version reads the whole
 	// member list eagerly before doing anything else.
 	var headers []*tar.Header
+	var totalUncompressed int64
 	for {
 		hdr, err := tr.Next()
 		if err == io.EOF {
@@ -52,6 +63,21 @@ func ValidateDataTar(r io.Reader) error {
 		if err != nil {
 			gz.Close()
 			return fmt.Errorf("archive is corrupt: %w", err)
+		}
+		// Tar header sizes are the exact byte counts extraction will
+		// write for regular files, so summing them here bounds the
+		// restore before any volume write happens. Reject negative
+		// sizes outright instead of letting them offset the total.
+		if hdr.Typeflag == tar.TypeReg || hdr.Typeflag == tar.TypeRegA {
+			if hdr.Size < 0 {
+				gz.Close()
+				return fmt.Errorf("archive is corrupt: member %q has negative size %d", hdr.Name, hdr.Size)
+			}
+			if hdr.Size > maxArchiveUncompressedBytes-totalUncompressed {
+				gz.Close()
+				return fmt.Errorf("archive uncompressed size exceeds the %d byte safety limit", maxArchiveUncompressedBytes)
+			}
+			totalUncompressed += hdr.Size
 		}
 		headers = append(headers, hdr)
 		// A crafted archive with millions of tiny entries would otherwise
