@@ -12,6 +12,48 @@ Separate containers do not keep Executor credentials confidential from that
 agent. Read the [security model](docs/security-model.md) before connecting
 sensitive accounts or host storage.
 
+## Install
+
+Prerequisites: a running Docker daemon your user can access. Release binaries
+are Linux and macOS, amd64 and arm64. The first `tx9 create` builds the box
+image on that daemon. The build takes several minutes and is cached after that.
+
+Install the current release into `~/.local/bin` (`TX9_INSTALL_DIR` overrides
+the directory). The installer prints a `PATH` line when that directory is
+absent from `PATH`:
+
+```bash
+curl -fsSL https://tx9.col-agents.com/install | sh
+tx9 version
+```
+
+Or install a published module version. This needs the Go version in `go.mod`
+(1.26.7 or newer):
+
+```bash
+go install github.com/davis7dotsh/tx9@latest
+```
+
+Or build from a checkout. `make tx9` writes `./bin/tx9`:
+
+```bash
+make tx9
+./bin/tx9 version
+```
+
+A source build reports version `dev` and tags its image `tx9-box:dev`.
+
+Create a box, then open a shell in the agent container. With no name, `tx9
+create` generates one and prints it:
+
+```bash
+tx9 create my-box
+tx9 list
+tx9 enter my-box
+```
+
+Build, test, and Makefile details are in [CONTRIBUTING.md](CONTRIBUTING.md).
+
 The [October 2026 reliability and performance pass](docs/audit-2026-10-04.md)
 records the latest fixes and measurements. The [August 2026 audit](docs/audit-2026-08-27.md)
 records earlier validation and remaining decisions. Package versions and earlier
@@ -255,10 +297,17 @@ toolchain declared in `go.mod`, and Node 22.18 or newer with npm. Go modules
 and npm packages must be available or downloaded first. With an older Go 1.26
 patch release installed, `go` downloads the declared toolchain on first use
 unless `GOTOOLCHAIN=local` is set, in which case the build fails instead.
-Docker integration tests are optional; setting `TX9_TEST_DOCKER_IMAGE` to an
-already installed image with `/bin/sh`, `cat`, `ls`, and `sleep` enables
-disposable helper tests. The audit used an existing `ubuntu:24.04` image.
+Set `TX9_TEST_DOCKER_IMAGE` to run the live Docker helper tests. The image
+must already be installed and must provide `/bin/sh`, `cat`, `ls`, and
+`sleep`. Without that variable, `go test ./...` skips them, including on
+GitHub Actions:
 
+```bash
+TX9_TEST_DOCKER_IMAGE=ubuntu:24.04 go test -buildvcs=false ./internal/docker/
+```
+
+`.github/workflows/ci.yml` runs gofmt, `go vet`, `go build`, and
+`go test ./...` on pull requests and pushes to `main`.
 `.depot/workflows/check.yml` runs the Go/guest and site checks through Depot
 CI for pushes to `main` and pull requests against any branch, including stacks.
 
